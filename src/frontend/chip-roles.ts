@@ -1,0 +1,97 @@
+// What a chip asks of the player under a reply: a decision to answer, an
+// offer to take or leave, or a record of what the turn did. Every kind is listed, so a new chip
+// kind can't ship without a role and a tone.
+
+import type { Chip, ChipKind } from "../shared/state-view";
+
+export type ChipRole = "decision" | "offer" | "done";
+
+export type ChipTone = "neutral" | "pos" | "neg" | "warn";
+
+const ROLE: Record<ChipKind, ChipRole> = {
+  confirm: "decision",
+  keep_report: "decision",
+  read_failed: "decision",
+  engine_failed: "decision",
+  reply_failed: "decision",
+  claim: "decision",
+  check: "decision",
+  routine_ask: "decision",
+  retry: "decision",
+  retry_read: "decision",
+  reread: "decision",
+  overdue: "decision",
+  refused: "decision",
+  intent_gate: "decision",
+  outline_gate: "decision",
+  review: "decision",
+  timelapse_offer: "offer",
+  continue_timelapse: "offer",
+  choice: "offer",
+  swipe_option: "offer",
+  change: "done",
+  elapsed: "done",
+  roll: "done",
+  price: "done",
+  undo: "done",
+  claimed: "done",
+  tidied: "done",
+  routine_added: "done",
+  not_action: "done",
+  mode_change: "done",
+  fix: "done",
+  world_made: "done",
+  turn: "done",
+  pending: "done",
+  degraded: "done",
+  untracked: "done",
+  decline: "done",
+};
+
+const TONE: Record<ChipKind, ChipTone> = {
+  decline: "neg",
+  read_failed: "neg",
+  engine_failed: "neg",
+  reply_failed: "neg",
+  claim: "neutral",
+  check: "neutral",
+  routine_ask: "neutral",
+  intent_gate: "neutral",
+  outline_gate: "neutral",
+  review: "neutral",
+  refused: "neg",
+  degraded: "warn",
+  pending: "warn",
+  overdue: "warn",
+  confirm: "warn",
+  keep_report: "neutral",
+  retry: "neutral",
+  retry_read: "neutral",
+  reread: "neutral",
+  timelapse_offer: "neutral",
+  continue_timelapse: "neutral",
+  choice: "neutral",
+  swipe_option: "neutral",
+  change: "neutral",
+  elapsed: "neutral",
+  roll: "neutral",
+  price: "neutral",
+  undo: "neutral",
+  claimed: "neutral",
+  tidied: "neutral",
+  routine_added: "neutral",
+  not_action: "neutral",
+  mode_change: "neutral",
+  fix: "neutral",
+  world_made: "neutral",
+  turn: "neutral",
+  untracked: "neutral",
+};
+
+export function chipRole(chip: Pick<Chip, "kind">): ChipRole {
+  return ROLE[chip.kind];
+}
+
+export function chipTone(chip: Pick<Chip, "kind">): ChipTone {
+  return TONE[chip.kind];
+}

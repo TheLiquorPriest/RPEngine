@@ -1,0 +1,148 @@
+// One reader over the user's books and the world's own lore: reading by id, and searching both.
+
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { type LoreBookEntry, type LoreIndexWord } from "../../src/lore/sources";
+import { Lore, LORE_DEFAULTS, LORE_INDEX_DEFAULTS, type LoreChatSettings } from "../../src/lore/index";
+import { ATLAS, CARD, CHAT, coastEntries, dbFile, type LoreDb, loreDb, Shelf, SONGS, startingWorlds, Tags, USER, W } from "./fixtures";
+
+const AT = { user: USER, chat: CHAT };
+
+describe("one reader over the books and the world", () => {
+  let dir: string;
+  let db: LoreDb;
+  let lore: Lore;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rpe-lore-read-"));
+    const { file, backups } = dbFile(dir);
+    db = loreDb(file, backups);
+    lore = new Lore({ books: new Shelf(), worlds: startingWorlds(), turns: new Tags(), numbers: db.numbers });
+  });
+  afterAll(async () => {
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("an entry is read by id from either source, in full and in the order asked; an id that names nothing is left out", async () => {
+    const [lamp] = await lore.search(AT, { text: "beacon" });
+    const read = await lore.read(AT, [W.tithe_law, "e-999", "tithe_law", lamp?.id ?? "", "w-no_such_entry"]);
+    expect(read).toEqual([
+      { id: W.tithe_law, source: "The Reed Coast", title: "The harbor tithe", keys: ["tithe", "harbor dues"], text: "Every boat pays a tenth of its catch at the harbor steps.", revision: expect.any(String) },
+      { id: lamp?.id ?? "", source: "Reed Coast Atlas", title: "The lamp room", keys: ["lamp", "lantern"], text: "Green glass and whale oil, kept burning by the night watch.", revision: expect.any(String) },
+    ]);
+  });
+
+  test("a search finds entries of both sources, by their keys, titles, words, and the world's lookup table, aliases and topics", async () => {
+    const harbor = await lore.search(AT, { text: "harbor" });
+    expect(harbor.map((h) => [h.title, h.source])).toEqual([
+      ["The harbor tithe", "The Reed Coast"],
+      ["Gulls nest on the harbor wall every spring…", "Reed Coast Atlas"],
+    ]);
+    expect(harbor.every((h) => h.how === "words" && h.snippet.toLowerCase().includes("harbor"))).toBe(true);
+    // A term of the world's lookup table, an alias, a topic's label, a book entry's other keys.
+    expect((await lore.search(AT, { text: "what did the old law say" }))[0]?.id).toBe(W.tithe_law);
+    expect((await lore.search(AT, { text: "a tenth" })).map((h) => h.id)).toEqual([W.tithe_law]);
+    expect((await lore.search(AT, { text: "the tenth" }))[0]?.id).toBe(W.tithe_law);
+    expect((await lore.search(AT, { text: "harbor law" }))[0]?.id).toBe(W.tithe_law);
+    expect((await lore.search(AT, { text: "beacon" })).map((h) => h.title)).toEqual(["The lamp room"]);
+    expect(await lore.search(AT, { text: "quicksilver" })).toEqual([]);
+  });
+
+  test("a search keeps to the sources and the number of hits asked", async () => {
+    expect((await lore.search(AT, { text: "lamp", sources: ["Tavern Songs"] })).map((h) => h.title)).toEqual(["The Lamplighter's Shanty"]);
+    expect((await lore.search(AT, { text: "harbor", sources: ["The Reed Coast"] })).map((h) => h.id)).toEqual([W.tithe_law]);
+    expect((await lore.search(AT, { text: "harbor", sources: ["Reed Coast Atlas"] })).map((h) => h.source)).toEqual(["Reed Coast Atlas"]);
+    expect(await lore.search(AT, { text: "harbor", limit: 1 })).toHaveLength(1);
+  });
+
+  test("a search finds every entry of the books the chat reads, a switched-off one and a twin included, and leaves out the engine's own entries, an earlier build's copy and every other user's books", async () => {
+    const lamp = (await lore.search(AT, { text: "lamp" })).map((h) => h.title);
+    expect(lamp).toEqual(expect.arrayContaining(["The lamp room", "An old rumor", "Lamp room (card)", "The Lamplighter's Shanty"]));
+    expect(lamp).not.toContain("Scene slot");
+    expect(lamp).not.toContain("Inland lamp");
+    // The world's copy of the gull entry is not read: the entry is, as the atlas has it now.
+    expect((await lore.search(AT, { text: "gull" })).map((h) => h.title)).toEqual(["Gulls nest on the harbor wall every spring…"]);
+    expect(await lore.read(AT, [W.gull_copy])).toEqual([]);
+  });
+
+  test("an entry is read by its number only from a book the chat reads: another chat's books stay that chat's", async () => {
+    // The same user has a chat that reads only the songs.
+    const shelf = new Shelf(new Map([[USER, { books: [ATLAS, SONGS, CARD], entries: coastEntries(), attached: new Map([[CHAT, [ATLAS.id, CARD.id]], ["chat-songs", [SONGS.id]]]) }]]));
+    const both = new Lore({ books: shelf, worlds: startingWorlds(), turns: new Tags(), numbers: db.numbers });
+    const [lamp] = await both.search(AT, { text: "beacon" });
+    const [shanty] = await both.search(AT, { text: "shanty" });
+    expect([lamp?.source, shanty?.source]).toEqual(["Reed Coast Atlas", "Tavern Songs"]);
+    const songs = { user: USER, chat: "chat-songs" };
+    expect((await both.read(songs, [lamp?.id ?? "", shanty?.id ?? ""])).map((e) => e.title)).toEqual(["The Lamplighter's Shanty"]);
+    expect((await both.read(AT, [lamp?.id ?? ""])).map((e) => e.title)).toEqual(["The lamp room"]);
+  });
+
+  test("a secret mark in a book entry is left out of what is read and searched, never shown as its raw text", async () => {
+    const [tide] = await lore.search(AT, { text: "tide bell" });
+    expect(tide?.title).toBe("The tide bell");
+    const [read] = await lore.read(AT, [tide?.id ?? ""]);
+    expect(read?.text.trim()).toBe("The bell rings at high water.");
+    expect(await lore.search(AT, { text: "cracked hammer" })).toEqual([]);
+  });
+
+  test("a hit's snippet is the words around what it matched, cut at whole words", async () => {
+    const [cove] = await lore.search(AT, { text: "brandy" });
+    expect(cove?.id).toBe(W.cove_route);
+    expect(cove?.snippet).toBe("Sefa runs brandy through the cove at the new moon.");
+    const narrow = new Lore({ books: new Shelf(), worlds: startingWorlds(), turns: new Tags(), numbers: db.numbers, settings: { snippetChars: 10 } });
+    expect((await narrow.search(AT, { text: "catch" }))[0]?.snippet).toBe("…of its catch at the…");
+  });
+
+  test("his choice of books narrows what the lore reads, and a chat's shortest word is its own setting", async () => {
+    const settings = (books: string[] | null, minTerm: number): LoreChatSettings => ({ indexEntry: null, lore: { ...LORE_DEFAULTS, minTerm }, search: { minTerm, wordCap: 3, stopWords: [] }, books, index: { ...LORE_INDEX_DEFAULTS }, projection: false });
+    const only = new Lore({ books: new Shelf(), worlds: startingWorlds(), turns: new Tags(), numbers: db.numbers, settingsFor: async () => settings(["book-songs"], 3) });
+    // The atlas is a book the chat reads, but not one of his choice: only the songs are read.
+    expect((await only.search(AT, { text: "lamp" })).map((h) => h.title)).toEqual(["The Lamplighter's Shanty"]);
+    expect((await only.catalog(AT)).filter((e) => e.book !== null).map((e) => e.book)).toEqual(["book-songs"]);
+    const short = new Lore({ books: new Shelf(), worlds: startingWorlds(), turns: new Tags(), numbers: db.numbers, settingsFor: async () => settings(null, 2) });
+    expect((await short.search(AT, { text: "of" })).length).toBeGreaterThan(0);
+    expect(await lore.search(AT, { text: "of" })).toEqual([]);
+  });
+
+  test("with no embedding connection set, every hit is by words; with one, an entry is found by meaning and marked so, and a character finds by meaning only what it may know", async () => {
+    const [lamp] = await lore.search(AT, { text: "beacon" });
+    await lore.catalog(AT);
+    const near = [lamp?.id ?? "", W.drowned_crown, W.tithe_law];
+    const asked: string[] = [];
+    const none = new Lore({ books: new Shelf(), worlds: startingWorlds(), turns: new Tags(), numbers: db.numbers, meaning: { find: async () => null } });
+    expect(await none.search(AT, { text: "darkness at sea" })).toEqual([]);
+    const meant = new Lore({ books: new Shelf(), worlds: startingWorlds(), turns: new Tags(), numbers: db.numbers, meaning: { find: async (_at, text) => (asked.push(text), near) } });
+    // The words find nothing; the lead is given all three by meaning, the secret one included.
+    expect((await meant.search(AT, { text: "darkness at sea" })).map((h) => [h.id, h.how])).toEqual(near.map((id) => [id, "meaning"]));
+    // A hit the words found is not found twice, and the limit holds.
+    expect((await meant.search(AT, { text: "tithe" })).map((h) => [h.id, h.how])).toEqual([[W.tithe_law, "words"], [lamp?.id ?? "", "meaning"], [W.drowned_crown, "meaning"]]);
+    expect((await meant.search(AT, { text: "darkness at sea", limit: 2 })).length).toBe(2);
+    // Tobin may not know the drowned crown: it is left out of what is found by meaning, as of a read.
+    expect((await meant.searchAs(AT, "tobin", { text: "darkness at sea" })).map((h) => h.id)).toEqual([lamp?.id ?? "", W.tithe_law]);
+    expect(asked.length).toBeGreaterThan(0);
+  });
+});
+
+/** A shelf with a search index of its own, as the door keeps one: the rows of the entries that hold any word asked of their names, or of their names and texts. */
+class IndexedShelf extends Shelf {
+  async found(user: string, books: readonly string[], words: readonly LoreIndexWord[], limit: number): Promise<LoreBookEntry[]> {
+    const rows = (this.users.get(user)?.entries ?? []).filter((e) => books.includes(e.book));
+    return rows.filter((e) => words.some((w) => [e.comment, ...e.keys, ...(w.names === true ? [] : [e.content])].join(" ").toLowerCase().split(/[^\p{L}\p{N}]+/u).includes(w.text))).slice(0, limit);
+  }
+}
+
+describe("a search through the index", () => {
+  test("an entry named only by words the ranking leaves out is still found by its name said whole", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rpe-lore-read-"));
+    const { file, backups } = dbFile(dir);
+    const db = loreDb(file, backups);
+    const shelf = new IndexedShelf();
+    shelf.users.get(USER)?.entries.push({ id: "entry-them", book: ATLAS.id, comment: "Them", content: "The creatures of the deep marsh, never named aloud.", keys: ["them"], secondaryKeys: [], disabled: false, constant: false, vectorized: false, extensions: {}, revision: 1 });
+    const lore = new Lore({ books: shelf, worlds: startingWorlds(), turns: new Tags(), numbers: db.numbers });
+    expect((await lore.search(AT, { text: "tell me about them" })).map((h) => h.title)).toEqual(["Them"]);
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

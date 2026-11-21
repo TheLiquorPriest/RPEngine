@@ -1,0 +1,692 @@
+// HostPort: the narrow port between the backend and Lumiverse (ARCHITECTURE §2, §8).
+//
+// Backend logic talks only to this interface. `backend/spindle-host.ts` implements it over the
+// `spindle` global and is the only file that touches it; `test/support/fake-host.ts`
+// implements it for tests by replaying the event orders recorded from a Lumiverse host (DESIGN §14).
+// Shapes mirror the observed payloads: event payloads carry no userId, which the host passes
+// as the handler's second argument.
+
+import type { ListedTool } from "./agents";
+import type { JsonObject, JsonValue } from "./json";
+import type { Limit } from "./minds";
+import type { ChatId, GenerationId, MessageId, UserId } from "./ids";
+import type { BackendToFrontend } from "./protocol";
+import type { Answers, Questions } from "./decide";
+
+/**
+ * How hard a model reasons on a call (Lumiverse's per-request reasoning override): `inherit` leaves
+ * it to the connection's reasoning binding, else the user's Lumiverse setting; `off` turns reasoning
+ * off; the rest ask for that effort, which the host maps to each provider's own field.
+ */
+export type ReasoningChoice = "inherit" | "off" | "auto" | "minimal" | "low" | "medium" | "high" | "max" | "xhigh";
+
+/**
+ * Sampling parameters a helper call may set, by the names Lumiverse's generation call takes
+ * (`GenerationParameters`). One left out is the connection's own (its preset's); the provider
+ * decides which it honours.
+ */
+export interface SamplingParams {
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+}
+
+export type HostGenerationType = "normal" | "regenerate" | "swipe" | "continue" | "impersonate";
+
+/** A chat message as the backend sees it. `content` is the displayed swipe, `swipes[swipeId]`. */
+export interface HostMessage {
+  id: MessageId;
+  chatId: ChatId;
+  index: number;
+  isUser: boolean;
+  name: string;
+  content: string;
+  swipeId: number;
+  swipes: string[];
+  /** The whole `spindle_metadata` bag (every extension's namespace). */
+  metadata: JsonObject;
+}
+
+/** A chat of the user's as the chat list has it: its name and its whole metadata bag (every extension's). */
+export interface HostChat {
+  id: ChatId;
+  name: string;
+  metadata: JsonObject;
+}
+
+// ---------------------------------------------------------------- events
+
+export interface GenerationStartedEvent {
+  generationId: GenerationId;
+  chatId: ChatId;
+  model: string;
+  /** Null for Continue (DESIGN §5.1 step 1). */
+  targetMessageId: MessageId | null;
+  /** Present for every type, Continue included. */
+  targetSwipeId: number | null;
+  characterId: string | null;
+  characterName: string | null;
+  generationType: HostGenerationType;
+  frontendSessionId?: string;
+}
+
+export interface GenerationInProgressEvent {
+  generationId: GenerationId;
+  chatId: ChatId;
+  model: string;
+  targetMessageId: MessageId | null;
+  targetSwipeId: number | null;
+  characterId: string | null;
+  characterName: string | null;
+}
+
+export interface GenerationEndedEvent {
+  generationId: GenerationId;
+  chatId: ChatId;
+  /** The saved message; absent for Impersonate and on error. */
+  messageId?: MessageId;
+  /** The saved swipe's whole content (for Continue too). Empty on error, and possibly empty without one. */
+  content: string;
+  usage?: JsonObject;
+  finish_reason?: string;
+  generationType: HostGenerationType;
+  frontendSessionId?: string;
+  impersonateDraft?: string;
+  error?: string;
+}
+
+/** No messageId; for a Continue, `content` is only the partial suffix (DESIGN §5.1 step 6). */
+export interface GenerationStoppedEvent {
+  generationId: GenerationId;
+  chatId: ChatId;
+  content: string;
+}
+
+export interface MessageEvent {
+  chatId: ChatId;
+  message: HostMessage;
+}
+
+export type SwipeAction = "added" | "navigated" | "updated" | "deleted";
+
+export interface MessageSwipedEvent {
+  chatId: ChatId;
+  message: HostMessage;
+  action: SwipeAction;
+  /** For `updated`, the written swipe, which may differ from `message.swipeId`. */
+  swipeId: number;
+  /** Only on `navigated`. */
+  previousSwipeId?: number;
+}
+
+export interface MessageDeletedEvent {
+  chatId: ChatId;
+  messageId: MessageId;
+}
+
+export interface ActivatedEntry {
+  id: string;
+  comment: string;
+  source: string;
+  bookId: string;
+}
+
+export interface WorldInfoActivatedEvent {
+  chatId: ChatId;
+  entries: ActivatedEntry[];
+  stats: JsonObject;
+}
+
+/** A chat deleted (the host sends `{ id }`). */
+export interface ChatDeletedEvent {
+  chatId: ChatId;
+}
+
+/**
+ * A chat's own record changed (`CHAT_CHANGED`). `renamed`: the host renamed the chat's user
+ * messages for a persona (`reattributedUserMessages`), which sends no message events.
+ */
+export interface ChatChangedEvent {
+  chatId: ChatId;
+  renamed: boolean;
+}
+
+/** A preset was written (`PRESET_CHANGED`): its blocks, and so the outlets it places, may differ now. */
+export interface PresetChangedEvent {
+  presetId: string | null;
+}
+
+/**
+ * Settings of the user's were written (`SETTINGS_UPDATED`), the active preset maybe among them: the
+ * keys written, one for a single write (`{key}`) and every one for a batch (`{keys}`, which is how
+ * Lumiverse's own pages save); null when the event names none.
+ */
+export interface SettingsUpdatedEvent {
+  keys: string[] | null;
+}
+
+/** A loaded Lumiverse page of the user's disconnected (`FRONTEND_SESSION_CLOSED`): the session routing named it. */
+export interface FrontendSessionClosedEvent {
+  frontendSessionId: string;
+}
+
+export interface HostEventMap {
+  GENERATION_STARTED: GenerationStartedEvent;
+  GENERATION_IN_PROGRESS: GenerationInProgressEvent;
+  GENERATION_ENDED: GenerationEndedEvent;
+  GENERATION_STOPPED: GenerationStoppedEvent;
+  MESSAGE_SENT: MessageEvent;
+  MESSAGE_EDITED: MessageEvent;
+  MESSAGE_SWIPED: MessageSwipedEvent;
+  MESSAGE_DELETED: MessageDeletedEvent;
+  WORLD_INFO_ACTIVATED: WorldInfoActivatedEvent;
+  CHAT_DELETED: ChatDeletedEvent;
+  CHAT_CHANGED: ChatChangedEvent;
+  PRESET_CHANGED: PresetChangedEvent;
+  SETTINGS_UPDATED: SettingsUpdatedEvent;
+  FRONTEND_SESSION_CLOSED: FrontendSessionClosedEvent;
+}
+
+export type HostEventName = keyof HostEventMap;
+
+// ---------------------------------------------------------------- hooks
+
+export interface ContextHandlerInput {
+  chatId: ChatId;
+  userId: UserId;
+  /** `other`: a type the engine doesn't play (the host's `quiet`). */
+  generationType: HostGenerationType | "other";
+  dryRun: boolean;
+  connectionId: string | null;
+  personaId: string | null;
+  frontendSessionId?: string;
+}
+
+/** What a context handler tells the host: go on to the prompt, or stop the generation before it (`cancelGeneration`). */
+export type ContextVerdict = "go" | "cancel";
+
+/**
+ * A World Info entry as the interceptor sees it before activation (DESIGN §6.1): its book, whether it
+ * is off for this prompt so far, its extension data, and its comment and text, by which its secret
+ * marks are read and a copy of a secret is known whatever book holds it (one the host builds from a
+ * character's card for the prompt, which no book stores, included).
+ */
+export interface WorldInfoCandidate {
+  id: string;
+  bookId: string;
+  disabled: boolean;
+  extensions: JsonObject;
+  comment: string;
+  content: string;
+}
+
+/** What the interceptor is asked, in every prompt assembly: the entries the host scans for the chat's prompt, and the chat's metadata. */
+export interface WorldInfoInput {
+  chatId: ChatId;
+  userId: UserId;
+  entries: WorldInfoCandidate[];
+  chatMetadata: JsonObject;
+}
+
+/**
+ * Its answer, for this prompt only and never stored: entries to switch off, entries stored switched
+ * off to switch on (an off vote anywhere wins), and entries whose text the prompt holds instead of
+ * their own (`mutated`, absent for none: the host activates and inserts that text).
+ */
+export interface WorldInfoVerdict {
+  disabled: string[];
+  enabled: string[];
+  mutated?: { id: string; content: string }[];
+}
+
+/** What the running Lumiverse does with a context handler's answer (DESIGN §5.1). */
+export interface HostCapabilities {
+  /** `cancelGeneration` stops the generation (the `preAssemblyGenerationContext` contract). */
+  cancel: boolean;
+  /** A `required` handler that fails or runs out of time stops the generation instead of being skipped (`required-context-handlers-v1`). */
+  required: boolean;
+  /** Frontend messages name the page they came from, and a send may go to that page alone (`frontend-session-routing-v1`). */
+  sessions: boolean;
+}
+
+// ---------------------------------------------------------------- model calls
+
+/**
+ * A part of a model message (the host's `LlmMessagePartDTO`): text, a tool call the model made, or
+ * a tool's result going back. `cache` marks a cache breakpoint after the part (the host's
+ * `cache_control`), which only a provider that takes explicit breakpoints reads.
+ */
+export type QuietPart =
+  | { type: "text"; text: string; cache?: true }
+  | { type: "tool_use"; id: string; name: string; input: JsonObject; thoughtSignature?: string; cache?: true }
+  | { type: "tool_result"; toolUseId: string; content: string; isError?: true; cache?: true };
+
+/** A provider's thinking block (Anthropic's signed `thinking`, or `redacted_thinking`), sent back verbatim after a tool call. */
+export interface QuietThinkingBlock {
+  type: "thinking" | "redacted_thinking";
+  thinking?: string;
+  signature?: string;
+  data?: string;
+}
+
+/**
+ * A message of a quiet call. `content` is its text; an agent's tool turns go as `parts` instead
+ * (AGENT-LOOP-PLAN §3.2), and then `content` only renders them as text, for logs and tests. An
+ * assistant turn carries what its model gave of its reasoning, sent back as given on the next
+ * call: the reasoning text (DeepSeek's `reasoning_content`, which a thinking model must be sent
+ * again after a tool call), Anthropic's thinking blocks and OpenRouter's `reasoning_details`.
+ */
+export interface QuietMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+  parts?: QuietPart[];
+  reasoning?: string;
+  thinkingBlocks?: QuietThinkingBlock[];
+  reasoningDetails?: JsonObject[];
+}
+
+export interface QuietRequest {
+  messages: QuietMessage[];
+  maxTokens: number;
+  json: boolean;
+  connectionId: string | null;
+  /** Overrides the connection's saved model for this call (a step's route, DESIGN §5.3 Custom). */
+  model: string | null;
+  /** Tools the model may call instead of answering (lore lookups, DESIGN §5.4); absent: none. */
+  tools?: QuietTool[];
+  /** How hard the model reasons (a step's effort); absent or `inherit`: the connection's own reasoning settings. */
+  effort?: ReasoningChoice;
+  /** How the model's thinking shows, with an effort of the call's own (the host's `thinkingDisplay`): `summarized` sends its text back; absent: the host's default. */
+  thinkingDisplay?: "summarized";
+  /** Sampling parameters by the host's names; each left out is the connection's own (its preset's). */
+  params?: SamplingParams;
+  /** Asks the provider for its token usage (the host's `_include_usage`): only then does an OpenAI-compatible stream, which every call with tools is, report it. */
+  usage?: true;
+  /** Takes the answer as Lumiverse streams it (`generate.quietStream`) instead of whole at the end (`generate.quiet`): the result reads the same, but the provider's connection carries it as it is written. */
+  stream?: true;
+}
+
+/**
+ * A tool a quiet call offers (the host's `ToolSchemaDTO`): its parameters as a JSON Schema. `cache`
+ * marks a cache breakpoint after it (the host's `cache_control`, which its Anthropic provider sends
+ * on a tool): the tools up to it are one cached prefix, read first, whatever follows them.
+ */
+export interface QuietTool {
+  name: string;
+  description: string;
+  parameters: JsonObject;
+  cache?: true;
+}
+
+/** A tool call the model made (the host's `ToolCallDTO`), its arguments parsed; `thoughtSignature`, Google's, goes back with it. */
+export interface QuietToolCall {
+  name: string;
+  args: JsonObject;
+  callId: string;
+  thoughtSignature?: string;
+}
+
+export interface QuietResult {
+  content: string;
+  finishReason: string;
+  tokens: number;
+  /** The prompt's and the answer's tokens, when the provider reports them apart. */
+  tokensIn?: number;
+  tokensOut?: number;
+  /** The model that answered, when the host says. */
+  model?: string;
+  /** Present when the model called tools natively. */
+  toolCalls?: QuietToolCall[];
+  /** The model's reasoning text, when the provider gave it. */
+  reasoning?: string;
+  /** Reasoning carriers to send back on the next call after a tool call, when the host passes them. */
+  thinkingBlocks?: QuietThinkingBlock[];
+  reasoningDetails?: JsonObject[];
+  /** The provider's usage as the host passed it: its prompt and completion tokens and, in `provider_raw`, the provider's own fields. */
+  usage?: JsonObject;
+}
+
+/**
+ * A connection as the agent runtime needs it (`connections.profile`): its provider and model, its
+ * explicit cache breakpoints (null where the provider takes none; else the most a request may hold,
+ * the provider's own limit, and those the connection's own prompt caching adds to every request on
+ * it: one after the leading system messages, one on the last message, one on each tool, and one for
+ * its automatic mode), and, for a Model Roulette, the connections the host picks one of at random
+ * for each call (`targets`; none for any other connection).
+ */
+export interface HostConnectionProfile {
+  id: string;
+  name: string;
+  provider: string;
+  model: string;
+  cache: { limit: number; system: boolean; lastMessage: boolean; tools: boolean; automatic: boolean } | null;
+  targets: string[];
+}
+
+export interface DecideRequest {
+  state: JsonValue;
+  questions: Questions;
+  connectionId: string | null;
+  model: string | null;
+}
+
+export interface DecideResult {
+  answers: Answers;
+  model: string;
+  tokens: number;
+}
+
+// ---------------------------------------------------------------- lore books, dry runs, processes
+
+export interface HostBookEntry {
+  id: string;
+  bookId: string;
+  comment: string;
+  content: string;
+  keys: string[];
+  /** The entry's secondary keys (`keysecondary`), which lore reads as other names it goes by; absent: none. */
+  secondaryKeys?: string[];
+  disabled: boolean;
+  constant: boolean;
+  /** Host position code (0 = before character, 1 = after, 4 = at depth, …). */
+  position: number;
+  depth: number;
+  role: string | null;
+  order: number;
+  extensions: JsonObject;
+}
+
+/**
+ * A new entry: where it sits (`position`, `depth`, `role`, `order`) may be left to the host's own
+ * defaults for a new entry, as Lumiverse's World Info editor makes one.
+ */
+export type HostBookEntryInput = Omit<HostBookEntry, "id" | "bookId" | "position" | "depth" | "role" | "order"> &
+  Partial<Pick<HostBookEntry, "position" | "depth" | "role" | "order">> & {
+    /** The `{{outlet::name}}` the entry fills, kept in its `extensions.outlet_name`; none when absent. */
+    outlet?: string | null;
+    /** Its text never triggers another entry (Lumiverse's Prevent further recursion); absent: the host's default, off. */
+    preventRecursion?: boolean;
+  };
+
+/** The parts of an entry `books.update` writes, each only when given. */
+export interface HostEntryPatch {
+  content?: string;
+  keys?: string[];
+  disabled?: boolean;
+  extensions?: JsonObject;
+}
+
+/** Where an entry sits in the prompt. The host keeps the outlet beside the extension data, so reading an entry back doesn't show it. */
+export interface HostEntryPlacement {
+  /** Host position code (0 = before character, 4 = at depth, 8 = only at its outlet, …). */
+  position: number;
+  depth: number;
+  role: "system" | "user" | "assistant";
+  /** Null takes the entry out of any outlet. */
+  outlet: string | null;
+}
+
+/** A child lane's message or lifecycle change (`backendProcesses`). */
+export interface ProcessEvent {
+  processId: string;
+  key: string;
+  state?: string;
+  payload?: unknown;
+  error?: string;
+}
+
+export interface ProcessHandle {
+  processId: string;
+  send(payload: unknown): void;
+  stop(): Promise<void>;
+}
+
+/** A dry-run assembly: the prompt, the preset blocks that assembled, and the final model parameters. */
+export interface DryRun {
+  messages: { role: string; content: string }[];
+  /** Preset blocks in the assembled prompt (enabled ones), resolved, in order. */
+  blocks: { id: string | null; name: string; content: string }[];
+  /** The final max-tokens parameter, when anything sets one. */
+  maxTokens: number | null;
+  model: string;
+}
+
+/** A preset prompt block as the engine reads it (`presets.blocks`). */
+export interface HostPresetBlock {
+  id: string;
+  name: string;
+  content: string;
+  enabled: boolean;
+  /** `"category"` for a category header, another marker for a structural block, else null. */
+  marker: string | null;
+  /** The generation types the block assembles for; empty for every one. */
+  injectionTrigger: string[];
+  /** The character tags the block assembles for (any one of them); empty for every character. */
+  characterTagTrigger: string[];
+  /** On a category header: `radio` keeps only the first switched-on block under it, `checkbox` each one. */
+  categoryMode: "radio" | "checkbox" | null;
+  /** The category header it is filed under, by id (null: none), as the preset editor shows it; absent in an older preset, where a block falls under the header above it. */
+  group?: string | null;
+  /** The prompt variables it declares, which every switched-on block's macros read (`{{var::name}}`). */
+  variables?: readonly HostPromptVariable[];
+}
+
+/** A prompt variable a preset block declares (Lumiverse's `PromptVariableDef`): its name, its kind, its default and, for a choice, its options. */
+export interface HostPromptVariable {
+  name: string;
+  type: "text" | "textarea" | "number" | "slider" | "range" | "select" | "switch" | "multiselect";
+  defaultValue: unknown;
+  min?: number;
+  max?: number;
+  /** A select's or a multiselect's options: what is stored is the option's id, what macros read its value. */
+  options?: readonly { id: string; value: string }[];
+  /** What a multiselect's values are joined with; two newlines when absent. */
+  separator?: string;
+}
+
+/** The values a preset's user set for its blocks' variables (its `metadata.promptVariables`), by block id, then by variable name. */
+export type HostPromptValues = Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+
+/** A block the engine adds to a preset: a category header, or text that stays switched off. */
+export type HostPresetBlockInput = { kind: "category"; name: string } | { kind: "text"; name: string; content: string };
+
+// ---------------------------------------------------------------- regex scripts
+
+/** A regex script of the user's (`regex_scripts`), scoped to a chat or global, as the backend reads one. */
+export interface HostRegexScript {
+  id: string;
+  /** The chat it is scoped to; null for a global one. */
+  chatId: ChatId | null;
+  /** This extension created it, so it may change or delete it (the host's `can_mutate`). */
+  mine: boolean;
+  findRegex: string;
+  replaceString: string;
+  flags: string;
+  placement: string[];
+  /** Where it runs; one script may run on several targets. */
+  targets: string[];
+  runOnEdit: boolean;
+  /** Lower runs earlier: on display among every script, elsewhere within its scope (global ones before a chat's). */
+  sortOrder: number;
+  metadata: JsonObject;
+}
+
+/** A script the backend writes, scoped to a chat, or global with `chatId` null. Its capture references are the host's (`$&`, `$1`), with no macros. */
+export interface HostRegexScriptInput {
+  name: string;
+  /** Stable and unique per user: the host refuses a second script with the same one. */
+  scriptId: string;
+  chatId: ChatId | null;
+  findRegex: string;
+  replaceString: string;
+  flags: string;
+  placement: "ai_output"[];
+  targets: ("response" | "display" | "prompt")[];
+  runOnEdit: boolean;
+  sortOrder: number;
+  description: string;
+  folder: string;
+  metadata: JsonObject;
+}
+
+// ---------------------------------------------------------------- the port
+
+export interface HostPort {
+  chats: {
+    messages(chatId: ChatId, userId: UserId): Promise<HostMessage[]>;
+    /** A stamp of the chat's messages as a port that keeps them holds them now: another stamp, or null, says they may have changed since. A port that keeps none has none. */
+    stamp?(chatId: ChatId, userId: UserId): number | null;
+    /** Replaces the message's whole `spindle_metadata` bag (host semantics; G2). Callers read-merge-write. */
+    writeMetadata(chatId: ChatId, messageId: MessageId, bag: JsonObject, userId: UserId): Promise<void>;
+    chatMetadata(chatId: ChatId, userId: UserId): Promise<JsonObject>;
+    mergeChatMetadata(chatId: ChatId, patch: JsonObject, userId: UserId): Promise<void>;
+    /** Appends a user message, optionally triggering a generation (palette and chip actions). */
+    appendUserMessage(chatId: ChatId, content: string, metadata: JsonObject, triggerGeneration: boolean, userId: UserId): Promise<MessageId>;
+    /** The chat the user has open, if any (`chats.getActive`). */
+    active(userId: UserId): Promise<ChatId | null>;
+    /** Every chat of the user's, most recently updated first (`chats.list`, paged through). */
+    list(userId: UserId): Promise<HostChat[]>;
+    /** Rewrites a message's swipes and the one shown (`chat.updateMessage`); the host keeps the swipe dates in step. */
+    setSwipes(chatId: ChatId, messageId: MessageId, swipes: readonly string[], swipeId: number, userId: UserId): Promise<void>;
+    /** Deletes a message, every swipe of it (`chat.deleteMessage`): the host sends MESSAGE_DELETED. Only the user's own act starts one (a whole turn undone). */
+    deleteMessage(chatId: ChatId, messageId: MessageId, userId: UserId): Promise<void>;
+  };
+  storage: {
+    read(path: string, userId: UserId): Promise<string | null>;
+    write(path: string, data: string, userId: UserId): Promise<void>;
+    move(from: string, to: string, userId: UserId): Promise<void>;
+    remove(path: string, userId: UserId): Promise<void>;
+    /** Every file under the prefix directory, recursively, as full storage paths (`"worlds/w_1/index.json"`). */
+    list(prefix: string, userId: UserId): Promise<string[]>;
+  };
+  /** The extension's own storage (`spindle.storage`), shared by every user: only what is no one's, such as the build it last started as. */
+  extensionStorage: {
+    read(path: string): Promise<string | null>;
+    write(path: string, data: string): Promise<void>;
+  };
+  on<K extends HostEventName>(event: K, handler: (payload: HostEventMap[K], userId: UserId | null) => void): () => void;
+  /** What the host does with the context handler's answer, read once at start. */
+  readonly capabilities: HostCapabilities;
+  /** The one context handler (the guard, DESIGN §5.1): `required` asks the host to stop the generation when it fails or runs out of time. */
+  registerContextHandler(handler: (input: ContextHandlerInput, signal: AbortSignal) => Promise<ContextVerdict>, options: { timeoutMs: number; required: boolean }): void;
+  /** The one World Info interceptor (DESIGN §6.1), asked before activation in every prompt assembly; on a throw or past the host's time, the entries go on as stored. */
+  registerWorldInfoInterceptor(handler: (input: WorldInfoInput) => Promise<WorldInfoVerdict>): void;
+  models: {
+    quiet(request: QuietRequest, userId: UserId, signal: AbortSignal): Promise<QuietResult>;
+    decide(request: DecideRequest, userId: UserId, signal: AbortSignal): Promise<DecideResult>;
+  };
+  tokens: {
+    /** The host tokenizer's count for each text (the user's main model, as the prompt breakdown counts), or null when it can't count; rejects with a `TimeoutFired` when counting takes longer than `limit`. */
+    count(texts: readonly string[], userId: UserId, limit: Limit): Promise<number[] | null>;
+  };
+  frontend: {
+    send(message: BackendToFrontend, userId: UserId | null, frontendSessionId?: string): void;
+    onMessage(handler: (message: unknown, userId: UserId, frontendSessionId?: string) => void): () => void;
+    /** `spindle.ui.closeDrawer` (the frontend has no such API; DESIGN §12). */
+    closeDrawer(userId: UserId): Promise<void>;
+  };
+  /** A toast on the user's open pages (`spindle.toast.info`), titled LumiRPEngine. */
+  toast(message: string, userId: UserId): void;
+  books: {
+    create(name: string, description: string, userId: UserId): Promise<string>;
+    exists(bookId: string, userId: UserId): Promise<boolean>;
+    /**
+     * Every World Info book of the user's (`world_books.list`, paged through); `engine`: one the
+     * engine made for a world; `character`: one a character brought (Lumiverse makes a book of its
+     * own for each one a card it imports carries, so it may share a name with one the user imported);
+     * `added`: when it was made, in Unix seconds (null when the host doesn't say); `updated`: when it
+     * or any of its entries last changed, in Unix seconds (null when the host doesn't say).
+     */
+    list(userId: UserId): Promise<{ id: string; name: string; engine: boolean; character: boolean; added: number | null; updated: number | null }[]>;
+    entries(bookId: string, userId: UserId): Promise<HostBookEntry[]>;
+    /** One entry by id (`world_books.entries.get`), or null when it is gone. */
+    entry(entryId: string, userId: UserId): Promise<HostBookEntry | null>;
+    /** The ids of the user's global books (`world_books.getGlobal`), which the host scans in every chat. */
+    global(userId: UserId): Promise<string[]>;
+    createEntry(bookId: string, entry: HostBookEntryInput, userId: UserId): Promise<string>;
+    /** Moves an entry (its position, depth, role and outlet) and rewrites its extension data. */
+    place(entryId: string, placement: HostEntryPlacement, extensions: JsonObject, userId: UserId): Promise<void>;
+    /** Fills an entry and switches it on as a constant one, or with null empties it and switches it off; where it sits stays. */
+    fill(entryId: string, content: string | null, userId: UserId): Promise<void>;
+
+    /**
+     * Writes the parts of an entry `patch` gives, and nothing else of it: its text, its keywords,
+     * whether it is stored switched off and its extension data. Only the user's own press writes a
+     * user's entry this way (Build's make-secret, the secrecy move and its restore, DESIGN §4.2). The
+     * host indexes the entry's text afresh when its text or its switch is written.
+     */
+    update(entryId: string, patch: HostEntryPatch, userId: UserId): Promise<void>;
+    deleteEntry(entryId: string, userId: UserId): Promise<void>;
+  };
+  /** A dry-run assembly of the chat's next prompt (deliverability check, DESIGN §4.2; the D32 preset lint). */
+  dryRun(chatId: ChatId, userId: UserId): Promise<DryRun>;
+  presets: {
+    /** A preset with its revision (each change to it bumps it) and the values its user set for its blocks' variables; null when there's no such preset. */
+    get(presetId: string, userId: UserId): Promise<{ id: string; name: string; revision: number; values?: HostPromptValues } | null>;
+    /**
+     * The preset the host generates the chat with, by its own resolution as prompt assembly makes it
+     * (the selected Loom preset, else the chat's connection's, then the profile bindings), and the
+     * block states those bindings set, by block id. With no chat: the selected preset and its defaults.
+     */
+    active(chatId: ChatId | null, userId: UserId): Promise<{ presetId: string | null; blockStates: Readonly<Record<string, boolean>> }>;
+    /** The preset's blocks, in order. */
+    blocks(presetId: string, userId: UserId): Promise<HostPresetBlock[]>;
+    /** Inserts blocks at `at` (null: the end) in one write of the preset's stored blocks as they are, while it is still at `revision`. */
+    insertBlocks(presetId: string, revision: number, at: number | null, blocks: readonly HostPresetBlockInput[], userId: UserId): Promise<void>;
+  };
+  macros: {
+    /**
+     * `template` with its macros resolved by Lumiverse's own engine for the chat, committing nothing
+     * (`macros.resolve`, `commit: false`): the chat's character, persona, chat and messages, but none
+     * of prompt assembly's own state. What the engine said of it besides, once each.
+     */
+    resolve(template: string, chatId: ChatId, userId: UserId): Promise<{ text: string; diagnostics: string[] }>;
+  };
+  connections: {
+    /** The user's default connection: the one a generation without its own route uses. */
+    active(userId: UserId): Promise<{ id: string; name: string } | null>;
+    /** The user's connection profiles, by id and name: what a step's own connection must be one of. */
+    list(userId: UserId): Promise<{ id: string; name: string }[]>;
+    /** The models a connection's provider offers, by id; null when the host can't list them or the provider doesn't answer, so nothing is said of a model. */
+    models(connectionId: string, userId: UserId): Promise<string[] | null>;
+    /** The user's Decisions API connection profiles, by id and name: what a Decision step's own connection must be one of. */
+    decisionList(userId: UserId): Promise<{ id: string; name: string }[]>;
+    /** One connection (null: the user's default) as the agent runtime needs it; null when there's no such connection. */
+    profile(connectionId: string | null, userId: UserId): Promise<HostConnectionProfile | null>;
+  };
+  /**
+   * Lumiverse's MCP server profiles (`spindle.mcp.servers`, the `mcp_servers` permission; DESIGN §23,
+   * G13), read to find the ones that run lumirpengine. Nothing here creates, changes or connects one.
+   */
+  mcp: {
+    /** Whether `mcp_servers` is granted now. */
+    granted(): boolean;
+    /** The user's stdio profiles, each by its id and name: nothing else of a profile is kept. */
+    stdioProfiles(userId: UserId): Promise<{ id: string; name: string }[]>;
+    /** Whether Lumiverse's client is connected to the profile, and the tools it holds for it, as the server listed them. */
+    status(profileId: string, userId: UserId): Promise<{ connected: boolean; tools: ListedTool[] }>;
+  };
+  regex: {
+    /** Chat-scoped scripts: one chat's, or with null every chat's. */
+    chatScripts(chatId: ChatId | null, userId: UserId): Promise<HostRegexScript[]>;
+    /** Global scripts. */
+    globalScripts(userId: UserId): Promise<HostRegexScript[]>;
+    /** Writes a script: a new one when `id` is null, else `id`'s definition (whether it is switched on stays the user's). Its id. */
+    write(id: string | null, script: HostRegexScriptInput, userId: UserId): Promise<string>;
+    remove(id: string, userId: UserId): Promise<void>;
+  };
+  processes: {
+    /** `startupMs` and `heartbeatMs`: how long Lumiverse waits for the process to start and between its heartbeats, already within its limits (`HOST_LIMITS`; a heartbeat of 0 checks none). */
+    spawn(options: { entry: string; kind: string; key: string; payload: JsonValue; userId: UserId; startupMs: number; heartbeatMs: number }): Promise<ProcessHandle>;
+    onMessage(handler: (event: ProcessEvent) => void): () => void;
+    onLifecycle(handler: (event: ProcessEvent) => void): () => void;
+  };
+  /**
+   * A log line. With `userId` it concerns that user's chats: the diagnostics mirror keeps it in
+   * their own storage, never in the extension-wide file. `turn` (a generation id) tags the line with
+   * the turn it belongs to. `debug` lines go to the mirror only.
+   */
+  log(level: "debug" | "info" | "warn" | "error", message: string, userId?: UserId, turn?: string): void;
+}

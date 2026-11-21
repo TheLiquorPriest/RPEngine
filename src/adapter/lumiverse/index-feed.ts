@@ -1,0 +1,199 @@
+// What the door puts into the index file's messages and entries indexes, and the search over them (STANDALONE-PLAN §4.2 "No copy", §4.1 l.199,
+// Appendix B). The index holds the tokens of each text and its id, revision and scope (the chat or the book), never the text: a search answers
+// ids from the index, and the text of the hits alone is read from Lumiverse's rows. The door feeds it from Lumiverse's rows as they stand: a chat is
+// brought up to date at the search that needs it (and again in the background when Lumiverse says one of its messages changed), a book the same, so
+// what a search finds is what is in Lumiverse, edits and deletes included, whether or not an event was heard.
+//
+// An entry is two texts of the index: the whole of it in its book's scope, and its names alone (its title, keys, secondary keys and LRE aliases) in
+// its book's names scope, so an entry a word names is found among many that only mention it.
+//
+// What the feed knows of what it has put is each chat's and book's id to revision, kept for the process's life, and read back from the index file
+// the first time a chat or a book is fed after RPE starts: so a text of the revision the index holds is left as it is, and a message or an entry
+// deleted while RPE was not running is dropped from the index, not only left out of every search.
+
+import type { IndexDoc, IndexHit, IndexName } from "../../app/index-file/index-file";
+import { bookLoreFieldsOf } from "../../shared/lore";
+import type { LumiverseReads, LvStep } from "./reads";
+import type { LvEntry } from "./rows";
+
+/** The index file as the feed uses it; the app's `IndexFile` is one. */
+export interface IndexPort {
+  put(index: IndexName, user: string, docs: readonly IndexDoc[]): Promise<unknown>;
+  drop(index: IndexName, user: string, ids: readonly string[]): Promise<unknown>;
+  search(index: IndexName, user: string, query: string, options: { scope?: string | null; limit: number; prefix?: boolean }): Promise<IndexHit[]>;
+  held(index: IndexName, user: string, scope: string): Promise<{ id: string; revision: string }[]>;
+}
+
+export interface FeedDeps {
+  index: IndexPort;
+  reads: LumiverseReads;
+  /** The user RPE belongs to: the only one whose texts are fed. */
+  user: string;
+  log(message: string): void;
+}
+
+/** How many messages are read from Lumiverse, and put into the index, at once. */
+const STRETCH = 500;
+
+/** What marks a message's indexed text as the one now: Lumiverse's revision, the swipe shown and the hash of its text, so an edit and a swipe flip both change it. */
+const keyOf = (s: LvStep): string => `${s.revision}.${s.swipe}.${s.shown.hash}`;
+
+/** What of an entry is searched: its title, its keys and its text. */
+const entryText = (e: LvEntry): string => [e.comment, ...e.keys, ...e.secondaryKeys, e.content].join("\n");
+
+/** What an entry is named by: its title, its keys, its secondary keys and its LRE aliases. */
+const namesText = (e: LvEntry): string => [e.comment, ...e.keys, ...e.secondaryKeys, ...(bookLoreFieldsOf(e.extensions)?.aliases ?? [])].join("\n");
+
+/** The index's id of an entry's names, and its book's scope for them. */
+const namesId = (entry: string): string => `${entry}\u0000n`;
+const namesScope = (book: string): string => `${book}\u0000n`;
+
+/** One word a search of entries asks the index for: whole, or as the start of a word; `names`: of the entries' names alone. */
+export interface EntryWord {
+  text: string;
+  prefix: boolean;
+  names?: true;
+}
+
+/** One place the index and Lumiverse's rows are compared, one at a time per chat or book. */
+class Serial {
+  readonly #tails = new Map<string, Promise<unknown>>();
+
+  run<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const tail = (this.#tails.get(key) ?? Promise.resolve()).catch(() => undefined);
+    const mine = tail.then(work);
+    this.#tails.set(key, mine);
+    void mine.catch(() => undefined).then(() => {
+      if (this.#tails.get(key) === mine) this.#tails.delete(key);
+    });
+    return mine;
+  }
+}
+
+export class IndexFeed {
+  readonly #chats = new Map<string, Map<string, string>>();
+  readonly #books = new Map<string, Map<string, string>>();
+  /** The book each entry fed is in. */
+  readonly #bookOf = new Map<string, string>();
+  readonly #serial = new Serial();
+
+  constructor(private readonly deps: FeedDeps) {}
+
+  /** What the index holds within a chat's or a book's scope, as the feed knows it: from the index file itself, the first time after RPE started. */
+  async #had(known: ReadonlyMap<string, ReadonlyMap<string, string>>, index: IndexName, scope: string): Promise<ReadonlyMap<string, string>> {
+    return known.get(scope) ?? new Map((await this.deps.index.held(index, this.deps.user, scope)).map((h) => [h.id, h.revision] as const));
+  }
+
+  /** The chat's messages brought up to date in the index: what was added or changed is put, what is gone is dropped. Null where the user has no such chat. */
+  ensureChat(chat: string): Promise<LvStep[] | null> {
+    return this.#serial.run(`chat\u0000${chat}`, async () => {
+      const { reads, index, user } = this.deps;
+      const path = await reads.path(chat);
+      // A chat deleted, while RPE ran or not: what the index holds of it goes.
+      if (path === null) {
+        await this.#forget(chat);
+        return null;
+      }
+      const had = await this.#had(this.#chats, "messages", chat);
+      const now = new Map(path.map((s) => [s.id, keyOf(s)] as const));
+      const changed = path.filter((s) => had.get(s.id) !== now.get(s.id)).map((s) => s.id);
+      const gone = [...had.keys()].filter((id) => !now.has(id));
+      for (let at = 0; at < changed.length; at += STRETCH) {
+        const texts = await reads.messagesById(chat, changed.slice(at, at + STRETCH));
+        await index.put(
+          "messages",
+          user,
+          texts.map((m): IndexDoc => ({ id: m.id, revision: now.get(m.id) ?? "", scope: chat, text: m.text })),
+        );
+      }
+      if (gone.length > 0) await index.drop("messages", user, gone);
+      this.#chats.set(chat, now);
+      return path;
+    });
+  }
+
+  /**
+   * The messages of the chat that hold every word of `text`, best first, by id, with the chat's path they were found against. The words are asked as prefixes,
+   * as a chat search reads them. Null where the user has no such chat. A hit the chat's path no longer holds is left out.
+   */
+  async searchChat(chat: string, text: string): Promise<{ path: LvStep[]; ids: string[] } | null> {
+    const path = await this.ensureChat(chat);
+    if (path === null) return null;
+    const hits = await this.deps.index.search("messages", this.deps.user, text, { scope: chat, limit: Math.max(1, path.length), prefix: true });
+    const here = new Set(path.map((s) => s.id));
+    return { path, ids: hits.filter((h) => here.has(h.id)).map((h) => h.id) };
+  }
+
+  /** What Lumiverse says changed in a chat the feed holds: the chat is brought up to date in the background. */
+  changed(chat: string): void {
+    if (!this.#chats.has(chat)) return;
+    this.ensureChat(chat).catch((error: unknown) => this.deps.log(`RPE could not bring its search of chat ${chat} up to date: ${error instanceof Error ? error.message : String(error)}`));
+  }
+
+  /** The chat's search entries let go of, for the Storage page's prune of a living chat's derived rows; the chat is fed again at its next search. */
+  dropChat(chat: string): Promise<void> {
+    return this.#serial.run(`chat\u0000${chat}`, () => this.#forget(chat));
+  }
+
+  /** Every text the index holds of the chat dropped, and the feed's knowledge of it with them. */
+  async #forget(chat: string): Promise<void> {
+    const { index, user } = this.deps;
+    const ids = (await index.held("messages", user, chat)).map((h) => h.id);
+    this.#chats.delete(chat);
+    if (ids.length > 0) await index.drop("messages", user, ids);
+  }
+
+  /** The book's entries brought up to date in the index, and what they are: Lumiverse's own, in its order. */
+  ensureBook(book: string): Promise<LvEntry[]> {
+    return this.#serial.run(`book\u0000${book}`, async () => {
+      const { reads, index, user } = this.deps;
+      const entries = await reads.entries(book);
+      const had = await this.#had(this.#books, "entries", book);
+      const now = new Map(entries.map((e) => [e.id, String(e.revision)] as const));
+      const changed = entries.filter((e) => had.get(e.id) !== now.get(e.id));
+      for (let at = 0; at < changed.length; at += STRETCH) {
+        await index.put(
+          "entries",
+          user,
+          changed.slice(at, at + STRETCH).flatMap((e): IndexDoc[] => {
+            const revision = now.get(e.id) ?? "";
+            return [
+              { id: e.id, revision, scope: book, text: entryText(e) },
+              { id: namesId(e.id), revision, scope: namesScope(book), text: namesText(e) },
+            ];
+          }),
+        );
+      }
+      const gone = [...had.keys()].filter((id) => !now.has(id));
+      if (gone.length > 0) await index.drop("entries", user, gone.flatMap((id) => [id, namesId(id)]));
+      for (const id of gone) this.#bookOf.delete(id);
+      for (const e of entries) this.#bookOf.set(e.id, book);
+      this.#books.set(book, now);
+      return entries;
+    });
+  }
+
+  /**
+   * The entries of these books the index finds for any of `words`, each asked alone of the entries' names and, but for a word of names
+   * alone, of their whole texts, at most `limit` hits for each ask: the rows of those entries alone, in each book's order (plan §4.2
+   * "No copy": a search reads only what the index found).
+   */
+  async foundEntries(books: readonly string[], words: readonly EntryWord[], limit: number): Promise<LvEntry[]> {
+    const held = await Promise.all(books.map((b) => this.ensureBook(b)));
+    const { index, user } = this.deps;
+    const asks = books.flatMap((book) =>
+      words.flatMap((w) => [
+        index.search("entries", user, w.text, { scope: namesScope(book), limit, prefix: w.prefix }),
+        ...(w.names === true ? [] : [index.search("entries", user, w.text, { scope: book, limit, prefix: w.prefix })]),
+      ]),
+    );
+    const ids = new Set<string>();
+    for (const hits of await Promise.all(asks)) for (const h of hits) ids.add(h.id.endsWith("\u0000n") ? h.id.slice(0, -2) : h.id);
+    return held.flat().filter((e) => ids.has(e.id));
+  }
+
+  /** The book an entry fed is in; null where the feed has not fed it. */
+  bookOf(entry: string): string | null {
+    return this.#bookOf.get(entry) ?? null;
+  }
+}

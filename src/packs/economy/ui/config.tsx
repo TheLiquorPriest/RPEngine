@@ -1,0 +1,788 @@
+// Build → Packs → economy: the economy pack's own config fields, in the Build forms' idiom, above
+// its config as JSON. The narrated-price cap (DESIGN §9.5) is the most a narrated price charges for
+// something no catalog row prices, and the claim cap (§9.4) the most a thing the player says they
+// have may cost before a capped Make it real asks first; each is typed as the world's currency
+// writes it and stored in whole minor units, and left empty, the engine derives it from the tables.
+// The region prices living and taxes for whoever names none; living costs are a week's spending
+// per wealth band; taxes are the spending categories sales tax never falls on, the corporate rate,
+// and the unemployment taxes' rates and wage bases, each empty for the tables' (§26); shares, the
+// units a company starts counting its owners' stakes in (§27.10).
+// The Custom toggles (DESIGN §25) switch a money feature on or off, under any preset, at the levels
+// its floor allows, on a page of their own; products are the world's own account products and
+// assets are what holdings hold (§27), each a row that opens as a sheet. Styles:
+// styles/packs-money.ts.
+
+import type { ComponentChildren } from "preact";
+import { useState } from "preact/hooks";
+import type { JsonObject, JsonValue } from "../../../shared/json";
+import { hasOwn, isRecord } from "../../../shared/json";
+import { ACCOUNT_CLASSES, ASSET_CLASSES, CLASS_TRAITS, DEPRECIATION_LABELS, FEATURE_DEFS, FINANCE_FEATURES, isAccountClass, OVERDRAFT_POLICIES, type FinanceFeature } from "../../../shared/finance";
+import type { LintIssue } from "../../../shared/lint";
+import { formatMoneyInput } from "../../../shared/money";
+import { REVENUE_ADJUST_DEFAULTS } from "../../../shared/revenue";
+import { formatMoney, type WorldCurrency, type WorldDoc } from "../../../shared/world";
+import { Button, IconButton, IdText, Seg, type SegOption } from "../../../frontend/components";
+import { FormGroup, FormSheet, Issues, ItemRow, RefPicker, type RefOption } from "../../../frontend/build/form-kit";
+import type { FieldSpec } from "../../../frontend/build/schema";
+import { ChoiceInput, DateInput, type FormCtx, lintAt, LintBadge, MinorMoneyInput, NewKey, NumberInput, SchemaFields } from "../../../frontend/build/schema-form";
+import { humanize } from "../../../frontend/format";
+import type { PackConfigProps } from "../../../frontend/registry";
+import { derivedClaimCap, derivedUnpricedCap, WEALTH_BANDS } from "../core/model";
+import { LISTING_REVERSION } from "../core/assets";
+import { LISTING_OFFER_CAP } from "../core/listing";
+import { SHARE_UNITS } from "../core/shares";
+import { CORPORATE_PCT } from "../core/taxes";
+
+/** A Custom toggle's state: as the level decides, or forced on or off. */
+export type ToggleState = "level" | "on" | "off";
+
+export function toggleOf(config: Readonly<JsonObject>, feature: FinanceFeature): ToggleState {
+  const set = isRecord(config.features) ? config.features[feature] : undefined;
+  return set === true ? "on" : set === false ? "off" : "level";
+}
+
+/** The config with one toggle set; "level" removes it, and an empty set of toggles goes too. */
+export function withToggle(config: Readonly<JsonObject>, feature: FinanceFeature, state: ToggleState): JsonObject {
+  const features: JsonObject = isRecord(config.features) ? { ...config.features } : {};
+  if (state === "level") delete features[feature];
+  else features[feature] = state === "on";
+  const { features: _old, ...rest } = config;
+  return Object.keys(features).length > 0 ? { ...rest, features } : { ...rest };
+}
+
+/** The regions a world can be in: the regions table's rows by name, the national baseline first. */
+export function regionChoices(world: WorldDoc): RefOption[] {
+  const rows = world.tables["economy.regions"]?.rows ?? {};
+  const choices = Object.entries(rows).map(([id, row]) => ({ value: id, label: typeof row.name === "string" && row.name !== "" ? row.name : id, national: row.scope === "national" }));
+  choices.sort((a, b) => Number(b.national) - Number(a.national) || a.label.localeCompare(b.label));
+  return choices.map(({ value, label }) => ({ value, label }));
+}
+
+/** The config in `region`, or with none ("" removes it). */
+export function withRegion(config: Readonly<JsonObject>, region: string): JsonObject {
+  const { region: _old, ...rest } = config;
+  return region === "" ? { ...rest } : { ...rest, region };
+}
+
+/** The config with a band's weekly living costs set, or removed; with no band left, `livingCosts` goes too. */
+export function withLivingCost(config: Readonly<JsonObject>, band: string, cents: number | undefined): JsonObject {
+  const costs: JsonObject = isRecord(config.livingCosts) ? { ...config.livingCosts } : {};
+  if (cents === undefined) delete costs[band];
+  else costs[band] = Math.round(cents);
+  const { livingCosts: _old, ...rest } = config;
+  return Object.keys(costs).length > 0 ? { ...rest, livingCosts: costs } : { ...rest };
+}
+
+/** The economy config's tax settings (`taxes`): the categories sales tax spares, the corporate rate, the unemployment taxes' rates and wage bases (ORG-SPEC §3.11, Phase 5), and whether corporations pay tax on the earnings they keep (`penaltyTaxes`, DESIGN §26.3). */
+export type TaxSetting = "exempt" | "corporatePct" | "futaPct" | "futaWageBase" | "futaCreditPct" | "sutaPct" | "sutaWageBase" | "penaltyTaxes";
+
+/** The config with one of its tax settings set, or removed (undefined); with none left, `taxes` goes too. */
+export function withTax(config: Readonly<JsonObject>, key: TaxSetting, value: JsonValue | undefined): JsonObject {
+  const taxes: JsonObject = isRecord(config.taxes) ? { ...config.taxes } : {};
+  if (value === undefined) delete taxes[key];
+  else taxes[key] = value;
+  const { taxes: _old, ...rest } = config;
+  return Object.keys(taxes).length > 0 ? { ...rest, taxes } : { ...rest };
+}
+
+/** The spending categories sales tax could spare: the categories table's rows by name, and any the config exempts that the table doesn't have, kept as they are. */
+export function exemptChoices(world: WorldDoc, exempt: readonly string[]): RefOption[] {
+  const rows = world.tables["economy.categories"]?.rows ?? {};
+  const known = Object.entries(rows).map(([id, row]) => ({ value: id, label: typeof row.name === "string" && row.name !== "" ? row.name : id }));
+  return [...known, ...exempt.filter((c) => !hasOwn(rows, c)).map((c) => ({ value: c, label: `${c} (not in the categories table)` }))];
+}
+
+const CONFIG = "packs.economy.config";
+const isObject = (v: JsonValue | undefined): v is JsonObject => isRecord(v);
+
+/** An object with one key set, or gone when `next` is undefined; a key it had keeps its place. */
+function withKey(values: JsonObject, key: string, next: JsonValue | undefined): JsonObject {
+  const out = { ...values };
+  if (next === undefined) delete out[key];
+  else out[key] = next;
+  return out;
+}
+
+// Amounts are typed in the world's currency and stored in whole minor units.
+const money = (key: string, label: string): FieldSpec => ({ kind: "money", key, label, min: 0, optional: true });
+const pct = (key: string, label: string): FieldSpec => ({ kind: "number", key, label: `${label} (%)`, min: 0, optional: true });
+
+/** A product's name, class and institution (`ProductDef`), above its credit limit. */
+const PRODUCT_HEAD: FieldSpec[] = [
+  { kind: "text", key: "label", label: "Name" },
+  { kind: "enum", key: "class", label: "Class", values: ACCOUNT_CLASSES },
+  { kind: "text", key: "institution", label: "Institution", optional: true },
+];
+
+/** The rest of a product's parameters, under its credit limit: what isn't set comes from its class's defaults in the finance tables. */
+const PRODUCT_TAIL: FieldSpec[] = [
+  pct("apr_pct", "APR"),
+  pct("apy_pct", "APY"),
+  { kind: "enum", key: "interest", label: "Interest method", values: ["monthly_simple", "average_daily"], optional: true },
+  pct("penalty_apr_pct", "Penalty APR, from 60 days late"),
+  pct("cash_advance_apr_pct", "Cash advance APR"),
+  { kind: "number", key: "statement_day", label: "Statement day", min: 1, max: 28, step: 1, optional: true },
+  { kind: "number", key: "due_days", label: "Days from statement to due date", min: 0, step: 1, optional: true },
+  { kind: "object", key: "minimum", label: "Minimum payment", optional: true, fields: [pct("pct", "Of the statement balance"), money("floor", "At least"), { kind: "bool", key: "plus_interest", label: "Plus the cycle's interest and fees" }] },
+  {
+    kind: "object",
+    key: "fees",
+    label: "Fees",
+    optional: true,
+    fields: [money("annual", "Annual"), money("late_first", "Late, first"), money("late_repeat", "Late, again within six cycles"), money("overdraft", "Overdraft item"), money("nsf", "Returned item"), money("atm", "Other banks' machines"), pct("cash_advance_pct", "Cash advance"), money("cash_advance_min", "Cash advance at least"), money("maintenance", "Monthly maintenance"), money("maintenance_waive", "Maintenance waived from a balance of"), money("card_replacement", "Card replacement")],
+  },
+  pct("rewards_pct", "Rewards on purchases"),
+  money("daily_purchase_limit", "Daily card purchases"),
+  money("daily_atm_limit", "Daily cash machine withdrawals"),
+  { kind: "number", key: "hold_days", label: "Days a machine deposit stays on hold", min: 0, step: 1, optional: true },
+  { kind: "enum", key: "overdraft", label: "Overdraft policy", values: OVERDRAFT_POLICIES, optional: true },
+  money("overdraft_limit", "How far a fee overdraft may go"),
+  { kind: "number", key: "term_months", label: "Term (months)", min: 0, step: 1, optional: true },
+  { kind: "bool", key: "secured", label: "Secured by an asset (a mortgage, a car loan)" },
+];
+
+/** An asset's class, price and price path (`AssetDef`), and a bond's face and coupon, above its maturity date. */
+const ASSET_HEAD: FieldSpec[] = [
+  { kind: "text", key: "label", label: "Name" },
+  { kind: "enum", key: "class", label: "Class", values: ASSET_CLASSES },
+  { kind: "text", key: "symbol", label: "Symbol", optional: true },
+  money("price", "Price per unit at the start"),
+  { kind: "text", key: "model", label: "Price path", optional: true, hint: "A finance table recipe; empty: the class's" },
+  { kind: "number", key: "annual_return_pct", label: "Return a year (%)", optional: true },
+  pct("annual_volatility_pct", "Volatility a year"),
+  pct("yield_pct", "Pays out a year, of its value"),
+  { kind: "number", key: "pays_per_year", label: "Payouts a year", min: 0, step: 1, optional: true },
+  { kind: "number", key: "correlation", label: "Follows its class's market (0–1)", min: 0, max: 1, step: 0.05, optional: true },
+  money("face", "Bond: face value"),
+  pct("coupon_pct", "Bond: coupon"),
+];
+
+/** An option's underlying and strike, between the bond's maturity and the option's expiry. */
+const ASSET_OPTION: FieldSpec[] = [{ kind: "text", key: "underlying", label: "Option: underlying asset id", optional: true }, money("strike", "Option: strike")];
+
+/** The rest of an option, and what the asset stands for. */
+const ASSET_TAIL: FieldSpec[] = [
+  { kind: "enum", key: "right", label: "Option: right", values: ["call", "put"], optional: true },
+  { kind: "number", key: "multiplier", label: "Units per contract", min: 1, step: 1, optional: true },
+  { kind: "enum", key: "settlement", label: "Option: settled", values: ["physical", "cash"], optional: true },
+  { kind: "ref", key: "entity", label: "Stands for (a business or a property)", collection: "entities", optional: true },
+];
+
+/** The narrated-price cap, the claim cap and the region: what prices, rents, taxes and claims follow. */
+function Prices(props: PackConfigProps) {
+  const currency = props.world.currency;
+  const derived = derivedUnpricedCap(props.world);
+  const meal = derivedClaimCap(props.world);
+  const { unpricedCap, ...rest } = props.config;
+  const region = typeof props.config.region === "string" ? props.config.region : "";
+  const choices = regionChoices(props.world);
+  // A region the table doesn't have stays shown as it is, so opening the form doesn't change it.
+  const options = region === "" || choices.some((c) => c.value === region) ? choices : [{ value: region, label: `${region} (not in the regions table)` }, ...choices];
+  return (
+    <FormGroup title="Prices and region">
+      <MinorMoneyInput
+        label="Narrated-price cap"
+        value={unpricedCap}
+        currency={currency}
+        min={1}
+        optional
+        placeholder={formatMoneyInput(derived, currency)}
+        hint={`Empty uses ${formatMoney(derived, currency)}, the highest price band in the catalog and categories. A price the player states is never capped.`}
+        issues={lintAt(props.lint, `${CONFIG}.unpricedCap`)}
+        onChange={(value) => props.onChange(value === undefined ? rest : { ...rest, unpricedCap: value })}
+      />
+      <MinorMoneyInput
+        label="Claim cap"
+        value={props.config.claimCap}
+        currency={currency}
+        min={1}
+        optional
+        placeholder={formatMoneyInput(meal, currency)}
+        hint={`Empty uses ${formatMoney(meal, currency)}, about the price of a meal. When the player says they have something the world doesn't, Make it real with the cap on asks first about anything that costs more.`}
+        issues={lintAt(props.lint, `${CONFIG}.claimCap`)}
+        onChange={(value) => props.onChange(withKey(props.config, "claimCap", value))}
+      />
+      <div class="lre-field">
+        <RefPicker label="Region" value={region} none="Not set: the national averages" options={options} onChange={(v) => props.onChange(withRegion(props.config, v))} />
+        <span class="lre-field-help">Prices, rents and taxes follow its cost of living and rates for anyone who doesn't name a region of their own.</span>
+        <Issues issues={lintAt(props.lint, `${CONFIG}.region`)} />
+      </div>
+    </FormGroup>
+  );
+}
+
+/**
+ * A week of living costs per wealth band. The engine takes the world's amounts for every band once
+ * any band has one (a band left empty then spends nothing), else prices each band's week from the
+ * catalog's grocery baskets.
+ */
+function LivingCosts(props: PackConfigProps) {
+  const currency = props.world.currency;
+  const costs = isRecord(props.config.livingCosts) ? props.config.livingCosts : {};
+  const own = Object.keys(costs).length > 0;
+  return (
+    <FormGroup title="Living costs">
+      <span class="lre-field-help">{own ? "What someone in each wealth band spends a week. A band left empty spends nothing." : "Each band's week is priced from the catalog's grocery baskets. Set any band and these amounts replace that for every band."}</span>
+      <div class="lre-money-build-bands">
+        {WEALTH_BANDS.map((b) => (
+          <MinorMoneyInput key={b.label} label={`${humanize(b.label)}, a week`} value={costs[b.label]} currency={currency} min={0} optional issues={lintAt(props.lint, `${CONFIG}.livingCosts.${b.label}`)} onChange={(v) => props.onChange(withLivingCost(props.config, b.label, typeof v === "number" ? v : undefined))} />
+        ))}
+      </div>
+      <Issues issues={props.lint.filter((issue) => issue.path === `${CONFIG}.livingCosts`)} />
+    </FormGroup>
+  );
+}
+
+type TaxState = "taxed" | "exempt";
+
+const TAX_CHOICES: readonly SegOption<TaxState>[] = [
+  { value: "taxed", label: "Taxed" },
+  { value: "exempt", label: "Exempt" },
+];
+
+const EXEMPT_NOTE = "A category exempt here is never taxed, wherever it's sold; a place can exempt more of its own.";
+
+/**
+ * What a C corporation pays, what employers pay on their staff's wages, and what sales tax spares:
+ * the corporate rate; FUTA's rate, wage base and credit and SUTA's rate and wage base, each empty
+ * for the tables' (ORG-SPEC §3.11, Phase 5: FUTA's in the finance table, SUTA's per state in the
+ * regions table); then a row naming the exempt categories, which opens them all on a page of their own.
+ */
+function Taxes(props: PackConfigProps) {
+  const [open, setOpen] = useState(false);
+  const currency = props.world.currency;
+  const taxes = isRecord(props.config.taxes) ? props.config.taxes : {};
+  const exempt = Array.isArray(taxes.exempt) ? taxes.exempt.filter((c): c is string => typeof c === "string") : [];
+  const choices = exemptChoices(props.world, exempt);
+  const lint = lintAt(props.lint, `${CONFIG}.taxes.exempt`);
+  const named = choices.filter((c) => exempt.includes(c.value)).map((c) => c.label);
+  const setExempt = (category: string, on: boolean) => {
+    const next = on ? [...exempt.filter((c) => c !== category), category] : exempt.filter((c) => c !== category);
+    props.onChange(withTax(props.config, "exempt", next.length > 0 ? next : undefined));
+  };
+  // What the unemployment settings fall back on: the finance table's FUTA row, and the world's region's SUTA columns (the national row's without one).
+  const unemployment = props.world.tables["economy.finance"]?.rows.taxes_unemployment?.values;
+  const futa = isRecord(unemployment) && isRecord(unemployment.futa) ? unemployment.futa : {};
+  const regions = props.world.tables["economy.regions"]?.rows ?? {};
+  const region = regions[typeof props.config.region === "string" && hasOwn(regions, props.config.region) ? props.config.region : "us"];
+  const where = typeof region?.name === "string" && region.name !== "" ? region.name : "the national row";
+  const fromTable = (value: JsonValue | undefined, words: (n: number) => string): string => (typeof value === "number" ? `Empty, it's the finance table's ${words(value)}.` : "Empty, it's the finance table's, which this world's doesn't have yet: take its Data update.");
+  const setNumber = (key: TaxSetting) => (v: JsonValue | undefined) => props.onChange(withTax(props.config, key, typeof v === "number" ? v : undefined));
+  return (
+    <FormGroup title="Taxes">
+      <NumberInput
+        label="Corporate tax rate (%)"
+        value={taxes.corporatePct}
+        min={0}
+        max={100}
+        optional
+        placeholder={String(CORPORATE_PCT)}
+        hint={`What a C corporation pays on its profit, with its state's rate. Empty, it's the federal rate, ${CORPORATE_PCT}%.`}
+        issues={lintAt(props.lint, `${CONFIG}.taxes.corporatePct`)}
+        onChange={setNumber("corporatePct")}
+      />
+      <ChoiceInput
+        label="Tax on kept earnings"
+        value={taxes.penaltyTaxes === true ? "on" : "off"}
+        options={[
+          { value: "off", label: "Off" },
+          { value: "on", label: "On" },
+        ]}
+        hint="On: a C corporation that keeps its earnings pays 20% on them each 15 April for the year before: as a personal holding company when 60% of its income is passive and five or fewer people hold over half of it, else above its $250,000 accumulated earnings credit. Its holders can consent to a dividend to clear it. Off, the default: neither tax."
+        issues={lintAt(props.lint, `${CONFIG}.taxes.penaltyTaxes`)}
+        onChange={(next) => props.onChange(withTax(props.config, "penaltyTaxes", next === "on" ? true : undefined))}
+      />
+      <NumberInput
+        label="FUTA rate before the credit (%)"
+        value={taxes.futaPct}
+        min={0}
+        max={100}
+        optional
+        placeholder={typeof futa.gross_pct === "number" ? String(futa.gross_pct) : "The tables'"}
+        hint={`The federal unemployment tax on each worker's pay up to its wage base, before the credit for state tax. ${fromTable(futa.gross_pct, (n) => `${n}%`)}`}
+        issues={lintAt(props.lint, `${CONFIG}.taxes.futaPct`)}
+        onChange={setNumber("futaPct")}
+      />
+      <MinorMoneyInput
+        label="FUTA wage base"
+        value={taxes.futaWageBase}
+        currency={currency}
+        min={1}
+        optional
+        placeholder={typeof futa.wage_base_cents === "number" ? formatMoneyInput(futa.wage_base_cents, currency) : "The tables'"}
+        hint={`The pay a year, per worker and employer, FUTA is paid on. ${fromTable(futa.wage_base_cents, (n) => formatMoney(n, currency))}`}
+        issues={lintAt(props.lint, `${CONFIG}.taxes.futaWageBase`)}
+        onChange={setNumber("futaWageBase")}
+      />
+      <NumberInput
+        label="FUTA credit for state tax (%)"
+        value={taxes.futaCreditPct}
+        min={0}
+        max={100}
+        optional
+        placeholder={typeof futa.max_credit_pct === "number" ? String(futa.max_credit_pct) : "The tables'"}
+        hint={`What an employer that pays state unemployment tax takes off FUTA's rate; a credit-reduction state's reduction cuts it. ${fromTable(futa.max_credit_pct, (n) => `${n}%`)}`}
+        issues={lintAt(props.lint, `${CONFIG}.taxes.futaCreditPct`)}
+        onChange={setNumber("futaCreditPct")}
+      />
+      <NumberInput
+        label="SUTA rate (%)"
+        value={taxes.sutaPct}
+        min={0}
+        max={100}
+        optional
+        placeholder="Each state's"
+        hint={`The state unemployment tax rate of an employer that sets none of its own. Empty, it's each employer's state's new-employer rate${typeof region?.suta_new_employer_pct === "number" ? ` (${where}: ${region.suta_new_employer_pct}%)` : ""}.`}
+        issues={lintAt(props.lint, `${CONFIG}.taxes.sutaPct`)}
+        onChange={setNumber("sutaPct")}
+      />
+      <MinorMoneyInput
+        label="SUTA wage base"
+        value={taxes.sutaWageBase}
+        currency={currency}
+        min={1}
+        optional
+        placeholder="Each state's"
+        hint={`The pay a year, per worker and employer, SUTA is paid on. Empty, it's each employer's state's${typeof region?.suta_wage_base_cents === "number" ? ` (${where}: ${formatMoney(region.suta_wage_base_cents, currency)})` : ""}.`}
+        issues={lintAt(props.lint, `${CONFIG}.taxes.sutaWageBase`)}
+        onChange={setNumber("sutaWageBase")}
+      />
+      <div class="lre-form-items">
+        <ItemRow title="Exempt from sales tax" subtitle={named.length > 0 ? named.join(", ") : "None: every category is taxed"} badge={<LintBadge issues={lint} />} onOpen={() => setOpen(true)} openLabel="Edit the categories exempt from sales tax" />
+      </div>
+      {open ? (
+        <FormSheet title="Sales tax" subtitle="Categories exempt everywhere" backLabel="Economy" onClose={() => setOpen(false)}>
+          <span class="lre-field-help">{EXEMPT_NOTE}</span>
+          <div class="lre-form-items" data-lre-money-exempt>
+            {choices.length === 0 ? <span class="lre-form-items-none">The world's tables list no spending categories.</span> : null}
+            {choices.map((c) => (
+              <div key={c.value} class="lre-money-build-feature" data-lre-category={c.value}>
+                <span class="lre-money-build-feature-text">
+                  <span class="lre-money-build-feature-name">{c.label}</span>
+                </span>
+                <Seg<TaxState> label={`${c.label}: sales tax`} value={exempt.includes(c.value) ? "exempt" : "taxed"} options={TAX_CHOICES} onChange={(state) => setExempt(c.value, state === "exempt")} />
+              </div>
+            ))}
+          </div>
+          <Issues issues={lint} />
+          <div class="lre-form-sheet-actions lre-money-build-done">
+            <Button variant="primary" onClick={() => setOpen(false)}>
+              Done
+            </Button>
+          </div>
+        </FormSheet>
+      ) : null}
+    </FormGroup>
+  );
+}
+
+/** The units a company that doesn't count its shares in units counts its owners in, the first time it issues, buys back or classes them (ORG-SPEC §3.10); the most the public pays for a listing's new units, and how a listed company's price moves (§27.10 Listing). */
+function Shares(props: PackConfigProps) {
+  return (
+    <FormGroup title="Shares">
+      <NumberInput
+        label="Units a company starts counting in"
+        value={props.config.shareUnits}
+        min={1}
+        step={1}
+        optional
+        placeholder={String(SHARE_UNITS)}
+        hint={`A company whose owners hold shares in percent counts them in this many units the first time it issues shares, buys some back or sets its classes, each owner's units their share of them. Empty, it's ${SHARE_UNITS.toLocaleString("en-US")}.`}
+        issues={lintAt(props.lint, `${CONFIG}.shareUnits`)}
+        onChange={(v) => props.onChange(withKey(props.config, "shareUnits", typeof v === "number" ? Math.round(v) : undefined))}
+      />
+      <NumberInput
+        label="Listing: the most the public pays, times its worth a unit"
+        value={props.config.listingOfferCap}
+        min={1}
+        max={100}
+        step={0.1}
+        optional
+        placeholder={String(LISTING_OFFER_CAP)}
+        hint={`The most the public pays a unit for a company's new units on the market, as a multiple of its books a unit (once it's listed, of its market price). Empty, it's ${LISTING_OFFER_CAP}: no more than they're worth.`}
+        issues={lintAt(props.lint, `${CONFIG}.listingOfferCap`)}
+        onChange={(v) => props.onChange(withKey(props.config, "listingOfferCap", typeof v === "number" ? v : undefined))}
+      />
+      <NumberInput
+        label="Listed prices: return to the books, a year"
+        value={props.config.listingReversion}
+        min={0}
+        max={50}
+        step={0.1}
+        optional
+        placeholder={String(LISTING_REVERSION)}
+        hint={`How fast a listed company's price returns toward its books a unit: a gap halves in about 0.69 ÷ this many years. 0 lets it wander. Empty, it's ${LISTING_REVERSION}.`}
+        issues={lintAt(props.lint, `${CONFIG}.listingReversion`)}
+        onChange={(v) => props.onChange(withKey(props.config, "listingReversion", typeof v === "number" ? v : undefined))}
+      />
+      <NumberInput
+        label="Listed prices: swings, % a year"
+        value={props.config.listingVolatility}
+        min={0}
+        max={200}
+        step={1}
+        optional
+        placeholder="As a single stock"
+        hint="How much a listed company's price swings around its books. Empty, it swings as the finance tables' single stock does."
+        issues={lintAt(props.lint, `${CONFIG}.listingVolatility`)}
+        onChange={(v) => props.onChange(withKey(props.config, "listingVolatility", typeof v === "number" ? v : undefined))}
+      />
+      <NumberInput
+        label="Listed prices: moving with the market, 0 to 1"
+        value={props.config.listingCorrelation}
+        min={0}
+        max={1}
+        step={0.05}
+        optional
+        placeholder="As a single stock"
+        hint="How closely a listed company's daily moves follow the stock market's (the index history where the world keeps it); 1 moves it by the market alone, the same in every chat. Empty, it's the finance tables' single stock's."
+        issues={lintAt(props.lint, `${CONFIG}.listingCorrelation`)}
+        onChange={(v) => props.onChange(withKey(props.config, "listingCorrelation", typeof v === "number" ? v : undefined))}
+      />
+    </FormGroup>
+  );
+}
+
+const TOGGLE_CHOICES: readonly SegOption<ToggleState>[] = [
+  { value: "level", label: "By level" },
+  { value: "on", label: "On" },
+  { value: "off", label: "Off" },
+];
+
+const FEATURES_NOTE = "Each runs from its usual Money level; switch one on to run it from its lowest level, or off. The money hub shows each one's detail wherever it runs; the rest of the full books show only at the top level.";
+
+const CASH_CHOICES: readonly { value: ToggleState; label: string }[] = [
+  { value: "level", label: `From Money ${FEATURE_DEFS.atm.on}` },
+  { value: "on", label: "Needs a machine" },
+  { value: "off", label: "Anywhere" },
+];
+
+const CASH_HELP: Record<ToggleState, string> = {
+  level: `Cash needs a cash machine or a branch of the account's bank from Money ${FEATURE_DEFS.atm.on}; below that it moves freely.`,
+  on: `Cash needs a cash machine or a branch of the account's bank from Money ${FEATURE_DEFS.atm.floor}, with a card for a machine, its limits and fees.`,
+  off: "Cash comes and goes anywhere, at every Money level.",
+};
+
+/** Where cash needs a machine or a branch (`features.atm`), the world's rule, as its own control; a chat may set its own in GM → This chat → Money. */
+function CashRule(props: PackConfigProps) {
+  const state = toggleOf(props.config, "atm");
+  return (
+    <FormGroup title="Cash">
+      <div class="lre-field" data-lre-money-cash={state}>
+        <span class="label">{FEATURE_DEFS.atm.label}</span>
+        <Seg<ToggleState> label={FEATURE_DEFS.atm.label} value={state} options={CASH_CHOICES} onChange={(next) => props.onChange(withToggle(props.config, "atm", next))} />
+        <span class="lre-field-help">{`${CASH_HELP[state]} Only a world that places cash machines or branches asks for one. A chat may set its own in GM → This chat → Money.`}</span>
+      </div>
+    </FormGroup>
+  );
+}
+
+/** The Custom toggles, under any preset: a row naming the ones switched, which opens them all on a page of their own. */
+function FeatureToggles(props: PackConfigProps) {
+  const [open, setOpen] = useState(false);
+  const lint = lintAt(props.lint, `${CONFIG}.features`);
+  const on: string[] = [];
+  const off: string[] = [];
+  for (const f of FINANCE_FEATURES) {
+    const state = toggleOf(props.config, f);
+    if (state === "on") on.push(FEATURE_DEFS[f].label);
+    else if (state === "off") off.push(FEATURE_DEFS[f].label);
+  }
+  const summary = on.length === 0 && off.length === 0 ? "Each as its Money level decides" : [on.length > 0 ? `On: ${on.join(", ")}` : null, off.length > 0 ? `Off: ${off.join(", ")}` : null].filter((s) => s !== null).join(" · ");
+  return (
+    <FormGroup title="Money features">
+      <span class="lre-field-help">{FEATURES_NOTE}</span>
+      <div class="lre-form-items">
+        <ItemRow title="Feature switches" subtitle={summary} badge={<LintBadge issues={lint} />} onOpen={() => setOpen(true)} openLabel="Edit the money feature switches" />
+      </div>
+      {open ? (
+        <FormSheet title="Money features" subtitle="Under any preset" backLabel="Economy" onClose={() => setOpen(false)}>
+          <span class="lre-field-help">{FEATURES_NOTE}</span>
+          <div class="lre-form-items" data-lre-money-features>
+            {FINANCE_FEATURES.map((f) => {
+              const def = FEATURE_DEFS[f];
+              return (
+                <div key={f} class="lre-money-build-feature" data-lre-feature={f}>
+                  <span class="lre-money-build-feature-text">
+                    <span class="lre-money-build-feature-name">{def.label}</span>
+                    <span class="lre-money-build-feature-sub">
+                      Usually from Money {def.on} · can run from Money {def.floor}
+                    </span>
+                  </span>
+                  <Seg<ToggleState> label={def.label} value={toggleOf(props.config, f)} options={TOGGLE_CHOICES} onChange={(state) => props.onChange(withToggle(props.config, f, state))} />
+                </div>
+              );
+            })}
+          </div>
+          <Issues issues={lint} />
+          <div class="lre-form-sheet-actions lre-money-build-done">
+            <Button variant="primary" onClick={() => setOpen(false)}>
+              Done
+            </Button>
+          </div>
+        </FormSheet>
+      ) : null}
+    </FormGroup>
+  );
+}
+
+type LimitMode = "class" | "none" | "amount";
+
+const LIMIT_MODES: readonly RefOption[] = [
+  { value: "class", label: "By class" },
+  { value: "none", label: "No limit" },
+  { value: "amount", label: "An amount" },
+];
+
+/**
+ * A product's credit limit (`ProductDef.limit`): its class's default when left out, none preset
+ * when null (as a charge card has), else an amount in the world's currency. Picking an amount shows
+ * the amount to type; the limit changes once one is typed.
+ */
+function CreditLimit(props: { value: JsonValue | undefined; currency: WorldCurrency; issues: readonly LintIssue[]; onChange(next: JsonValue | undefined): void }) {
+  const [typing, setTyping] = useState(false);
+  const mode: LimitMode = typing || (props.value !== undefined && props.value !== null) ? "amount" : props.value === null ? "none" : "class";
+  const odd = props.value !== undefined && props.value !== null && typeof props.value !== "number" ? `Holds ${JSON.stringify(props.value)}, which isn't an amount.` : null;
+  return (
+    <>
+      <ChoiceInput
+        label="Credit limit"
+        value={mode}
+        options={LIMIT_MODES}
+        hint="By class: the class's default from the finance tables. No limit: none preset, as on a charge card."
+        issues={props.issues}
+        onChange={(next) => {
+          setTyping(next === "amount");
+          if (next === "class") props.onChange(undefined);
+          else if (next === "none") props.onChange(null);
+        }}
+      />
+      {mode === "amount" ? (
+        <MinorMoneyInput
+          label="Limit"
+          value={props.value}
+          currency={props.currency}
+          min={0}
+          hint={odd ?? (typeof props.value === "number" ? undefined : "Until an amount is typed, the limit stays as it was.")}
+          issues={[]}
+          onChange={(next) => {
+            if (typeof next === "number") props.onChange(next);
+          }}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * The world's own products or assets (id → definition), as Build lists a record: a row per entry
+ * (its name, a summary, its id under Show ids, its lint) that opens it as a sheet. A new one asks
+ * for its name and derives its id from it; the record stays, empty, when its last entry goes.
+ */
+function Definitions(props: {
+  config: JsonObject;
+  world: WorldDoc;
+  lint: readonly LintIssue[];
+  field: "products" | "assets";
+  label: string;
+  hint: string;
+  noun: string;
+  summary(def: JsonObject): string;
+  sheet(def: JsonObject, set: (next: JsonObject) => void, ctx: FormCtx): ComponentChildren;
+  onChange(next: JsonObject): void;
+}) {
+  const stored = props.config[props.field];
+  const record: JsonObject = isObject(stored) ? stored : {};
+  const keys = Object.keys(record);
+  const [open, setOpen] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const path = `${CONFIG}.${props.field}`;
+  const titleOf = (key: string): string => {
+    const def = record[key];
+    return isObject(def) && typeof def.label === "string" && def.label !== "" ? def.label : key;
+  };
+  const put = (next: JsonObject) => props.onChange(withKey(props.config, props.field, next));
+  const remove = (key: string) => {
+    const next = { ...record };
+    delete next[key];
+    setOpen(null);
+    put(next);
+  };
+  const entry = open !== null && hasOwn(record, open) ? record[open] : undefined;
+  return (
+    <div class="lre-field lre-form-list" data-lre-record={props.field}>
+      <div class="lre-form-list-head">
+        <span class="label">{props.label}</span>
+        <span class="lre-badge">{keys.length}</span>
+      </div>
+      <span class="lre-field-help">{props.hint}</span>
+      <div class="lre-form-items">
+        {keys.length === 0 ? <span class="lre-form-items-none">None yet.</span> : null}
+        {keys.map((key) => {
+          const def = record[key];
+          return (
+            <ItemRow
+              key={key}
+              title={titleOf(key)}
+              subtitle={
+                <>
+                  {props.summary(isObject(def) ? def : {})}
+                  {titleOf(key) !== key ? <IdText id={key} /> : null}
+                </>
+              }
+              badge={<LintBadge issues={lintAt(props.lint, `${path}.${key}`)} />}
+              onOpen={() => setOpen(key)}
+              openLabel={`Edit ${titleOf(key)}`}
+              actions={<IconButton icon="trash" label={`Remove ${titleOf(key)}`} onClick={() => remove(key)} />}
+            />
+          );
+        })}
+      </div>
+      <Issues issues={props.lint.filter((issue) => issue.path === path)} />
+      {adding ? (
+        <NewKey
+          named
+          keyLabel="Id"
+          noun={props.noun}
+          taken={new Set(keys)}
+          suggestions={[]}
+          onAdd={(key, label) => {
+            put({ ...record, [key]: label !== undefined ? { label } : {} });
+            setAdding(false);
+            setOpen(key);
+          }}
+          onCancel={() => setAdding(false)}
+        />
+      ) : (
+        <div class="lre-form-list-add">
+          <Button size="sm" icon="plus" onClick={() => setAdding(true)}>
+            Add {props.noun}
+          </Button>
+        </div>
+      )}
+      {open !== null && entry !== undefined ? (
+        <FormSheet title={titleOf(open)} subtitle={titleOf(open) !== open ? <IdText id={open} /> : undefined} backLabel={props.label} onClose={() => setOpen(null)}>
+          {props.sheet(isObject(entry) ? entry : {}, (next) => put({ ...record, [open]: next }), { doc: props.world, lint: props.lint, path: `${path}.${open}`, identifiers: [], functions: [] })}
+          <Issues issues={props.lint.filter((issue) => issue.path === `${path}.${open}`)} />
+          <div class="lre-form-sheet-actions">
+            <Button variant="danger" icon="trash" onClick={() => remove(open)}>
+              Remove {props.noun}
+            </Button>
+            <Button variant="primary" onClick={() => setOpen(null)}>
+              Done
+            </Button>
+          </div>
+        </FormSheet>
+      ) : null}
+    </div>
+  );
+}
+
+/** How organizations' books recover what their projects build and their mineral interests cost (DESIGN §26.5); each organization may say otherwise (its Depreciation field). */
+function Books(props: PackConfigProps) {
+  const value = props.config.depreciation === "straight_line" ? "straight_line" : "none";
+  return (
+    <FormGroup title="Books">
+      <ChoiceInput
+        label="Depreciation"
+        value={value}
+        options={[
+          { value: "none", label: DEPRECIATION_LABELS.none },
+          { value: "straight_line", label: DEPRECIATION_LABELS.straight_line },
+        ]}
+        hint="None: a project's costs are expenses when paid, so EBITDA equals operating income. Straight-line: what projects capitalize is spread over the asset's useful life from the month after it goes into service, and a mineral interest's cost is depleted by what it produces. Each organization may choose its own."
+        issues={lintAt(props.lint, `${CONFIG}.depreciation`)}
+        onChange={(next) => props.onChange(withKey(props.config, "depreciation", next === "straight_line" ? "straight_line" : undefined))}
+      />
+    </FormGroup>
+  );
+}
+
+const REVENUE_ADJUST_FIELDS: readonly { key: keyof typeof REVENUE_ADJUST_DEFAULTS; label: string; hint: string; min: number }[] = [
+  { key: "factorMin", label: "Lowest factor", hint: "An adjustment that takes a stream below this share of its payment is made, and the agent is told.", min: 0 },
+  { key: "factorMax", label: "Highest factor", hint: "An adjustment that takes a stream above this many times its payment is made, and the agent is told.", min: 0 },
+  { key: "days", label: "Longest adjustment, in days", hint: "One that lasts longer is made, and the agent is told.", min: 1 },
+  { key: "inForce", label: "Adjustments in force at once", hint: "A stream that has this many already takes one more, and the agent is told.", min: 1 },
+];
+
+/** The figures an agent's adjustment of a revenue stream is advised against (`packs.economy.config.revenueAdjust`); nothing is held to them. */
+function RevenueAdjustments(props: PackConfigProps) {
+  const set = isRecord(props.config.revenueAdjust) ? props.config.revenueAdjust : {};
+  return (
+    <FormGroup title="Revenue adjustments">
+      {REVENUE_ADJUST_FIELDS.map((f) => (
+        <NumberInput
+          key={f.key}
+          label={f.label}
+          value={set[f.key]}
+          min={f.min}
+          optional
+          placeholder={String(REVENUE_ADJUST_DEFAULTS[f.key])}
+          hint={`${f.hint} Empty uses ${REVENUE_ADJUST_DEFAULTS[f.key]}.`}
+          issues={lintAt(props.lint, `${CONFIG}.revenueAdjust.${f.key}`)}
+          onChange={(value) => {
+            const next: JsonObject = { ...set };
+            if (value === undefined) delete next[f.key];
+            else next[f.key] = value;
+            props.onChange(Object.keys(next).length > 0 ? { ...props.config, revenueAdjust: next } : withKey(props.config, "revenueAdjust", undefined));
+          }}
+        />
+      ))}
+    </FormGroup>
+  );
+}
+
+export function EconomyConfig(props: PackConfigProps) {
+  const currency = props.world.currency;
+  const calendar = props.world.calendar;
+  return (
+    <div class="lre-form-fields" data-lre-money-config>
+      <Prices {...props} />
+      <LivingCosts {...props} />
+      <Taxes {...props} />
+      <Shares {...props} />
+      <Books {...props} />
+      <RevenueAdjustments {...props} />
+      <CashRule {...props} />
+      <FeatureToggles {...props} />
+      <Definitions
+        config={props.config}
+        world={props.world}
+        lint={props.lint}
+        field="products"
+        label="Products"
+        hint="The world's own kinds of account, which accounts name as their product. What a product leaves empty comes from its class's defaults in the finance tables."
+        noun="product"
+        summary={(def) => [isAccountClass(def.class) ? CLASS_TRAITS[def.class].label : typeof def.class === "string" ? `${def.class} (no such class)` : "No class", typeof def.institution === "string" ? def.institution : ""].filter((s) => s !== "").join(" · ")}
+        sheet={(def, set, ctx) => (
+          <>
+            <SchemaFields specs={PRODUCT_HEAD} value={def} ctx={ctx} onChange={set} />
+            <CreditLimit value={def.limit} currency={currency} issues={lintAt(props.lint, `${ctx.path}.limit`)} onChange={(limit) => set(withKey(def, "limit", limit))} />
+            <SchemaFields specs={PRODUCT_TAIL} value={def} ctx={ctx} onChange={set} />
+          </>
+        )}
+        onChange={props.onChange}
+      />
+      <Definitions
+        config={props.config}
+        world={props.world}
+        lint={props.lint}
+        field="assets"
+        label="Assets"
+        hint="What holdings hold: securities, funds, bonds, options and stakes, each with its price path."
+        noun="asset"
+        summary={(def) => [typeof def.class === "string" ? humanize(def.class) : "No class", typeof def.symbol === "string" ? def.symbol : "", typeof def.price === "number" ? formatMoney(def.price, currency) : ""].filter((s) => s !== "").join(" · ")}
+        sheet={(def, set, ctx) => (
+          <>
+            <SchemaFields specs={ASSET_HEAD} value={def} ctx={ctx} onChange={set} />
+            <DateInput label="Bond: matures" value={def.maturity} calendar={calendar} issues={lintAt(props.lint, `${ctx.path}.maturity`)} onChange={(next) => set(withKey(def, "maturity", next))} />
+            <SchemaFields specs={ASSET_OPTION} value={def} ctx={ctx} onChange={set} />
+            <DateInput label="Option: expires" value={def.expiry} calendar={calendar} issues={lintAt(props.lint, `${ctx.path}.expiry`)} onChange={(next) => set(withKey(def, "expiry", next))} />
+            <SchemaFields specs={ASSET_TAIL} value={def} ctx={ctx} onChange={set} />
+          </>
+        )}
+        onChange={props.onChange}
+      />
+    </div>
+  );
+}

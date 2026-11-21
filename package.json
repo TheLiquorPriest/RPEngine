@@ -1,0 +1,40 @@
+{
+  "name": "lumi-rp-engine",
+  "version": "3.1.1",
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
+    "bun-types": "^1.4.2",
+    "lumiverse-spindle-types": "0.6.80",
+    "preact": "11.0.1",
+    "rp-harness": "git+https://github.com/TheLiquorPriest/RPHarness.git#fb61c0fcab7e7c147414719349825915341e4812",
+    "typescript": "7.0.2"
+  },
+  "exports": {
+    "./schemas/lre-world-v1.schema.json": "./schemas/lre-world-v1.schema.json",
+    "./schemas/lre-map-v1.schema.json": "./src/shared/lre-map-v1.schema.json"
+  },
+  "bin": {
+    "lumirpengine": "dist/lumirpengine.js",
+    "rpe": "dist/rpe.js"
+  },
+  "engines": {
+    "bun": ">=1.4",
+    "node": ">=22"
+  },
+  "private": true,
+  "scripts": {
+    "build": "\"$npm_execpath\" scripts/build.ts",
+    "typecheck": "tsc --noEmit -p . && tsc --noEmit -p dev/preview",
+    "tables": "bun scripts/tables/build.ts",
+    "templates": "bun scripts/templates/build.ts",
+    "reference": "bun scripts/reference/build.ts",
+    "api": "bun scripts/api/generate.ts",
+    "settings": "bun scripts/settings/generate.ts",
+    "test": "\"$npm_execpath\" scripts/test-all.ts",
+    "check": "\"$npm_execpath\" scripts/test/run.ts --check",
+    "test:all": "\"$npm_execpath\" scripts/test-all.ts",
+    "test:release": "\"$npm_execpath\" scripts/test/run.ts --release",
+    "test:timings": "\"$npm_execpath\" scripts/test-all.ts --record"
+  },
+  "type": "module"
+}

@@ -1,0 +1,638 @@
+// The action sheet (DESIGN §11, §12): actions with targets and exact odds, Buy, Pay,
+// Transfer, Drive, Lend and Combat, and the Timelapse sheet (duration chips, until targets, interrupt
+// overrides), plus Pause/Resume clock. Each option shows its price, its time and one odds bar with
+// the chances in words; why it can't be taken now shows inline. Pay and Buy offer Paying as where the
+// player character may spend for an organization (ORG-SPEC §3.6). Everything comes from
+// `StateView.palette`; a choice sends one `lre.action`. By its kind (plan §10.10): one that manages
+// (`atOnce`) is done at once; any other waits for your next message, shown chosen while it waits (the
+// same choice again takes it back), or Send now puts its line in the chat as your message at once.
+
+import type { ComponentChildren } from "preact";
+import { useEffect, useId, useRef, useState } from "preact/hooks";
+import { INTERRUPT_CLASSES } from "../shared/ids";
+import type { InterruptClass, InterruptPolicy } from "../shared/ids";
+import type { TimelapseTarget } from "../shared/ledger";
+import type { JsonObject, JsonValue } from "../shared/json";
+import { isRecord } from "../shared/json";
+import { formatMoneyInput, parseMoneyInput } from "../shared/money";
+import type { OutcomeOdds, PaletteEncounter, PaletteEntry, PaletteOption, PaletteView, StateView, TimelapseView } from "../shared/state-view";
+import { DEFAULT_CURRENCY, formatMoney } from "../shared/world";
+import type { PaletteEdit, PaletteTab } from "./app";
+import { useApp, useView } from "./app";
+import { sendChipChoice } from "./chips";
+import { Badge, Banner, Button, Disclosure, Empty, HostSwitch, IconButton, oddsSeries, Section, Seg, Tabs, tabPanel, useBusy } from "./components";
+import type { TabPanelProps } from "./components";
+import { formatCents, formatMinutes, formatOdds, humanize } from "./format";
+import { Icon } from "../ui/icons";
+import { MoneyInput } from "./money-input";
+import { paletteRequest, type Req, timelapseRequest, timeMarker } from "./requests";
+import { holdsPick, isStaged, SENT_NOW, TURN_RUNS, turnRuns, WaitingPress } from "../ui/kept/waiting";
+
+// Combat leads while it's there: in a fight its actions are what the player wants first.
+const GROUP_LABEL: Record<PaletteEntry["group"], string> = { combat: "Combat", action: "Actions", buy: "Buy", pay: "Pay", transfer: "Transfer", drive: "Drive", lend: "Lend" };
+const GROUP_TAB: Record<PaletteEntry["group"], PaletteTab> = { combat: "combat", action: "actions", buy: "buy", pay: "pay", transfer: "transfer", drive: "drive", lend: "lend" };
+
+/** The tabs a palette view offers, in a fixed order; Timelapse last. */
+export function paletteTabs(palette: PaletteView): { id: PaletteTab; label: string }[] {
+  const tabs: { id: PaletteTab; label: string }[] = [];
+  for (const group of Object.keys(GROUP_LABEL) as PaletteEntry["group"][]) {
+    if (palette.entries.some((entry) => entry.group === group)) tabs.push({ id: GROUP_TAB[group], label: GROUP_LABEL[group] });
+  }
+  if (palette.timelapse) tabs.push({ id: "timelapse", label: "Timelapse" });
+  return tabs;
+}
+
+export function PaletteSheet(props: { tab: PaletteTab; edit?: PaletteEdit; desk: boolean; onClose(): void }) {
+  const view = useView();
+  const palette = view?.palette ?? null;
+  // Opened from an intent gate's Edit (DESIGN §5.1): only the read action's entry, its picks made;
+  // for a time skip, only the Timelapse sheet, at the skip as read.
+  const skip = props.edit && palette?.timelapse && props.edit.action === palette.timelapse.action ? props.edit : undefined;
+  const editing = props.edit && palette && !skip ? palette.entries.find((entry) => entry.action === props.edit?.action) : undefined;
+  // Asked for the actions in a fight on the POV's turn, the palette opens on Combat.
+  const [tab, setTab] = useState<PaletteTab>(skip ? "timelapse" : editing ? GROUP_TAB[editing.group] : props.tab === "actions" && view?.palette?.encounter?.yours ? "combat" : props.tab);
+  const panelId = useId();
+  const tabs = palette ? (skip ? paletteTabs(palette).filter((t) => t.id === "timelapse") : editing ? paletteTabs(palette).filter((t) => t.id === GROUP_TAB[editing.group]) : paletteTabs(palette)) : [];
+  const active = tabs.some((entry) => entry.id === tab) ? tab : tabs[0]?.id ?? tab;
+  return (
+    <div
+      class={props.desk ? "lre lre-sheet desk" : "lre lre-sheet"}
+      data-lre-sheet="palette"
+      role="dialog"
+      aria-label="Actions"
+      tabIndex={-1}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        event.stopPropagation();
+        props.onClose();
+      }}
+    >
+      <header>
+        <Icon name={active === "timelapse" ? "fast-forward" : "bolt"} />
+        <h2 class="title">{editing ? "Change the action" : skip ? "Change the timelapse" : active === "timelapse" ? "Timelapse" : "Actions"}</h2>
+        <ClockToggle view={view} />
+        <IconButton icon="close" label="Close actions" onClick={props.onClose} />
+      </header>
+      {!view || view.status === "not_world" ? (
+        <div class="body">
+          <Empty icon="globe" title="Not a world chat">
+            Open a world chat to use actions.
+          </Empty>
+        </div>
+      ) : !palette || tabs.length === 0 ? (
+        <div class="body">
+          <Empty icon="bolt" title="Nothing to do here">
+            No actions are available here right now.
+          </Empty>
+        </div>
+      ) : (
+        <>
+          {editing || skip ? null : (
+            <div class="lre-chat-tabs">
+              <Tabs<PaletteTab> label="Action groups" panelId={panelId} value={active} tabs={tabs} onChange={(id) => setTab(id)} />
+            </div>
+          )}
+          {active === "timelapse" && palette.timelapse && !editing ? (
+            <TimelapsePanel view={view} timelapse={palette.timelapse} edit={skip} panel={tabPanel(panelId, active)} onSent={props.onClose} />
+          ) : (
+            <ActionList
+              key={active}
+              view={view}
+              head={editing ? <p class="lre-chat-hint" data-lre-palette-edit>Change what your message plays. It plays this instead of what was read.</p> : active === "combat" && palette.encounter ? <EncounterHead encounter={palette.encounter} /> : null}
+              entries={editing ? [editing] : palette.entries.filter((entry) => GROUP_TAB[entry.group] === active)}
+              edit={editing && props.edit ? { gate: props.edit, entry: editing } : undefined}
+              panel={tabPanel(panelId, active)}
+              onSent={props.onClose}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ClockToggle(props: { view: StateView | null }) {
+  const app = useApp();
+  const [busy, run] = useBusy();
+  const hud = props.view?.hud;
+  const chatId = props.view?.chatId;
+  if (!hud || !chatId) return null;
+  return (
+    <Button
+      size="sm"
+      icon={hud.clock.paused ? "play" : "pause"}
+      busy={busy}
+      onClick={() =>
+        run(async () => {
+          await app.request(timeMarker(chatId, "pause", { all: true }, !hud.clock.paused));
+        })
+      }
+    >
+      {hud.clock.paused ? "Resume clock" : "Pause clock"}
+    </Button>
+  );
+}
+
+/** The Combat tab's head in a fight: the round, whose turn it is, and what the POV has left of each budget. */
+export function EncounterHead(props: { encounter: PaletteEncounter }) {
+  const { encounter } = props;
+  return (
+    <div class="lre-chat-encounter" data-lre-encounter-head>
+      <div class="lre-chat-encounter-head">
+        <Icon name="sword" size={16} />
+        <strong>Round {encounter.round}</strong>
+        <Badge tone={encounter.yours ? "accent" : "neutral"}>{encounter.yours ? "Your turn" : `${encounter.turn.charAt(0).toUpperCase()}${encounter.turn.slice(1)}'s turn`}</Badge>
+      </div>
+      {encounter.economy.length > 0 ? (
+        <div class="lre-chat-encounter-left" role="group" aria-label="What you have left this turn">
+          {encounter.economy.map((b) => (
+            <span key={b.id} title={`${b.left} of ${b.of} ${b.label} left`}>
+              <Badge tone={b.left > 0 ? "pos" : "neutral"}>
+                {b.label} {b.left}/{b.of}
+              </Badge>
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** A palette option's second step (`PaletteOption.next`): Drive picks a destination after the vehicle, Lend a person after the item. */
+type NextStepView = NonNullable<PaletteOption["next"]>;
+
+/** The chosen action and its chain of picks: the first option, then one choice per `next` step. */
+interface Selection {
+  entry: PaletteEntry;
+  picks: PaletteOption[];
+}
+
+/**
+ * One odds bar, and the chances in words in the bar's order, with a check's success in bold. The
+ * words are what assistive tech reads; the bar repeats them for the eye.
+ */
+function OptionOdds(props: { odds: readonly OutcomeOdds[] }) {
+  const series = oddsSeries(props.odds);
+  return (
+    <span class="lre-chat-odds">
+      <span class="lre-chat-oddsbar" aria-hidden="true">
+        {props.odds.map((o, i) => (
+          <span key={o.outcome} style={{ width: `${Math.max(0, o.p) * 100}%`, background: `var(--lre-series-${series[i]})` }} />
+        ))}
+      </span>
+      <span class="lre-chat-oddswords">
+        {props.odds.map((o, i) => (
+          <span key={o.outcome}>
+            {i > 0 ? " · " : ""}
+            {o.outcome.toLowerCase() === "success" ? <strong>{`${formatOdds(o.p)} ${o.outcome}`}</strong> : `${formatOdds(o.p)} ${o.outcome}`}
+          </span>
+        ))}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * An option: its label, its time and what the check reads, one odds bar, the price, and why it
+ * can't be taken now. One that can't stays readable, so its reason does too: it is marked
+ * unavailable rather than disabled, and a tap does nothing. One pressed for your next message is
+ * marked so while it waits.
+ */
+function OptionRow(props: { option: PaletteOption; current: boolean; waits?: boolean; onPick(): void }) {
+  const { option } = props;
+  const blocked = option.disabled !== undefined;
+  return (
+    <button type="button" class="lre-item lre-chat-option" aria-current={props.current} aria-disabled={blocked || undefined} data-lre-waits={props.waits ? "" : undefined} onClick={() => (blocked ? undefined : props.onPick())}>
+      <span class="grow">
+        <span class="title">
+          {option.label}
+          {props.waits ? <Badge tone="accent">With your next message</Badge> : null}
+        </span>
+        {option.minutes !== undefined || option.detail ? (
+          <span class="lre-chat-meta">
+            {option.minutes !== undefined ? (
+              <span class="lre-chat-time">
+                <Icon name="clock" size={14} />
+                {formatMinutes(option.minutes)}
+              </span>
+            ) : null}
+            {option.detail ? <span>{option.detail}</span> : null}
+          </span>
+        ) : null}
+        {option.odds && option.odds.length > 0 ? <OptionOdds odds={option.odds} /> : null}
+        {blocked ? (
+          <span class="lre-chat-whynot">
+            <Icon name="lock" size={14} />
+            <span>{option.disabled}</span>
+          </span>
+        ) : null}
+      </span>
+      {option.cents !== undefined ? <span class="lre-chat-price lre-num">{formatCents(option.cents)}</span> : null}
+      {option.next ? <Icon name="chevron-right" size={16} class="lre-chat-chev" /> : null}
+    </button>
+  );
+}
+
+/** Picks match by params: a state push rebuilds the palette, so option objects aren't stable. */
+function samePick(a: PaletteOption | undefined, b: PaletteOption | undefined): boolean {
+  return a !== undefined && b !== undefined && JSON.stringify(a.params) === JSON.stringify(b.params);
+}
+
+/** The picks an entry offers that `params` already holds, step by step: the option at each step whose own params all match (an intent gate's Edit opens with the read's picks made). */
+export function picksFor(entry: PaletteEntry, params: JsonObject): PaletteOption[] {
+  const matches = (option: PaletteOption): boolean => Object.entries(option.params).every(([key, value]) => JSON.stringify(params[key]) === JSON.stringify(value));
+  const picks: PaletteOption[] = [];
+  let options: readonly PaletteOption[] = entry.options;
+  for (;;) {
+    const hit = options.find(matches);
+    if (!hit) return picks;
+    picks.push(hit);
+    if (!hit.next) return picks;
+    options = hit.next.options;
+  }
+}
+
+/** One `next` step under the pick it follows; scrolls itself into view when it opens. */
+function NextStep(props: { after: PaletteOption; step: NextStepView; chosen: PaletteOption | undefined; waits(params: JsonObject): boolean; onPick(option: PaletteOption): void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const after = JSON.stringify(props.after.params);
+  useEffect(() => ref.current?.scrollIntoView({ block: "nearest", behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }), [after]);
+  return (
+    <div ref={ref} class="lre-chat-next" data-lre-palette-step={props.step.param}>
+      <div class="lre-chat-next-head">
+        <Icon name="chevron-right" size={16} />
+        <span>
+          {props.step.label} <span class="lre-muted">for {props.after.label}</span>
+        </span>
+      </div>
+      {props.step.options.length === 0 ? (
+        <Empty>No {props.step.label.toLowerCase()} available.</Empty>
+      ) : (
+        <div class="lre-list">
+          {props.step.options.map((option) => (
+            <OptionRow key={JSON.stringify(option.params)} option={option} current={samePick(props.chosen, option)} waits={props.waits({ ...props.after.params, ...option.params })} onPick={() => props.onPick(option)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Paying as (ORG-SPEC §3.6, Pay and Buy): You, or each organization the POV may spend for; `value` is the organization's id, "" for You. */
+export function PayingAs(props: { acting: NonNullable<PaletteEntry["acting"]>; value: string; onChange(id: string): void }) {
+  const options = [{ value: "", label: "You" }, ...props.acting.options.map((o) => ({ value: o.id, label: o.name }))];
+  return (
+    <div class="lre-chat-next" data-lre-palette-acting={props.acting.param}>
+      <div class="lre-chat-next-head">
+        <Icon name="briefcase" size={16} />
+        <span>{props.acting.label}</span>
+      </div>
+      <Seg label={props.acting.label} value={options.some((o) => o.value === props.value) ? props.value : ""} options={options} onChange={props.onChange} />
+    </div>
+  );
+}
+
+function ActionList(props: { view: StateView; head: ComponentChildren; entries: PaletteEntry[]; edit?: { gate: PaletteEdit; entry: PaletteEntry }; panel: TabPanelProps; onSent(): void }) {
+  const app = useApp();
+  // Amounts are typed in the world's currency, with its own decimals (5 is 5 bits, or $5.00).
+  const currency = props.view.currency ?? DEFAULT_CURRENCY;
+  // An intent gate's Edit opens with the read's picks, amount, number and company already made.
+  const read = props.edit?.gate.params;
+  const readValue = (param: string | undefined): JsonValue | undefined => (read && param ? read[param] : undefined);
+  const [selected, setSelected] = useState<Selection | null>(() => (props.edit && read ? { entry: props.edit.entry, picks: picksFor(props.edit.entry, read) } : null));
+  const [amount, setAmount] = useState(() => {
+    const cents = readValue(props.edit?.entry.amount?.param);
+    return typeof cents === "number" ? formatMoneyInput(cents, currency) : "";
+  });
+  // The entry's required number (Lend's days); null shows and sends its default.
+  const [count, setCount] = useState<string | null>(() => {
+    const n = readValue(props.edit?.entry.number?.param);
+    return typeof n === "number" ? String(n) : null;
+  });
+  // Who comes along (Go's With), ticked for the selected entry; cleared when the action changes.
+  const [people, setPeople] = useState<string[]>(() => {
+    const along = readValue(props.edit?.entry.people?.param);
+    return Array.isArray(along) ? along.filter((id): id is string => typeof id === "string") : [];
+  });
+  // Paying as (Pay and Buy): the organization the player pays for, "" for themselves; back to You when the action changes.
+  const [payingAs, setPayingAs] = useState(() => {
+    const as = readValue(props.edit?.entry.acting?.param);
+    return typeof as === "string" ? as : "";
+  });
+  const [busy, run] = useBusy();
+  const amountCents = parseMoneyInput(amount, currency);
+  const range = selected?.entry.amount;
+  const amountOk = !range || (amountCents !== null && amountCents >= range.min && (range.max === null || amountCents <= range.max));
+  const number = selected?.entry.number;
+  const countValue = !number ? null : count === null ? number.default : /^\d+$/.test(count.trim()) ? Number(count) : null;
+  const countOk = !number || (countValue !== null && countValue >= number.min && (number.max === null || countValue <= number.max));
+  const last = selected?.picks.at(-1);
+  const pending = last?.next;
+  // Picking at a depth replaces that pick and drops the ones after it; picking the current one again clears it.
+  const pick = (entry: PaletteEntry, depth: number, option: PaletteOption) => {
+    const same = selected?.entry.action === entry.action;
+    const picks = same ? selected.picks.slice(0, depth) : [];
+    const again = same && samePick(selected.picks[depth], option);
+    if (!same) {
+      setCount(null);
+      setPeople([]);
+      setPayingAs("");
+    }
+    setSelected(again ? (depth === 0 ? null : { entry, picks }) : { entry, picks: [...picks, option] });
+  };
+  const go = () => {
+    if (!selected || pending || !amountOk || !countOk) return;
+    run(async () => {
+      const request = paletteRequest(selected.entry, selected.picks, props.view.chatId, range ? amountCents ?? undefined : undefined, countValue ?? undefined, people, payingAs === "" ? undefined : payingAs);
+      // From an intent gate's Edit, the action as picked plays through the chip, in place of the read (DESIGN §5.1).
+      const edit = props.edit?.gate;
+      const sent = edit ? await sendChipChoice(app, edit.chip, "edit", edit.chatId, { params: request.params }) : (await app.request(request)) !== null;
+      if (sent) props.onSent();
+    });
+  };
+  // A press that would wait, played now instead (plan §10.10, a tap that plays now): its line goes in the chat as his message and the reply starts.
+  const sendNow = (asking: Req<"lre.action">) =>
+    run(async () => {
+      const result = await app.request({ ...asking, now: true });
+      if (result === null) return;
+      if ("messageId" in result) app.toast(SENT_NOW, "info");
+      props.onSent();
+    });
+  const chain = selected ? selected.picks.map((p) => p.label).filter((part) => part !== selected.entry.label) : [];
+  const payer = selected?.entry.acting?.options.find((o) => o.id === payingAs)?.name;
+  const named = !selected ? "" : chain.length > 0 ? `${selected.entry.label}: ${chain.join(" → ")}` : selected.entry.label;
+  const what = !selected ? "Choose an action" : pending ? `Choose ${pending.label.toLowerCase()}` : payer ? `${named}, as ${payer}` : named;
+  // What waits for the next message shows chosen; the same press again takes it back, and the button says so.
+  const staged = props.view.staged ?? null;
+  const asking = selected && !pending && amountOk && countOk && !props.edit ? paletteRequest(selected.entry, selected.picks, props.view.chatId, range ? amountCents ?? undefined : undefined, countValue ?? undefined, people, payingAs === "" ? undefined : payingAs) : null;
+  const waits = asking !== null && isStaged(staged, asking.action, asking.params, props.view.currency);
+  const label = props.edit && selected && !pending ? `Play ${what}` : waits ? `Take back ${what}` : what;
+  const held = (entry: PaletteEntry) => (params: JsonObject) => holdsPick(staged, entry.action, params);
+  const span = range ? `${formatMoney(range.min, currency)}${range.max !== null ? `–${formatMoney(range.max, currency)}` : " or more"}` : "";
+  return (
+    <>
+      <div {...props.panel} class="body" data-lre-palette-list>
+        {props.head}
+        {props.edit ? null : <WaitingPress view={props.view} block />}
+        {props.entries.map((entry) => (
+          <section key={entry.action} class="lre-chat-entry">
+            <div class="lre-chat-entry-head">
+              <h3>{entry.label}</h3>
+              {entry.amount ? <Badge>Amount</Badge> : null}
+            </div>
+            <div class="lre-list">
+              {entry.options.map((option) => (
+                <OptionRow key={JSON.stringify(option.params)} option={option} current={selected?.entry.action === entry.action && samePick(selected.picks[0], option)} waits={held(entry)(option.params)} onPick={() => pick(entry, 0, option)} />
+              ))}
+            </div>
+            {selected?.entry.action === entry.action
+              ? selected.picks.map((chosen, depth) => (chosen.next ? <NextStep key={`${depth}:${JSON.stringify(chosen.params)}`} after={chosen} step={chosen.next} chosen={selected.picks[depth + 1]} waits={held(entry)} onPick={(option) => pick(entry, depth + 1, option)} /> : null))
+              : null}
+            {selected?.entry.action === entry.action && entry.people ? (
+              <div class="lre-chat-next" data-lre-palette-people={entry.people.param}>
+                <div class="lre-chat-next-head">
+                  <Icon name="users" size={16} />
+                  <span>{entry.people.label}</span>
+                </div>
+                {entry.people.options.map((person) => (
+                  <HostSwitch key={person.id} label={person.name} checked={people.includes(person.id)} onChange={(on) => setPeople(on ? [...people, person.id] : people.filter((id) => id !== person.id))} />
+                ))}
+              </div>
+            ) : null}
+            {selected?.entry.action === entry.action && entry.acting ? <PayingAs acting={entry.acting} value={payingAs} onChange={setPayingAs} /> : null}
+          </section>
+        ))}
+      </div>
+      <footer>
+        {range && amount.trim() !== "" && !amountOk ? (
+          <span class="lre-chat-hint" role="status">
+            <Icon name="alert" size={14} />
+            Enter an amount of {span}.
+          </span>
+        ) : null}
+        {number && !countOk ? (
+          <span class="lre-chat-hint" role="status">
+            <Icon name="alert" size={14} />
+            Enter {number.min}
+            {number.max !== null ? `–${number.max}` : " or more"} {number.label}.
+          </span>
+        ) : null}
+        {range ? <MoneyInput currency={currency} value={amount} onInput={setAmount} label="Amount" invalid={amount.trim() !== "" && !amountOk} placeholder={`Amount (${span})`} /> : null}
+        {number ? (
+          <label class="lre-chat-count">
+            <input
+              class={countOk ? "lre-input" : "lre-input invalid"}
+              inputMode="numeric"
+              aria-label={`Number of ${number.label}`}
+              aria-invalid={!countOk || undefined}
+              value={count ?? String(number.default)}
+              onInput={(event) => setCount(event.currentTarget.value)}
+            />
+            <span>{number.label}</span>
+          </label>
+        ) : null}
+        {selected && !pending && !props.edit && selected.entry.atOnce !== true ? (
+          <span class="lre-chat-hint" data-lre-palette-waits>
+            <Icon name="info" size={14} />
+            {waits ? "It waits for your next message; pressed again, it no longer does." : "It waits for your next message, and the Author is told then what you pressed and on what. Send now puts it in the chat as your message at once."}
+          </span>
+        ) : null}
+        {asking !== null && selected?.entry.atOnce !== true && !waits ? (
+          <Button variant="secondary" icon="send" disabled={busy || turnRuns(props.view)} title={turnRuns(props.view) ? TURN_RUNS : "Put it in the chat as your message now, and start the reply"} onClick={() => sendNow(asking)}>
+            Send now
+          </Button>
+        ) : null}
+        <button type="button" class="lre-btn primary lre-chat-go" disabled={!selected || pending !== undefined || !amountOk || !countOk || busy} aria-busy={busy || undefined} onClick={go} data-lre-go>
+          {selected && !pending ? <Icon name={waits ? "close" : "check"} /> : null}
+          {label}
+        </button>
+      </footer>
+    </>
+  );
+}
+
+const UNIT_MINUTES: Record<"min" | "h" | "d" | "w", number> = { min: 1, h: 60, d: 1440, w: 10080 };
+const POLICY_OPTIONS = [
+  { value: "stop", label: "Stop" },
+  { value: "note", label: "Note" },
+  { value: "ignore", label: "Ignore" },
+] as const;
+
+/**
+ * "Follow my routine" for one Timelapse (DESIGN §8, §9.2): on, the POV lives its routine through the
+ * skip; off, it stays where the story has it while the world moves on. The sheet opens it at the
+ * world's default (`TimelapseView.followRoutine`), so a routine only ever runs when asked for.
+ */
+export function FollowRoutineChoice(props: { value: boolean; disabled: boolean; onChange(next: boolean): void }) {
+  return (
+    <Section>
+      <div data-lre-follow-routine={props.value}>
+        <HostSwitch label="Follow my routine" checked={props.value} disabled={props.disabled} onChange={props.onChange} />
+        <span class="lre-chat-hint">
+          <Icon name="info" size={14} />
+          On, you go about your usual day through the skip; off, you stay where the story left you while the world goes on.
+        </span>
+      </div>
+    </Section>
+  );
+}
+
+function TimelapsePanel(props: { view: StateView; timelapse: TimelapseView; edit?: PaletteEdit; panel: TabPanelProps; onSent(): void }) {
+  const app = useApp();
+  const { timelapse, edit } = props;
+  // From an intent gate's Edit (DESIGN §5.1): the skip as the message was read, chosen already, and
+  // whether the player character follows their routine through it.
+  const read = edit && isRecord(edit.params.target) && typeof edit.params.target.type === "string" ? (edit.params.target as TimelapseTarget) : null;
+  const [target, setTarget] = useState<TimelapseTarget | null>(read);
+  const [custom, setCustom] = useState("");
+  const [unit, setUnit] = useState<"min" | "h" | "d" | "w">("h");
+  const [overrides, setOverrides] = useState<Partial<Record<InterruptClass, InterruptPolicy>>>({});
+  const [follow, setFollow] = useState(typeof edit?.params.followRoutine === "boolean" ? edit.params.followRoutine : timelapse.followRoutine);
+  const [busy, run] = useBusy();
+  const customMinutes = /^\d+(\.\d+)?$/.test(custom.trim()) ? Number(custom) * UNIT_MINUTES[unit] : null;
+  const chosen: TimelapseTarget | null = customMinutes !== null && customMinutes > 0 ? { type: "duration", minutes: customMinutes } : target;
+  const sameTarget = (a: TimelapseTarget | null, b: TimelapseTarget) => a !== null && JSON.stringify(a) === JSON.stringify(b);
+  const changed = Object.entries(overrides).filter(([cls, policy]) => timelapse.interrupts[cls as InterruptClass] !== policy).length;
+  // The sheet's words for the skip, which RPE keeps as what was pressed; the skip that waits for the next message shows so, and the same press again takes it back.
+  const named = chosen ? `Timelapse ${chosen.type === "duration" ? formatMinutes(chosen.minutes) : (timelapse.until.find((entry) => sameTarget(chosen, entry.target))?.label ?? (chosen.type === "at" ? "to the time you said" : "")).toLowerCase()}` : null;
+  const asking = chosen && named !== null ? timelapseRequest(timelapse, chosen, overrides, props.view.chatId, follow, named) : null;
+  const waits = !edit && asking !== null && isStaged(props.view.staged, asking.action, asking.params, props.view.currency);
+  return (
+    <>
+      <div {...props.panel} class="body" data-lre-timelapse>
+        {edit ? (
+          <p class="lre-chat-hint" data-lre-palette-edit>
+            Change how long your message's time skip runs. It plays this instead of what was read.
+          </p>
+        ) : (
+          <WaitingPress view={props.view} block />
+        )}
+        {timelapse.blocked ? (
+          <Banner tone="warn" icon="pause">
+            {timelapse.blocked}
+          </Banner>
+        ) : null}
+        <Section title="For">
+          <div class="lre-chat-durations" role="group" aria-label="How long">
+            {timelapse.durations.map((minutes) => {
+              const t: TimelapseTarget = { type: "duration", minutes };
+              return (
+                <button
+                  key={minutes}
+                  type="button"
+                  class="lre-chat-pill"
+                  aria-pressed={sameTarget(chosen, t)}
+                  onClick={() => {
+                    setCustom("");
+                    setTarget(t);
+                  }}
+                >
+                  {formatMinutes(minutes)}
+                </button>
+              );
+            })}
+          </div>
+          <div class="lre-chat-custom">
+            <input class="lre-input" inputMode="decimal" placeholder="Custom" aria-label="Custom duration" value={custom} onInput={(event) => setCustom(event.currentTarget.value)} />
+            <Seg<"min" | "h" | "d" | "w">
+              label="Unit"
+              value={unit}
+              options={[
+                { value: "min", label: "min" },
+                { value: "h", label: "hours" },
+                { value: "d", label: "days" },
+                { value: "w", label: "weeks" },
+              ]}
+              onChange={(next) => setUnit(next)}
+            />
+          </div>
+          {timelapse.dayParts ? (
+            <span class="lre-chat-hint">
+              <Icon name="info" size={14} />
+              Calendar is at Narrative: times round to day parts.
+            </span>
+          ) : null}
+        </Section>
+        {timelapse.until.length > 0 ? (
+          <Section title="Until">
+            <div class="lre-list">
+              {timelapse.until.map((entry) => (
+                <button
+                  key={JSON.stringify(entry.target)}
+                  type="button"
+                  class="lre-item"
+                  aria-current={customMinutes === null && sameTarget(target, entry.target)}
+                  onClick={() => {
+                    setCustom("");
+                    setTarget(entry.target);
+                  }}
+                >
+                  <Icon name="flag" size={16} class="lre-chat-lead" />
+                  <span class="grow">
+                    <span class="title">{entry.label}</span>
+                    {entry.detail ? <span class="sub">{entry.detail}</span> : null}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </Section>
+        ) : null}
+        <FollowRoutineChoice value={follow} disabled={busy} onChange={setFollow} />
+        <Section>
+          <Disclosure summary={`Interrupts for this run${changed > 0 ? ` · ${changed} changed` : ""}`}>
+            {INTERRUPT_CLASSES.map((cls) => (
+              <div key={cls} class="lre-field">
+                <span class="label">{humanize(cls)}</span>
+                <Seg label={humanize(cls)} value={overrides[cls] ?? timelapse.interrupts[cls]} options={POLICY_OPTIONS} onChange={(policy) => setOverrides((prev) => ({ ...prev, [cls]: policy }))} />
+              </div>
+            ))}
+          </Disclosure>
+        </Section>
+      </div>
+      <footer>
+        {named !== null && !edit ? (
+          <span class="lre-chat-hint" data-lre-palette-waits>
+            <Icon name="info" size={14} />
+            {waits ? "It waits for your next message; pressed again, it no longer does." : "It waits for your next message, and the Author is told then how long, and plays the stretch of time. Send now puts it in the chat as your message at once."}
+          </span>
+        ) : null}
+        {asking !== null && !edit && !waits ? (
+          <Button
+            variant="secondary"
+            icon="send"
+            block
+            disabled={busy || timelapse.blocked !== null || turnRuns(props.view)}
+            title={turnRuns(props.view) ? TURN_RUNS : "Put it in the chat as your message now, and start the reply"}
+            onClick={() =>
+              run(async () => {
+                const result = await app.request({ ...asking, now: true });
+                if (result === null) return;
+                if ("messageId" in result) app.toast(SENT_NOW, "info");
+                props.onSent();
+              })
+            }
+          >
+            Send now
+          </Button>
+        ) : null}
+        <button
+          type="button"
+          class="lre-btn primary block"
+          data-lre-go
+          disabled={!chosen || timelapse.blocked !== null || busy}
+          aria-busy={busy || undefined}
+          onClick={() => {
+            if (asking === null) return;
+            run(async () => {
+              // From an intent gate's Edit, the skip as set here plays through the chip, in place of the read (DESIGN §5.1).
+              if (edit ? await sendChipChoice(app, edit.chip, "edit", edit.chatId, { params: asking.params }) : await app.request(asking)) props.onSent();
+            });
+          }}
+        >
+          <Icon name={waits ? "close" : "fast-forward"} />
+          {named === null ? "Choose how long" : edit ? `Play ${named}` : waits ? `Take back ${named}` : named}
+        </button>
+      </footer>
+    </>
+  );
+}

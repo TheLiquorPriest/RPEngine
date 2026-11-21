@@ -1,0 +1,252 @@
+// Every user interaction becomes exactly one of these protocol requests (ARCHITECTURE §4).
+// Kept pure so the mapping from a tap to its message is tested directly.
+
+import type { JsonObject, JsonValue } from "../shared/json";
+import type { ChatId, DomainId, EntityId, InterruptClass, InterruptPolicy, TierId, WorldId } from "../shared/ids";
+import type { EntityUpgradePick, KeepLine, TimeControl, TimelapseTarget, TimeScope, UpgradePicks } from "../shared/ledger";
+import { parseMoneyInput } from "../shared/money";
+import type { EditOp } from "../shared/edit-ops";
+import type { GenerateAs } from "../shared/state-view";
+import type { GmThingsRead, ThingsRead } from "../shared/thing-view";
+import type { UpgradePreview } from "../shared/upgrade";
+import type { Chip, FieldFixTarget, GmEntity, GmView, HudView, PaletteEntry, PaletteOption, StateView, TimelapseView } from "../shared/state-view";
+import { chipStarts } from "../shared/state-view";
+import type { FacetId, FacetValueId, WorldCurrency } from "../shared/world";
+import { PARTY_RELATION, partyTierOf, type PartyTier } from "../shared/party";
+import type { RequestBody } from "./registry";
+
+/** The request body of one protocol type. */
+export type Req<K extends RequestBody["type"]> = Extract<RequestBody, { type: K }>;
+
+/**
+ * What a chip button does. `regenerate` (the Retry chip on an empty reply, D32) runs the host's
+ * own Regenerate, and `continue` its Continue: only the frontend can start them. A swipe option
+ * (`renarrate`, `rerun`), the Retry of an unread action (`read_failed`,
+ * a Re-run) and the answer to a claim's question (Add, Not an action: the turn waiting on it
+ * resumes) record the one-shot choice with `lre.chip`, then run the same Regenerate; a failed
+ * reply's Re-run starts the reply as its card says (`Chip.as`), and a `send` start is the player's
+ * own Send, which no page can press. Every other choice, the pause chip's Keep and Discard
+ * included, is `lre.chip {chip, choice: action.id}`, with the value an action's input asked for as
+ * its payload.
+ */
+export interface ChipIntent {
+  request: Req<"lre.chip"> | null;
+  /** How the reply the choice waits for starts; null when it waits for none. */
+  start: GenerateAs | null;
+}
+
+/**
+ * An Upgrade with the owner's picks (DESIGN §4.3 `migrate`): only the changes whose choice differs
+ * from the default travel, written at every target (both sides of a relation pair); the fold works
+ * the defaults out itself. Even with no picks the Upgrade brings the definition changes in.
+ */
+export function upgradeRequest(chatId: ChatId, preview: UpgradePreview, choices: Readonly<Record<string, EntityUpgradePick>>): Req<"lre.world"> {
+  const merge: UpgradePicks = {};
+  for (const row of preview.entities) {
+    for (const change of row.changes) {
+      const choice = choices[change.id] ?? change.pick;
+      if (choice === change.pick) continue;
+      for (const t of change.targets) {
+        const picks = (merge[t.entity] ??= {});
+        if (t.part === "entity") picks.entity = choice;
+        else if (choice === "remove") continue;
+        else if (t.part === "field") (picks.fields ??= {})[t.field] = choice;
+        else if (t.part === "relation") ((picks.relations ??= {})[t.rel] ??= {})[t.to] = choice;
+        else picks[t.part] = choice;
+      }
+    }
+  }
+  return { type: "lre.world", op: "upgrade", chatId, to: preview.to, merge };
+}
+
+export function chipIntent(chip: Chip, choice: string, chatId: ChatId, payload?: JsonObject): ChipIntent {
+  const start = chipStarts(chip, choice);
+  if (choice === "regenerate" || choice === "continue") return { request: null, start };
+  const request: Req<"lre.chip"> = payload ? { type: "lre.chip", chatId, chip: chip.id, choice, payload } : { type: "lre.chip", chatId, chip: chip.id, choice };
+  return { request, start };
+}
+
+/** Convert one Keep-report entry; markers have no event ref and cannot be converted. */
+export function convertRequest(line: KeepLine, chatId: ChatId): Req<"lre.keep"> | null {
+  if ("marker" in line.ref) return null;
+  return { type: "lre.keep", chatId, choice: "convert", messageId: line.messageId, parentPath: line.parentPath, refs: [line.ref] };
+}
+
+/** A chain of palette picks (an option, then its second-step choices); params merge in order, then a free amount (cents), the entry's required number, who comes along and whom the player pays as. */
+export function paletteRequest(entry: PaletteEntry, picks: readonly PaletteOption[], chatId: ChatId, amountCents?: number, count?: number, people: readonly EntityId[] = [], as?: EntityId): Req<"lre.action"> {
+  const params: JsonObject = Object.assign({}, ...picks.map((pick) => pick.params));
+  if (entry.amount && amountCents !== undefined) params[entry.amount.param] = Math.round(amountCents);
+  if (entry.number && count !== undefined) params[entry.number.param] = count;
+  // Only the people the picker offered come along: a tick left from another place never does.
+  const along = entry.people ? people.filter((id) => entry.people?.options.some((o) => o.id === id)) : [];
+  if (entry.people && along.length > 0) params[entry.people.param] = along;
+  // Paying as (ORG-SPEC §3.6): only an organization the entry offers; You, or one it no longer offers, sends none.
+  if (entry.acting && as !== undefined && entry.acting.options.some((o) => o.id === as)) params[entry.acting.param] = as;
+  return { type: "lre.action", chatId, action: entry.action, params, source: "palette" };
+}
+
+/**
+ * A timelapse: only the overrides that differ from the current policy travel in the intent.
+ * `followRoutine` travels only when given (the palette always gives it): true lets the POV live its
+ * routine through the skip, false holds it where the story has it; absent, the world's default decides.
+ * `label`, the sheet's words for it ("Timelapse 3 h"), is what was pressed, as RPE tells the Author.
+ */
+export function timelapseRequest(view: TimelapseView, target: TimelapseTarget, overrides: Partial<Record<InterruptClass, InterruptPolicy>>, chatId: ChatId, followRoutine?: boolean, label?: string): Req<"lre.action"> {
+  const changed: JsonObject = {};
+  for (const [cls, policy] of Object.entries(overrides)) {
+    if (policy !== undefined && view.interrupts[cls as InterruptClass] !== policy) changed[cls] = policy;
+  }
+  return { type: "lre.action", chatId, action: view.action, params: { target: { ...target }, overrides: changed, ...(followRoutine === undefined ? {} : { followRoutine }), ...(label === undefined ? {} : { label }) }, source: "palette" };
+}
+
+/** A map tap on a travel option (move or drive). */
+export function travelRequest(action: string, params: JsonObject, chatId: ChatId): Req<"lre.action"> {
+  return { type: "lre.action", chatId, action, params: { ...params }, source: "map" };
+}
+
+/** A character's model (DESIGN §7): from a world's draft in Build, or from a chat's head in GM, behind the GM gate. */
+export function characterRequest(entity: EntityId, from: { worldId: WorldId } | { chatId: ChatId }): Req<"lre.character"> {
+  return "worldId" in from ? { type: "lre.character", op: "get", entity, scope: "build", worldId: from.worldId } : { type: "lre.character", op: "get", entity, scope: "gm", chatId: from.chatId };
+}
+
+/** Build's Things read of `worldId`'s draft (ITEMS-SPEC §10.1): the list, a thing's page, a person's things, a search, or the catalog's types. */
+export function thingsRequest(worldId: WorldId, read: ThingsRead): Req<"lre.things"> {
+  return { type: "lre.things", scope: "build", worldId, ...read };
+}
+
+/** GM → Things' read of the chat's head (ITEMS-SPEC §10.2), behind the GM gate: Build's reads, and Tidy up, Leave it, what was made in play and Keep in the world. */
+export function gmThingsRequest(chatId: ChatId, read: GmThingsRead): Req<"lre.things"> {
+  return { type: "lre.things", scope: "gm", chatId, ...read };
+}
+
+export function fixRequest(target: FieldFixTarget, value: JsonValue, chatId: ChatId): Req<"lre.fix"> {
+  return { type: "lre.fix", chatId, entity: target.entity, field: target.field, value };
+}
+
+/**
+ * The ✎ "Where are they?" on someone in People: the player character's own place ✎, aimed at them.
+ * It offers the places that ✎ offers (those the POV may know, never a hidden one) and starts at the
+ * POV's place when they're here, else at no place, since where they are when away isn't shown.
+ */
+export function whereFixTarget(hud: Pick<HudView, "fixes"> | null, entity: EntityId, here: boolean): FieldFixTarget | null {
+  const pov = hud?.fixes.place;
+  return pov ? { ...pov, entity, value: here ? pov.value : null } : null;
+}
+
+/** The clock's ✎ (DESIGN §12): the clock set to `time`, a date and time of day (`YYYY-MM-DD HH:MM`) in the world's calendar, local to where the POV is. */
+export function timeFixRequest(time: string, chatId: ChatId): Req<"lre.fix"> {
+  return { type: "lre.fix", chatId, time };
+}
+
+/** "Show a hint" on a quest sheet (DESIGN §10): the next hint earned at the row `track` (its id in the quest log) opened, with its Undo; only opened ones reach the agents. */
+export function hintRequest(track: string, chatId: ChatId): Req<"lre.fix"> {
+  return { type: "lre.fix", chatId, hint: track };
+}
+
+/** A GM edit: the operations in order, applied all or none as one fix with its own Undo (DESIGN §7). */
+export function editRequest(chatId: ChatId, ops: EditOp[]): Req<"lre.edit"> {
+  return { type: "lre.edit", chatId, ops };
+}
+
+/** The GM's simulation edit of an entity: only what the form changed (tier, agent flag, each domain's override; null hands a domain back to the tier). Null when nothing changed. */
+export function entityStateOp(entity: GmEntity, tier: TierId, agent: boolean, levels: Partial<Record<DomainId, number | null>>): EditOp | null {
+  const changed: Partial<Record<DomainId, number | null>> = {};
+  for (const l of entity.levels) {
+    const to = levels[l.domain];
+    if (to !== undefined && to !== l.override) changed[l.domain] = to;
+  }
+  const levelsChanged = Object.keys(changed).length > 0;
+  if (tier === entity.tier && agent === entity.agent && !levelsChanged) return null;
+  return { op: "entity", entity: entity.id, ...(tier !== entity.tier ? { tier } : {}), ...(agent !== entity.agent ? { agent } : {}), ...(levelsChanged ? { levels: changed } : {}) };
+}
+
+/** The GM's classification edit of an entity: its classes and tags, both whole. Null when they read as they are now. */
+export function classifyOp(entity: GmEntity, classes: Readonly<Record<FacetId, FacetValueId[]>>, tags: readonly string[]): EditOp | null {
+  const same = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((x) => b.includes(x));
+  const facets = new Set([...Object.keys(classes), ...Object.keys(entity.class)]);
+  const unchanged = [...facets].every((f) => same(classes[f] ?? [], entity.class[f] ?? [])) && same(tags, entity.tags);
+  return unchanged ? null : { op: "classify", entity: entity.id, class: Object.fromEntries(Object.entries(classes).filter(([, v]) => v.length > 0)), tags: [...tags] };
+}
+
+/** The GM's life edit of an entity (DESIGN §8): its state when the form changed it, and who is told it. Null when there is nothing to send. */
+export function lifeEditOp(entity: GmEntity, to: string, tell: readonly EntityId[]): EditOp | null {
+  const changes = to !== entity.life.state;
+  if (!changes && tell.length === 0) return null;
+  return { op: "life", entity: entity.id, ...(changes ? { to } : {}), ...(tell.length > 0 ? { tell: [...tell] } : {}) };
+}
+
+/**
+ * A relation's fields from the GM's inputs, one per field its type declares: a number within the
+ * field's bounds, one of an enum's values, yes or no, else the text. An empty input leaves the
+ * field out; fields the relation holds that its type doesn't declare are kept. Null when an input
+ * doesn't fit its field.
+ */
+export function relationFields(defs: GmView["relationTypes"][number]["fields"], inputs: Readonly<Record<string, string>>, held: JsonObject = {}): JsonObject | null {
+  const fields: JsonObject = Object.fromEntries(Object.entries(held).filter(([id]) => !defs.some((d) => d.id === id)));
+  for (const def of defs) {
+    const text = (inputs[def.id] ?? "").trim();
+    if (text === "") continue;
+    if (def.type === "number") {
+      const n = Number(text);
+      if (!Number.isFinite(n) || n < (def.min ?? -Infinity) || n > (def.max ?? Infinity)) return null;
+      fields[def.id] = n;
+    } else if (def.type === "bool") fields[def.id] = text === "true";
+    else if (def.values && !def.values.includes(text)) return null;
+    else fields[def.id] = text;
+  }
+  return fields;
+}
+
+/** Money into an account, or out of it with `take`, from the amount typed; null unless it reads as an amount above zero. */
+export function adjustOp(account: EntityId, text: string, currency: WorldCurrency, take: boolean): EditOp | null {
+  const cents = parseMoneyInput(text, currency);
+  return cents !== null && cents > 0 ? { op: "adjust", account, cents: take ? -cents : cents } : null;
+}
+
+/** The GM's "Bring to <player character>'s place": a move to where the player character is; null for the player character itself or while it's nowhere. */
+export function bringOp(entity: GmEntity, gm: Pick<GmView, "entities">): EditOp | null {
+  const pov = gm.entities.find((e) => e.pov);
+  return pov && pov.id !== entity.id && pov.place && pov.place !== entity.place ? { op: "move", entity: entity.id, to: pov.place } : null;
+}
+
+/**
+ * The player character's party (DESIGN §9.3; ORG-SPEC §3.12): someone's tier in it (null: not in it),
+ * and the GM's edit that puts them in a tier or takes them out (`null`), none when it is so already. A
+ * tier change keeps since when they joined; a GM's correction doesn't say since when for someone new.
+ */
+export function partyOf(entity: Pick<GmEntity, "id" | "relations">, gm: Pick<GmView, "entities">): { pov: GmEntity; tier: PartyTier | null; op(tier: PartyTier | null): EditOp | null } | null {
+  const pov = gm.entities.find((e) => e.pov);
+  if (!pov || pov.id === entity.id) return null;
+  const link = entity.relations.find((r) => r.type === PARTY_RELATION && r.to === pov.id);
+  const now = link ? partyTierOf(link.fields) : null;
+  const since = link?.fields?.since;
+  return {
+    pov,
+    tier: now,
+    op: (tier) => {
+      if (tier === now) return null;
+      if (tier === null) return { op: "unlink", rel: PARTY_RELATION, from: entity.id, to: pov.id };
+      return { op: "link", rel: PARTY_RELATION, from: entity.id, to: pov.id, fields: { tier, ...(typeof since === "string" && since !== "" ? { since } : {}) } };
+    },
+  };
+}
+
+/** The places a picker offers for a search: each word of it in the name, in the list's order. */
+export function placesMatching<P extends { name: string }>(places: readonly P[], search: string): P[] {
+  const words = search.toLowerCase().split(/\s+/).filter((w) => w !== "");
+  return places.filter((p) => words.every((w) => p.name.toLowerCase().includes(w)));
+}
+
+/** A `time` marker on the running chat (Play → Calendar, HUD ⏸, palette Pause/Resume). */
+export function timeMarker(chatId: ChatId, control: TimeControl, scope: TimeScope, to: JsonValue, preview = false): Req<"lre.marker"> {
+  return preview ? { type: "lre.marker", chatId, kind: "time", control, scope, to, preview: true } : { type: "lre.marker", chatId, kind: "time", control, scope, to };
+}
+
+/**
+ * The Sheet Designer's live preview (`lre.world sheet`): the ruleset as edited, saved or not, read
+ * on the draft's POV unless another entity is named. Absent parts go as absent, so a ruleset
+ * without a sheet previews as none.
+ */
+export function sheetPreviewRequest(worldId: WorldId, ruleset: JsonObject, entity?: EntityId): Req<"lre.world"> {
+  return entity === undefined ? { type: "lre.world", op: "sheet", worldId, ruleset } : { type: "lre.world", op: "sheet", worldId, ruleset, entity };
+}

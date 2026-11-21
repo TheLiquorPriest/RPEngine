@@ -1,0 +1,173 @@
+// Bulk changes to a list's selection (DESIGN §7, §4.1): what a multi-select's bar applies to everyone
+// picked. On the World page a change is the existing edit ops, one per entity, sent in chunks of the
+// setting `engine.maxEditOps`: each chunk is one `lre.edit`, all or none, with its own Undo. In Build it is a JSON
+// Patch on the draft, worked out from the draft as it stands, so it writes only what changes, sent in chunks of
+// `engine.maxEditOps` and never more than `worlds.maxPatchOps`. Each op goes through the same checks a single edit or write does.
+
+import type { DomainId, EntityId, Level, PlaceId, TierId } from "../shared/ids";
+import { pointerOf } from "../shared/json-patch";
+import type { Fidelity, MindApproach } from "../shared/minds";
+import { FIDELITIES } from "../shared/minds";
+import type { PartyTier } from "../shared/party";
+import type { EditOp } from "../shared/edit-ops";
+import type { JsonPatchOp } from "../shared/json-patch";
+import type { RoutineRole } from "../shared/routines";
+import type { GmView } from "../shared/state-view";
+import type { WorldDoc } from "../shared/world";
+import { partyOf } from "./requests";
+
+/** A group a list selects at once ("by level"): exactly these rows. */
+export interface SelectGroup {
+  id: string;
+  label: string;
+  ids: readonly string[];
+}
+
+/** The characters by fidelity, Live first (GM → World and Minds): each level's group, the empty ones left out. */
+export function fidelityGroups(characters: readonly { entity: EntityId; fidelity: { level: Fidelity } }[], label: Record<Fidelity, string>): SelectGroup[] {
+  return FIDELITIES.map((level) => ({ id: level, label: label[level], ids: characters.filter((c) => c.fidelity.level === level).map((c) => c.entity) })).filter((g) => g.ids.length > 0);
+}
+
+/** The world's entities by tier, in the tiers' order (Build → Entities): each tier's group, the empty ones left out. */
+export function tierGroups(doc: Pick<WorldDoc, "tiers" | "entities">): SelectGroup[] {
+  return Object.entries(doc.tiers)
+    .sort(([, a], [, b]) => a.order - b.order)
+    .map(([id, tier]) => ({ id, label: tier.label, ids: Object.values(doc.entities).filter((e) => e.tier === id).map((e) => e.id) }))
+    .filter((g) => g.ids.length > 0);
+}
+
+/** Splits a batch into chunks of at most `size`, in order; the size is the caller's (a setting of RPE's), never a default. */
+export function chunks<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Sends a batch in chunks of at most `size`, in order, each through `send` (one `lre.edit`, or one
+ * draft write); stops at the first one refused, so what applied is the chunks before it. Resolves how
+ * many applied.
+ */
+export async function sendInChunks<T>(items: readonly T[], send: (chunk: T[]) => Promise<boolean>, size: number): Promise<{ applied: number; of: number }> {
+  const all = chunks(items, size);
+  let applied = 0;
+  for (const chunk of all) {
+    if (!(await send(chunk))) break;
+    applied++;
+  }
+  return { applied, of: all.length };
+}
+
+/**
+ * How a selection stands on one setting now: each value with how many have it, the most common
+ * first (a tie in the order first seen), at most `max` of them; the rest counted together.
+ */
+export function mixCounts(labels: readonly string[], max = 3): { shown: { label: string; count: number }[]; rest: number } {
+  const counts = new Map<string, number>();
+  for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
+  const groups = [...counts].map(([label, count]) => ({ label, count })).sort((a, b) => b.count - a.count);
+  return { shown: groups.slice(0, max), rest: groups.slice(max).reduce((sum, g) => sum + g.count, 0) };
+}
+
+/** The mix as a bulk change shows it before it applies: "3 Leads, 2 Supporting", "… and 4 more". */
+export function mixOf(labels: readonly string[], max = 3): string {
+  const { shown, rest } = mixCounts(labels, max);
+  const text = shown.map((g) => `${g.count} ${g.label}`).join(", ");
+  return rest > 0 ? `${text} and ${rest} more` : text;
+}
+
+// ---------------------------------------------------------------- The World page
+
+/** A change the GM view applies to everyone selected, as the GM edit op that makes it for one. */
+export type BulkChange =
+  | { kind: "tier"; tier: TierId }
+  /** A domain's level for them, or null to hand it back to their tier. */
+  | { kind: "level"; domain: DomainId; level: Level | null }
+  /** Their routine's role in this chat (`routine_follow`), or null for the world's. */
+  | { kind: "role"; role: RoutineRole | null }
+  /** Their fidelity pinned in this chat (`mind_pin`), or null to go by score. */
+  | { kind: "pin"; level: Fidelity | null }
+  /** What they mean to do now and how (`mind_intent`); blank text and no approach clear it. */
+  | { kind: "intent"; text: string; approach: MindApproach | null }
+  | { kind: "move"; to: PlaceId }
+  /** Their tier in the player character's party (ORG-SPEC §3.12), or null to take them out of it. */
+  | { kind: "party"; tier: PartyTier | null };
+
+/** Whether a kind of change is a character's (their mind or routine): it applies only to the characters among those selected. */
+export function forCharacters(kind: BulkChange["kind"]): boolean {
+  return kind === "role" || kind === "pin" || kind === "intent";
+}
+
+/** An intent's text as it is sent, its spaces tidied; null when it is longer than `max`, the length for an intent. */
+export function intentText(text: string, max: number): string | null {
+  const tidy = text.trim().replace(/\s+/g, " ");
+  return tidy.length > max ? null : tidy;
+}
+
+/**
+ * The ops that make a change for each entity, in order; null when the change can't be made (an
+ * intent over its cap). A party tier is set only where it changes something, keeping since when
+ * each joined, and only those in the party are taken out of it.
+ */
+export function bulkOps(ids: readonly EntityId[], change: BulkChange, gm: Pick<GmView, "entities" | "minds">): EditOp[] | null {
+  switch (change.kind) {
+    case "tier":
+      return ids.map((entity) => ({ op: "entity", entity, tier: change.tier }));
+    case "level":
+      return ids.map((entity) => ({ op: "entity", entity, levels: { [change.domain]: change.level } }));
+    case "role":
+      return ids.map((entity) => ({ op: "routine_follow", entity, role: change.role }));
+    case "pin":
+      return ids.map((entity) => ({ op: "mind_pin", entity, level: change.level }));
+    case "intent": {
+      const text = intentText(change.text, gm.minds.lengths.gmIntent);
+      return text === null ? null : ids.map((entity) => ({ op: "mind_intent", entity, text, approach: change.approach }));
+    }
+    case "move":
+      return ids.map((entity) => ({ op: "move", entity, to: change.to }));
+    case "party":
+      return ids.flatMap((id) => {
+        const entity = gm.entities.find((e) => e.id === id);
+        const op = entity ? partyOf(entity, gm)?.op(change.tier) : null;
+        return op ? [op] : [];
+      });
+  }
+}
+
+// ---------------------------------------------------------------- Build
+
+/** A change Build applies to everyone selected in the draft. */
+export type DraftChange =
+  | { kind: "tier"; tier: TierId }
+  /** A domain's level override, or null to remove it (the tier decides). */
+  | { kind: "level"; domain: DomainId; level: Level | null }
+  /** A place's default scene type, or null to remove it. */
+  | { kind: "sceneType"; sceneType: string | null };
+
+/**
+ * The JSON Patch that makes a change for each selected item of the draft, only where it changes
+ * something. A place a map draws keeps its scene type (the map is its source).
+ */
+export function draftPatch(doc: WorldDoc, collection: "entities" | "places", ids: readonly string[], change: DraftChange): JsonPatchOp[] {
+  const ops: JsonPatchOp[] = [];
+  for (const id of ids) {
+    if (collection === "places") {
+      const place = doc.places[id];
+      if (!place || change.kind !== "sceneType" || place.map !== undefined || (place.sceneType ?? null) === change.sceneType) continue;
+      const path = pointerOf(["places", id, "sceneType"]);
+      ops.push(change.sceneType === null ? { op: "remove", path } : { op: "add", path, value: change.sceneType });
+      continue;
+    }
+    const entity = doc.entities[id];
+    if (!entity) continue;
+    if (change.kind === "tier" && entity.tier !== change.tier) ops.push({ op: "add", path: pointerOf(["entities", id, "tier"]), value: change.tier });
+    if (change.kind === "level" && (entity.levels?.[change.domain] ?? null) !== change.level) {
+      const levels = { ...entity.levels };
+      if (change.level === null) delete levels[change.domain];
+      else levels[change.domain] = change.level;
+      const path = pointerOf(["entities", id, "levels"]);
+      ops.push(Object.keys(levels).length === 0 ? { op: "remove", path } : { op: "add", path, value: levels });
+    }
+  }
+  return ops;
+}

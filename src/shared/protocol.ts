@@ -1,0 +1,1093 @@
+// Frontend ↔ backend protocol over Spindle messaging (`ctx.sendToBackend` /
+// `spindle.sendToFrontend`, routed by userId and frontendSessionId). ARCHITECTURE §5.
+//
+// Every message is an envelope `{ lre: PROTOCOL_VERSION, type, ... }`. Requests carry a
+// `reqId` chosen by the frontend; the backend answers each with exactly one `lre.result` or
+// `lre.error` carrying the same `reqId`. State arrives unsolicited as snapshots and deltas.
+
+import type { JsonObject, JsonValue } from "./json";
+import type { AgentsView, HelloClient, KitReport } from "./agents";
+import type { ClaimsPolicy } from "./claims";
+import type { BookFieldsEdit, BookLoreFields } from "./lore";
+import type { Limit, MindsRunView } from "./minds";
+import type { RoutineRead, RoutineReadResult } from "./routines";
+import type { ItemFix } from "./things";
+import type { VehicleClassChoice } from "./vehicles";
+import type { CharacterResult } from "./character";
+import type { AccessChip, GmThingsRead, PersonThings, ThingPage, ThingPicks, ThingsList, ThingsRead, ThingType } from "./thing-view";
+import type { UpgradePreview } from "./upgrade";
+import type { GmThingExtras, GmThingsList, KeepResult, MadeInPlay, TidyRun } from "./thing-gm";
+import type { ActionId, BoundMode, ChatId, ChipId, DomainId, EntityId, FieldId, Level, MessageId, PanelId, PlaceId, RevisionId, SlotId, TableId, WorldId } from "./ids";
+import type { EventRef, JournalNote, PathHash, ResolveScope, TimeControl, TimeScope, UpgradePicks } from "./ledger";
+import type { BuiltLoreIndex, LoreBookEntryView, LoreBookView, LoreIndexView, LoreMarkChange, LorePinsView, SecrecyBookPlan, SecrecyBookView } from "./lore-views";
+import type { Activity } from "./turn-activity";
+import type { GenerateAs, GmView, SheetSectionView, StateView } from "./state-view";
+import type { AdjudicationDef, EditorAnswer, EditorRequest, FeedScope, KindDef, LorePin, MapDisplay, RelationTypeDef, RevisionNote, StepPurpose, WorldDoc, WorldIndex } from "./world";
+import type { EditOp } from "./edit-ops";
+import type { JobKind, JobResult, JobStatus, JobSummary } from "./jobs";
+import type { LintIssue } from "./lint";
+import type { NarratorView } from "./narrator-view";
+import type { TableUpdate } from "./tables";
+import type { QuickestWay, TravelWay } from "./travel";
+import type { GM_OUTLINE, GmPartReply, GmReadPart, QueuedOn } from "./gm-parts";
+import type { OrgView } from "./org-view";
+
+// Moved to homes of their own (PlanSwap-13): today's files take them from here until PlanSwap-10 removes this protocol.
+export type { EditOp } from "./edit-ops";
+export type { JobKind, JobProposal, JobResult, JobSummary } from "./jobs";
+export type { JsonPatchOp } from "./json-patch";
+export type { LintFix, LintIssue } from "./lint";
+export type { GenerateAs } from "./state-view";
+export type { TableNames, TableRowChanges, TableUpdate } from "./tables";
+export type { GmThingsRead, ThingsRead } from "./thing-view";
+export type { UpgradeChange, UpgradeEntityRow, UpgradePreview, UpgradeTarget } from "./upgrade";
+export type { BuiltLoreIndex, LoreBookEntryView, LoreBookView, LoreIndexView, LoreMarkChange, LoreMarkView, LorePinsView, LorePinView, SecrecyBookPlan, SecrecyBookView, SecrecyEntryView, SecrecyState } from "./lore-views";
+export type { EditorRequest, WorldCollection, WorldPart } from "./world";
+
+export const PROTOCOL_VERSION = 1;
+
+/**
+ * The level of the requests outside clients rely on (DESIGN §23). 1: editor `version`, `patch` and
+ * `restore`, commit notes and history, `templates`, `chats` and `lre.draft.changed`; 2: `lre.state.get`.
+ * `lre.hello` answers with it; a build without them answers without it.
+ */
+export const AGENT_API = 2;
+
+/** The engine's extension identifier in Lumiverse (`spindle.json`), by which the command line finds it. */
+export const ENGINE_EXTENSION = "lumi_rp_engine";
+
+interface Envelope<T extends string> {
+  lre: typeof PROTOCOL_VERSION;
+  type: T;
+}
+
+interface Request<T extends string> extends Envelope<T> {
+  reqId: string;
+}
+
+// ---------------------------------------------------------------- state push
+
+/** One change to a StateView: set or delete the value at `path` (object keys and array indexes). */
+export type DeltaOp = { op: "set"; path: (string | number)[]; value: JsonValue } | { op: "del"; path: (string | number)[] };
+
+export interface StateSnapshot extends Envelope<"lre.state.snapshot"> {
+  chatId: ChatId;
+  /** Per (user, chat) push counter; strictly increasing. */
+  rev: number;
+  view: StateView;
+}
+
+export interface StateDelta extends Envelope<"lre.state.delta"> {
+  chatId: ChatId;
+  /** The `rev` the ops apply to. A frontend holding another rev sends `lre.state.resync`. */
+  base: number;
+  rev: number;
+  ops: DeltaOp[];
+}
+
+// ---------------------------------------------------------------- requests (frontend → backend)
+
+/** The frontend opened (or switched to) a chat; the backend replies with a snapshot. */
+export interface HelloRequest extends Request<"lre.hello"> {
+  chatId: ChatId | null;
+  /**
+   * An outside client (the `lumirpengine` CLI or MCP server, DESIGN §23) names itself: its commits
+   * are labelled `agent`, and the log says who connected. An MCP server checks in with what it runs
+   * and whether it follows the extension's agent kit.
+   */
+  client?: HelloClient;
+  /** The page shows the chat on screen (its route is the chat and the document is visible); absent: it does. */
+  viewing?: boolean;
+}
+
+/** Sent on reconnecting and on coming back into view (`viewing`, as on hello). */
+export interface ResyncRequest extends Request<"lre.state.resync"> {
+  chatId: ChatId;
+  viewing?: boolean;
+}
+
+/** The page's chat went out of view or came back (DESIGN §5.1): which chat it shows, and whether on screen. */
+export interface PageRequest extends Request<"lre.page"> {
+  chatId: ChatId | null;
+  viewing: boolean;
+}
+
+/**
+ * A page asked to start a prepared reply (`lre.generate`) claims it before starting it (DESIGN
+ * §5.1): the backend says start only to the page that holds the turn, once, so a page that wakes
+ * with an old ask never starts a second reply.
+ */
+export interface RestartRequest extends Request<"lre.restart"> {
+  chatId: ChatId;
+  turn: string;
+  /** What the player asked of this telling, from the page's ask: for the narrator alone. */
+  direction?: string;
+}
+
+/**
+ * A palette, map, command or chip action. A money or organization action tapped with no words is
+ * done at once, off screen (DESIGN §11, `shared/offstage.ts`): no message, turn or clock time,
+ * recorded on the head as a ✎ fix is, with its Undo. Any other tap from the palette, a panel or the
+ * map with no words is staged for the player's next message, and the same tap again clears it;
+ * `now` plays it at once as a turn, as a chip or a command does: the backend appends a user message
+ * with `intent` and triggers a generation. Words always play it as a turn.
+ */
+export interface ActionRequest extends Request<"lre.action"> {
+  chatId: ChatId;
+  action: ActionId;
+  params: JsonObject;
+  source: "palette" | "map" | "command" | "chip";
+  /** Optional user-visible text for the appended message. */
+  text?: string;
+  /** Play it at once as a turn rather than stage it or do it off screen (the staged action's Send now). */
+  now?: boolean;
+  /** Done at once, off screen, for an action of the table that only its surface does so (Gear → Manage's gear actions). */
+  offstage?: true;
+  /** Whether the Author is told of the action done off screen at the next turn; absent, the Tell the Author settings decide by its group. */
+  tell?: boolean;
+}
+
+export interface ChipRequest extends Request<"lre.chip"> {
+  chatId: ChatId;
+  chip: ChipId;
+  /** One of the chip's `actions[].id`. */
+  choice: string;
+  payload?: JsonObject;
+}
+
+/** A player-facing observation: opening detail may materialize it (DESIGN §9.2, "show"). */
+export interface ViewOpenRequest extends Request<"lre.view.open"> {
+  chatId: ChatId;
+  panel: PanelId;
+  entity: EntityId | null;
+}
+
+/**
+ * A ✎ fix on the head, written as a `post` entry of kind `fix`: one typed `set` of a field
+ * (`EditOp`; locked fields are refused), the clock set to `time`, a date and time of day in the
+ * world's calendar (`YYYY-MM-DD HH:MM`) at the POV's place, as the HUD reads it (DESIGN §9.2, §12),
+ * the next hint the player has earned at a quest log row opened (`hint`, the row's id: DESIGN §10),
+ * or a change to one of the player's own things (`thing`: `fix_item`, under the player's rules), or
+ * to several at once (`things`, 1 to `FIX_THINGS_MAX`: all or none, one entry with one Undo named by
+ * its `label`, told as the Tell the Author settings say for its group unless `tell`
+ * says). `undo` is the chip of the entry just written, null while it waits for a reply in flight.
+ */
+export type FixRequest = Request<"lre.fix"> & { chatId: ChatId } & ({ entity: EntityId; field: FieldId; value: JsonValue } | { time: string } | { hint: string } | { thing: ItemFix } | { things: ItemFix[]; label: string; tell?: boolean });
+
+/** The most things one `lre.fix {things}` changes. */
+export const FIX_THINGS_MAX = 64;
+
+/** A GM edit on the head (DESIGN §7): the operations in order, all or none, as one `post` entry of kind `fix`; locked fields are writable. */
+export interface EditRequest extends Request<"lre.edit"> {
+  chatId: ChatId;
+  ops: EditOp[];
+}
+
+/**
+ * The most operations one GM edit carries (`lre.edit`): the engine refuses more, the tools' schemas
+ * take no more, and the GM view's bulk changes send a larger selection in chunks of this many, each
+ * chunk one edit with its own Undo.
+ */
+export const EDIT_OPS_MAX = 64;
+
+/** The GM view's data (DESIGN §7), asked for when the GM view opens: never in a state push. */
+export interface GmRequest extends Request<"lre.gm"> {
+  chatId: ChatId;
+}
+
+/**
+ * One part of the GM view (DESIGN §7), built alone (`GmPartView`): a client reading one part (the
+ * MCP server's `lre_gm`, the GM page's tabs) needn't have the whole view built and sent. With `id`,
+ * of `entities`, `money` or `orgs` only that one, by its id or its name (an ambiguous name is
+ * refused, listing the ids); with `ids`, of those or of `roster`, only those found, in the order
+ * asked; with `kind`, of `entities`, `roster` or `money`, only those of that kind or one extending
+ * it. `roster` lists every entity slim (`GmRosterEntry`). `outline` (`GM_OUTLINE`) reads how many
+ * each part holds instead (`GmOutline`), with each part's size when `bytes` is asked. `since`, the
+ * key of an answer the client holds: while the head's key is still that, the answer is `same`, with
+ * nothing built.
+ */
+export interface GmPartRequest extends Request<"lre.gm.part"> {
+  chatId: ChatId;
+  part: GmReadPart | typeof GM_OUTLINE;
+  id?: string;
+  ids?: string[];
+  kind?: string;
+  since?: string;
+  bytes?: boolean;
+}
+
+/**
+ * A chat's folded head as one document (DESIGN §23), for a scratch copy an outside client plays on
+ * its own engine (the command line's sandbox): behind the GM gate, as `lre.gm` is, since it holds
+ * everything, secrets included. Nothing is written.
+ */
+export interface ChatExportRequest extends Request<"lre.chat.export"> {
+  chatId: ChatId;
+}
+
+/**
+ * What `lre.chat.export` answers: the head as `renderState` folds it (the world as played and its
+ * state, plain JSON), the world revision in force, the engine that folded it, the chat run's seed
+ * (which samples on-demand detail) and the clock.
+ */
+export interface ChatExport {
+  chatId: ChatId;
+  worldId: WorldId;
+  revision: RevisionId;
+  engine: string;
+  runSeed: string;
+  clock: number;
+  world: WorldDoc;
+  state: JsonObject;
+}
+
+/**
+ * The World page's Sections' preview (DESIGN §6.11): every section as the next turn would give it to
+ * the narrator now, built the way a turn builds it. Behind the spoiler gate: it holds marked facts.
+ */
+export interface SectionsRequest extends Request<"lre.sections"> {
+  chatId: ChatId;
+}
+
+/**
+ * One section in the preview, in prompt order. `status`: `sent` (its text goes to the narrator),
+ * `off` (the world or the GM switched it off), `unplaced` (no book entry to fill), `empty` (nothing
+ * to tell now), `clipped` (over the section budget, or the Minds section's own). `content` is the
+ * text as the narrator reads it, marked facts and hints included; `cut` the lines its caps left out;
+ * `marked` and `hints` how many of those ride in it.
+ */
+export interface SectionPreview {
+  slot: SlotId;
+  label: string;
+  status: "sent" | "off" | "unplaced" | "empty" | "clipped";
+  scope: FeedScope;
+  content: string | null;
+  tokens: number | null;
+  cut: number;
+  marked: number;
+  hints: number;
+}
+
+/**
+ * A character's routine (DESIGN §8): `day`, their effective routine, schedules and day with where each
+ * block comes from, as the GM reads it (`view: "gm"`, behind the GM gate: everything) or as the POV
+ * may know it (`view: "player"`: what Cast shows, with why); `changed`, everyone the chat changed.
+ */
+export type RoutineRequest = Request<"lre.routine"> & { chatId: ChatId } & RoutineRead;
+
+/**
+ * A character as its own model (DESIGN §7, the Character model), with every place for the picker.
+ * `scope: "build"` reads the world's draft (where the world starts them); `scope: "gm"` reads the
+ * chat's head, behind the GM gate as `lre.gm` is, and adds what they're doing now.
+ */
+export type CharacterRequest = Request<"lre.character"> & { op: "get"; entity: EntityId } & ({ scope: "build"; worldId: WorldId } | { scope: "gm"; chatId: ChatId });
+
+/**
+ * Things (ITEMS-SPEC §10.1, §10.2): Build's (`scope: "build"`), read from the world's draft as a chat
+ * would start from it, and GM → Things' (`scope: "gm"`), read from the chat's head behind the GM gate
+ * as `lre.gm` is. `list`, every thing with its size, where it is and whose, by owner too, and the
+ * pickers' choices (in GM, also where the player character is and why each thing someone has is
+ * theirs to have); `thing`, one thing's page (where it is kept, who may use it, what it holds) and
+ * the pickers' choices (in GM, also where it rests, why it is had, its history and its findings);
+ * `person`, the things a person has and owns in the Character page's groups, and the choices;
+ * `find`, the things words name, best first (the name resolver, then names starting with them);
+ * `types`, the catalog's types with the size each gives. GM only: `tidy`, Tidy up's findings (at
+ * most the user's findings per run, those left out); `leave`, a finding left (or shown again,
+ * `left: false`) for this chat; `made`, the things and places the chat made in play, each saying
+ * whether the world's draft has it; `keep`, copies of those into the world's draft. Play's
+ * (`scope: "play"`): `types`, what Belongings' Add offers the player of the chat's head (the types,
+ * the vehicle classes, and how many things one Add makes at most); `use`, who may use a thing of the
+ * player's, for its Owner & use, which the state view carries none of.
+ */
+export type ThingsRequest = Request<"lre.things"> & (({ scope: "build"; worldId: WorldId } & ThingsRead) | ({ scope: "gm"; chatId: ChatId } & GmThingsRead) | { scope: "play"; chatId: ChatId; op: "types" } | { scope: "play"; chatId: ChatId; op: "use"; entity: EntityId });
+
+/**
+ * A chat's state view, as a page's snapshot holds it, answered to an outside client (DESIGN §23),
+ * with the chat's activity line. A read only: unlike a hello or a resync it makes the session no
+ * page, claims no prepared reply and opens no ledger window.
+ */
+export interface StateGetRequest extends Request<"lre.state.get"> {
+  chatId: ChatId;
+}
+
+/**
+ * A Play change to the running chat: a realism, time, player-claims, adjudication or Upgrade
+ * marker. With `preview`, nothing is written. An Upgrade with `merge` brings the revision's
+ * definition changes in as the picks say.
+ */
+export type MarkerRequest = Request<"lre.marker"> & { chatId: ChatId; preview?: true } & (
+    | { kind: "resolve"; domain: DomainId; scope: ResolveScope; to: Level }
+    | { kind: "time"; control: TimeControl; scope: TimeScope; to: JsonValue }
+    | { kind: "claims"; to: ClaimsPolicy }
+    | { kind: "adjudicate"; to: AdjudicationDef }
+    | { kind: "migrate"; to: RevisionId; merge?: UpgradePicks }
+  );
+
+/** What a marker would do (DESIGN §9.2: the demotion preview lists predicates whose inputs will freeze; an Upgrade's lists its definition changes). */
+export interface MarkerPreview {
+  lines: { text: string; tone: "freeze" | "promote" | "materialize" | "info" }[];
+  upgrade?: UpgradePreview;
+}
+
+/** Keep-report and pause decisions (DESIGN §4.3). */
+export type KeepRequest = Request<"lre.keep"> & { chatId: ChatId } & (
+    | { choice: "keep"; messageId: MessageId }
+    | { choice: "discard"; messageId: MessageId }
+    | { choice: "convert"; messageId: MessageId; parentPath: PathHash; refs: EventRef[] }
+  );
+
+export interface SettingsGetRequest extends Request<"lre.settings.get"> {}
+
+/** The D32 preset caveats, apart from settings: they need a dry run of the chat, which takes long on a long chat. */
+export interface SettingsCaveatsRequest extends Request<"lre.settings.caveats"> {}
+
+/**
+ * An RFC 7386 merge patch over the user's settings: `null` deletes (unpin a type with
+ * `{extraction: {purchase: null}}`) and arrays replace. A `realism.preset` or `modelUse.preset`
+ * other than `custom` is expanded by the backend into levels and band caps, or steps and budgets;
+ * any manual change sends `preset: "custom"`.
+ */
+export interface SettingsSetRequest extends Request<"lre.settings.set"> {
+  patch: JsonObject;
+}
+
+/** Host UI operations only the backend can perform (the frontend has no close-drawer API; DESIGN §12). */
+export interface UiRequest extends Request<"lre.ui"> {
+  op: "close_drawer";
+}
+
+/**
+ * Play's map (DESIGN §12). `display` (the default op): how the map shows this chat, what the POV
+ * knows or fog of war; presentation, kept beside the chat rather than in its ledger, so it never
+ * changes the world. `walk`: what Walk here to a cell of the grid the POV stands on takes, judged
+ * as the step action is, on the real ground: the page's grid is cut to the display, so it can't
+ * path-find under fog. `ways`: the quickest way's minutes to each place there is a way to, for the
+ * list of places; `travel`: every way to one place, for its sheet. Neither is in the state view.
+ */
+export type MapRequest = Request<"lre.map"> & { chatId: ChatId } & ({ op?: "display"; display: MapDisplay } | { op: "walk"; x: number; y: number } | { op: "ways" } | { op: "travel"; to: PlaceId });
+
+/** One organization's page as Orgs draws it, read when its page or one of its editors opens (`orgs.org`): the state view carries only each page's summary (`orgs.summary`). */
+export interface OrgPageRequest extends Request<"lre.org"> {
+  chatId: ChatId;
+  org: EntityId;
+}
+
+/** The Journal's notes of the chat's newest turns, read when the Journal opens and again as the state it shows changes: the state view carries none of them. */
+export interface JournalRequest extends Request<"lre.journal"> {
+  chatId: ChatId;
+}
+
+/**
+ * GM → This chat → Knowledge (DESIGN §6.11): the chat's own knowledge choices, knowledge tracking
+ * and the narrator's knowledge, kept in its metadata (`backend/chat-knowledge-prefs.ts`) rather
+ * than its ledger, so a Lumiverse Branch keeps them and no recorded turn changes. A part given sets
+ * it, null returns it to what it follows (the world's default, else Settings), and one left out
+ * stays as it is: with neither, it only reads them. A world chat's only.
+ */
+export interface ChatKnowledgeRequest extends Request<"lre.chat.knowledge"> {
+  chatId: ChatId;
+  knowledge?: boolean | null;
+  narrator?: NarratorView | null;
+  /** Retired: which of the previous builds' engines played the chat's turns. RPE plays every chat itself, so nothing offers or sets it. */
+  engine?: "classic" | "agents" | "harness" | null;
+  /** Whether this chat's impossible holds are tidied automatically, its one-time Things tidied fix (the World page's Things, ITEMS-SPEC §9, §11); null returns it to the world's (`tidy.auto`). */
+  tidy?: boolean | null;
+  /** GM → This chat → Engine's own read: the answer also says why an engine can't be chosen now, where one can't (`harnessBlocked`). */
+  engines?: true;
+}
+
+/**
+ * Propose routines from lore (DESIGN §13): whom it proposes routines and schedules for, and where a
+ * second pass starts. People and groups are read in id order; a pass that stops before the last
+ * returns the input that continues it (`JobResult.next`).
+ */
+export interface RoutineJobInput {
+  /** The people and groups to propose for; absent, every one the job may read. */
+  owners?: EntityId[];
+  /** A second pass: start after this owner. */
+  after?: EntityId;
+}
+
+/**
+ * `list`: the user's kept jobs for a world (running ones, and the last few that ended), oldest
+ * first, so Build shows a job and its proposals after a reload or a restart. `dismiss` removes a
+ * job that has ended, with its result.
+ */
+export type JobRequest = Request<"lre.job"> & ({ op: "start"; kind: JobKind; worldId: WorldId; input: JsonObject } | { op: "cancel"; jobId: string } | { op: "list"; worldId: WorldId } | { op: "dismiss"; jobId: string });
+
+/** Pushed while a job runs and once when it ends. */
+export interface JobUpdate extends Envelope<"lre.job.update"> {
+  jobId: string;
+  kind: JobKind;
+  status: JobStatus;
+  /** 0..1 */
+  progress: number;
+  message?: string;
+  result?: JobResult;
+}
+
+/**
+ * World operations. `sheet` previews the Sheet Designer's layout: the draft world with `ruleset` in
+ * place of its own, read on `entity` (the POV by default) as a new chat would start; nothing is saved.
+ * `commit`'s `note` goes into the world's history, and its `version`, when sent, is checked as an
+ * editor write's is (DESIGN §23). `templates` lists the starter worlds `create` takes; `chats` lists
+ * the user's chats that play a world (one world's with `worldId`, one chat with `chatId`). `updates`
+ * lists the data tables this build ships newer than the world's copies (`TableUpdate`): the draft's,
+ * or one revision's (a chat's, for Pins and upgrade). `revisions` reads a page of the world's history,
+ * newest first (the next page by the `next` the last one gave, as `cursor`). `changes` lists what changed
+ * from `from` (the head by default) to `to` (the draft by default), part by part.
+ */
+export type WorldRequest = Request<"lre.world"> &
+  (
+    | { op: "list" }
+    | { op: "get"; worldId: WorldId; revision?: RevisionId }
+    | { op: "create"; name: string; template: string | null }
+    | { op: "delete"; worldId: WorldId }
+    | { op: "commit"; worldId: WorldId; base: RevisionId | null; note?: string; version?: number }
+    | { op: "import"; file: JsonValue }
+    | { op: "export"; worldId: WorldId; revision?: RevisionId }
+    | { op: "lint"; worldId: WorldId; revision?: RevisionId }
+    | { op: "attach"; worldId: WorldId; chatId: ChatId }
+    | { op: "upgrade"; chatId: ChatId; to: RevisionId; merge?: UpgradePicks }
+    | { op: "undo_upgrade"; chatId: ChatId; edit: string }
+  | { op: "limits" }
+    | { op: "sheet"; worldId: WorldId; ruleset: JsonValue; entity?: EntityId }
+    | { op: "templates" }
+    | { op: "chats"; worldId?: WorldId; chatId?: ChatId }
+    | { op: "updates"; worldId: WorldId; revision?: RevisionId }
+    | { op: "revisions"; worldId: WorldId; cursor?: string }
+    | { op: "changes"; worldId: WorldId; from?: RevisionId; to?: RevisionId }
+  );
+
+/** A starter world `lre.world create` can start from. */
+export interface TemplateInfo {
+  id: string;
+  name: string;
+  /** One or two sentences on what it holds. */
+  summary: string;
+}
+
+/**
+ * A chat that plays a world: the revision it plays now (after any Upgrade), and whether that is
+ * behind the world's head. `revision` is null, with `reason`, when the chat's ledger can't be read;
+ * `behind` is then false.
+ */
+export interface WorldChatInfo {
+  chatId: ChatId;
+  name: string;
+  worldId: WorldId;
+  revision: RevisionId | null;
+  behind: boolean;
+  /** The world's head revision, which a chat that is behind moves to; null where the world is gone. */
+  head?: RevisionId | null;
+  reason?: string;
+}
+
+/** One revision of a world as its history lists it (`lre.world revisions`): when it became head and what made it, its note, how many things it changed against the revision before it, whether it is the head now, and the chats that play it. */
+export interface WorldRevisionInfo {
+  revision: RevisionId;
+  /** When it became head, in ms since the epoch; none for a revision that became head before the world kept a history. */
+  at?: number;
+  source?: RevisionNote["source"];
+  note?: string;
+  head: boolean;
+  /** The revision that was the head before it; null for the world's first. */
+  before: RevisionId | null;
+  /** Null for the world's first revision, and for one whose file is gone. */
+  changed: number | null;
+  chats: { chat: ChatId; name: string }[];
+}
+
+/** What changed from one version of a world to another, part by part (`lre.world changes`); `to` is null for the draft. */
+export interface WorldChangesInfo {
+  from: RevisionId;
+  to: RevisionId | null;
+  total: number;
+  parts: {
+    /** The collection (`entities`, `places`…) or the part (`calendar`…) of the world's document. */
+    part: string;
+    added: number;
+    changed: number;
+    removed: number;
+    /** The first things it changed, named; none for a part that holds no things of its own. */
+    things: { id: string; name: string | null; kind: "added" | "changed" | "removed" }[];
+    more: number;
+  }[];
+}
+
+/**
+ * Lore curation (DESIGN §4.2) and pins (§24.5). LRE reads World Info as lore live, so nothing here
+ * refreshes a copy of it. `save`: the chat's latest reply, or `text` (an excerpt of the chat), becomes a lore
+ * entry in the draft of the chat's world, its source the message it came from. `books`: the user's
+ * World Info books a pin may name an entry of, those attached to `chatId` first (the engine's own
+ * books left out). `entries`: one book's entries. `pins`: every pin of the world's draft (with
+ * `worldId`) or of the revision the chat plays (with `chatId`), each read now. `fields`: Build's
+ * Save of one entry's own LRE fields, its visibility, links and aliases (null takes them off); an
+ * earlier build's secrecy fields on it stay as they are, and nothing else of the entry is written.
+ * `mark`: Build's Make secret and Make public, written as secret marks into the entry's text
+ * (`shared/secret-marks.ts`) and nothing else of it. Both answer the book's entries, as read after, and carry the `revision` the page read
+ * the entry at: a write on an entry that has changed since is refused, and the page reads the entry as it now stands.
+ * `index`: the lore index of the world's books as Build's index entry would hold it now
+ * (`LoreIndexView`), the entry kept brought up to date first. `build`: Build's Build an index entry,
+ * on the user's press: that index written as a new entry of `bookId`, which RPE keeps in sync until
+ * the user stops it; answers the index.
+ */
+export type LoreRequest = Request<"lre.lore"> &
+  (
+    | { op: "save"; chatId: ChatId; text?: string }
+    | { op: "books"; chatId?: ChatId }
+    | { op: "entries"; bookId: string }
+    | { op: "pins"; worldId?: WorldId; chatId?: ChatId }
+    | { op: "fields"; bookId: string; entryId: string; fields: BookFieldsEdit | null; revision?: number }
+    | { op: "mark"; bookId: string; entryId: string; change: LoreMarkChange; revision?: number }
+    | { op: "index"; worldId: WorldId }
+    | { op: "build"; worldId: WorldId; bookId: string }
+  );
+
+/**
+ * Moving the user's World Info books from LRE's old secrecy fields to secret marks (DESIGN §4.2),
+ * book by book, each step on the user's own press in Build → Lore → Secrecy in your World Info.
+ * `books`: the user's books (the engine's own left out) and where each stands; `preview`: one book
+ * read now, with what Apply would do or what its move did, writing nothing; `apply`, `confirm` and
+ * `restore` act on the book as the preview that gave `version` read it, and are refused as a
+ * conflict once the book or its move changed since. Each answers with the book as it stands after.
+ */
+export type SecrecyRequest = Request<"lre.secrecy"> &
+  (
+    | { op: "books" }
+    | { op: "preview"; bookId: string }
+    | { op: "apply"; bookId: string; version: string }
+    | { op: "confirm"; bookId: string; version: string }
+    | { op: "restore"; bookId: string; version: string }
+  );
+
+/**
+ * Character minds on demand (DESIGN §24.9), from GM → Minds behind the GM gate. `run` asks the minds
+ * of `who` (absent: everyone Live and Near) now, at the chat's head, from its messages and lore as a
+ * turn would, and records them as one GM edit with its Undo; it answers at once, and the run's
+ * progress and end arrive as `lre.minds.update`. `cancel` stops a run, recording nothing; `status`
+ * reads the chat's latest run.
+ */
+export type MindsRequest = Request<"lre.minds"> & { chatId: ChatId } & ({ op: "run"; who?: EntityId[] } | { op: "cancel"; runId: string } | { op: "status" });
+
+/** Cancel on the activity line (DESIGN §5.1): stop the chat's engine run or reply read under way. A cancelled turn ends with no failure, and can be sent again. */
+export interface CancelTurnRequest extends Request<"lre.cancel"> {
+  chatId: ChatId;
+}
+
+/**
+ * The preset card (DESIGN §6.8): `get` reads the card of the preset Lumiverse generates with; `add`
+ * adds the RPEngine blocks it lacks, then reads it.
+ */
+export type PresetRequest = Request<"lre.preset"> & { op: "get" | "add" };
+
+/**
+ * Diagnostics (DESIGN §6.9), GM-level like `lre.gm`: answered on request, never pushed. `get` reads
+ * the chat's records, `clear` forgets them, `dismiss` clears a failure from the activity line, `text`
+ * reads an agent call's text by the hash one of the chat's records keeps (no other blob).
+ */
+export type DiagRequest = Request<"lre.diag"> & ({ chatId: ChatId; op: "get" | "clear" | "dismiss" } | { chatId: ChatId; op: "text"; hash: string });
+
+/** What the active preset says to LumiRPEngine: the section outlets its enabled blocks hold (with the section each places, null when none has that name) and each guidance block's state. */
+export interface PresetCard {
+  preset: { id: string; name: string } | null;
+  outlets: { outlet: string; label: string | null }[];
+  blocks: { target: string; name: string; state: "missing" | "empty" | "read" | "enabled" }[];
+}
+
+/**
+ * The outside MCP servers (DESIGN §23). `kit` is a server's own check: this build and where its
+ * kit is, and whether this session checked in since the extension started. The MCP server page
+ * and the update notice `get` the servers this account has seen; `update` asks the one named to
+ * reload now; `reconnect` (Reconnect in Lumiverse) asks the Lumiverse-run one named to leave, so
+ * Lumiverse's client connects it again and lists this build's tools; `dismiss` puts the notice away
+ * until the next update; `forget` drops a server.
+ */
+export type AgentsRequest = Request<"lre.agents"> & ({ op: "get" | "kit" | "dismiss" } | { op: "update" | "reconnect" | "forget"; client: string });
+
+// ---------------------------------------------------------------- the GM assistant and the workspace (INC1-SPEC C8)
+
+/**
+ * GM → Assistant (DESIGN §4.5): the game master's chat with the GM agent about this chat's world:
+ * GM data, behind the GM gate as `lre.gm` is. `get` reads the thread; `send` adds your message and
+ * starts the agent on it, answering at once: its progress and its answer come as
+ * `lre.assistant.update`. `cancel` stops the answer under way; `apply` applies an open proposal,
+ * whole or the changes `keys` picks; `reject` turns one down; `clear` forgets the thread and its
+ * proposals (refused while an answer is under way).
+ */
+export type AssistantRequest = Request<"lre.assistant"> & { chatId: ChatId } & ({ op: "get" | "cancel" | "clear" } | { op: "send"; text: string } | { op: "apply"; proposalId: string; keys?: string[] } | { op: "reject"; proposalId: string });
+
+/** One tool call of an answer: the tool, its arguments in short, what it gave back when it failed, and how long it took. GM-only, as the whole thread is. */
+export interface TraceRow {
+  tool: string;
+  summary: string;
+  error?: string;
+  ms: number;
+}
+
+/** How an answer ended: it answered; a budget or the acceptance guard refused its next call; the loop detector stopped it; you cancelled it; or a call failed. */
+export type AssistantStatus = "answered" | "refused" | "stopped" | "cancelled" | "failed";
+
+/**
+ * One message of the thread, yours (`user`) or the assistant's. An assistant message has its tool
+ * calls (`trace`), what its calls spent (`usage`: tokens in, of which `cached` the provider read from
+ * its cache and, when the provider says, `written` it wrote to it, and out) and how it ended
+ * (`status`), with why when it stopped short of an answer (`reason`).
+ */
+export interface AssistantMessage {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  /** Epoch ms. */
+  at: number;
+  trace?: TraceRow[];
+  usage?: { in: number; out: number; cached: number; written?: number };
+  status?: AssistantStatus;
+  reason?: string;
+}
+
+/**
+ * One change of a proposal as its dry run put it: its operation key, its change type, its mode and
+ * its lines; then, once it was applied, whether it landed (`applied`) or was refused, and why.
+ */
+export interface AssistantProposalOp {
+  key: string;
+  changeType: string;
+  /** The change in plain words, read with the assistant's knowledge. */
+  lines: string[];
+  /** `auto`, or `confirm`: its change type asks first, so it waits for Apply even where changes apply at once. */
+  mode: string;
+  applied?: true;
+  /** Why it didn't land: the writer's code and reason; `WRITE_REFUSED` (its write was refused for when it came), and an applied proposal's Apply may send it again. */
+  refused?: { code: string; reason: string };
+  /** Its proposal's Undo took it back. A change it made in the learned area is no Undo's to take back: it stays applied. */
+  undone?: true;
+}
+
+/**
+ * A change's refusal when its write was refused for when it came, not for what it is: a turn's close
+ * refused its held write, or a turn landed between its check and its write. An Apply may send it
+ * again, an applied proposal's too, while what landed beside it stands.
+ */
+export const WRITE_REFUSED = "write_refused";
+
+/**
+ * The changes one answer proposed: its edit tools' dry runs, each change once. `open` waits for
+ * Apply, a pick or No; `applied`: what was picked landed as one GM edit, whose chip (`chipId`, for
+ * `lre.chip`'s undo) takes it back; `pending`: applied while the engine ran a turn, so it lands when
+ * that turn ends, and its chip is named then (none when the turn had already made it so); `undone`:
+ * its chip's Undo took back what it wrote, wherever it was pressed (each change it took back says
+ * so); `rejected`: turned down.
+ */
+export interface AssistantProposal {
+  id: string;
+  /** The answer that proposed it. */
+  messageId: string;
+  ops: AssistantProposalOp[];
+  status: "open" | "applied" | "rejected";
+  chipId?: string;
+  pending?: true;
+  undone?: true;
+}
+
+/** The answer under way: its agent, its label (all the activity line shows of it), the tokens its calls have spent so far, and when it started (epoch ms). */
+export interface AssistantRun {
+  agentId: string;
+  label: string;
+  tokens: { in: number; out: number };
+  startedAt: number;
+}
+
+/** A chat's thread with the assistant, oldest first; the answer under way, if any; and every proposal, oldest first. */
+export interface AssistantView {
+  thread: AssistantMessage[];
+  running: AssistantRun | null;
+  proposals: AssistantProposal[];
+}
+
+/**
+ * GM → Workspace (DESIGN §4.4): the chat's workspace at its head, its learned area, and the user's
+ * global workspace, whose paths start `~/`. `list` and `read` read them; `write`, `delete`, `move`
+ * and `pin` change one file through the writer the agents' tools use, as one GM edit with its Undo
+ * chip, held while the engine runs a turn (`HeldWrite.hold`); a file under `learned/` or `~/`
+ * changes at once, in its store, with no Undo chip. Every file is every agent's to read. `session`
+ * reads the main agent's session at the head, whole, and `rollback` rolls its latest compaction
+ * back: the next agent turn's record carries the restore, so no earlier record changes (INC2-SPEC
+ * C14). The turns' transcripts (`transcripts/`) are listed and read like files, and refused to
+ * every change. GM data, behind the gate as `lre.gm` is.
+ */
+export type WorkspaceRequest = Request<"lre.workspace"> & { chatId: ChatId } & ({ op: "list" } | { op: "read"; path: string } | { op: "write"; path: string; text: string } | { op: "delete"; path: string } | { op: "move"; from: string; to: string } | { op: "pin"; path: string; pinned: boolean } | { op: "session" } | { op: "rollback" });
+
+/**
+ * The main agent's session at the chat's head (`lre.workspace session`), whole: no knowledge holds
+ * any of it back, since GM → Workspace is the GM's. Its compaction summary (null when none); the
+ * turns it holds whole and their size in tokens, estimated; each turn's segment with its messages;
+ * what of it the main agent reads (its own messages and the summary, the only part its prompt is
+ * sent); how many of its parts the store no longer has; and its latest compaction's rollback: `none`
+ * when there is none to roll back, `available`, or `pending` once asked for, until the next agent
+ * turn's record carries it.
+ */
+export interface SessionView {
+  summary: string | null;
+  turns: number;
+  tokens: number;
+  segments: SessionSegmentView[];
+  reads: { turns: number; tokens: number };
+  missing: number;
+  rollback: "none" | "available" | "pending";
+}
+
+/** One turn's segment of the main session: the reply on the chain whose record holds it (1-based; null for one a compaction kept that no reply on the chain names), and its messages in order. */
+export interface SessionSegmentView {
+  turn: number | null;
+  messages: SessionMessageView[];
+  /** What of it the main agent reads, in tokens, estimated (its receipts where the session keeps them). */
+  tokens?: number;
+}
+
+/**
+ * A message of the main session: who it is from (the engine's message to the main agent, or its
+ * own answer: `main`, which the main agent reads; else a fixed pipeline's digest of its turn, the
+ * player's words or the reply), its text, and each role run and what landed (a digest's).
+ */
+export interface SessionMessageView {
+  role: "user" | "assistant";
+  text: string;
+  main: boolean;
+  engine?: { roles: { role: string; via: string; ok: boolean }[]; committed: { role: string; key: string; type: string }[] };
+}
+
+/**
+ * The Prompt page's Test for a role's text (AGENT-LOOP-PLAN §9; DESIGN §6.12): `text`
+ * checked as it would be saved as text `id`'s, then the task whose contract it keeps, built from
+ * `chatId`'s latest exchange as a turn builds it, run once by its role with `text` in place, and the
+ * answer checked against that contract: one model call, none for a text with problems. It reads the
+ * chat, so it is GM data, behind the gate as `lre.gm` is. Only a role's texts are tested.
+ */
+export type PromptsRequest = Request<"lre.prompts"> & { op: "test"; chatId: ChatId; id: string; text: string };
+
+/** What a Test found, in words: `ok` when the text has no problems and the answer keeps its contract; else each problem with the text, then each way the answer breaks the contract. The answer itself isn't sent: it may hold what the page shouldn't. */
+export interface PromptTestView {
+  ok: boolean;
+  problems: string[];
+  /** What of the role's task the chat couldn't give, in words, each with why (a task only a turn under way has runs on the role's texts alone); empty when the task was built whole from the chat's latest exchange, or nothing ran. */
+  left: string[];
+}
+
+/**
+ * A workspace file as GM → Workspace lists it: its path (`~/…` for the global workspace's), its
+ * body's hash and size, whether it is pinned, whether it is the learned area's (kept outside the
+ * turns) or a turn's transcript (`transcript`: read-only, under `transcripts/`), and who wrote it:
+ * the agent's role (`gm` for your own) and its operation's key, and the turn, the number of the
+ * reply on the chain whose record holds the write (null before any reply, and for a kept file).
+ */
+export interface WorkspaceFileView {
+  path: string;
+  hash: string;
+  size: number;
+  pinned: boolean;
+  learned: boolean;
+  transcript?: true;
+  provenance: { role?: string; key?: string; turn: number | null };
+}
+
+// ---------------------------------------------------------------- an agent turn's review card (INC2-SPEC C13)
+
+/**
+ * An agent turn's review card (`backend/agents/review.ts`): every change of the turn that asks first,
+ * in plain words as the player character may read them. `get` reads the chat's cards, and pushes their
+ * changes to this page as `lre.review.update` from then on; `apply` applies a card's open changes, all
+ * or the ones `keys` picks; `reject` turns them all down. At a gate
+ * either answers the card and the turn resumes: the answer says how to start it (`start`).
+ */
+export type ReviewRequest = Request<"lre.review"> & { chatId: ChatId } & ({ op: "get" } | { op: "apply"; turn: string; keys?: string[] } | { op: "reject"; turn: string });
+
+/**
+ * One change of a review card: its key (an operation's, or the read's confirm chip's), whether a role
+ * staged it (`agent`) or the reply's read proposed it (`read`), the role, its change type, its lines,
+ * and how it stands: waiting (`open`), let through at a gate (`approved`), `applied` (with its Undo chip
+ * for `lre.chip`, `undo`; `undone` once that was pressed), `rejected`, or `refused` when it no longer applied.
+ */
+export interface ReviewItemView {
+  key: string;
+  source: "agent" | "read";
+  role: string;
+  changeType: string;
+  lines: string[];
+  status: "open" | "approved" | "applied" | "rejected" | "refused";
+  refused?: { code: string; reason: string };
+  undo?: string;
+  undone?: true;
+  /** On a harness chat, who staged it: the agent's harness name, and after the reply that it came then. Absent on the other engines, where `source` and `role` say it. */
+  by?: string;
+}
+
+/** One turn's review card: the turn (`<message>:<swipe>`, or `<message>:gate`), the message it shows on, where its changes wait, its items, and at a gate how its turn resumes. */
+export interface ReviewCardView {
+  turn: string;
+  messageId: MessageId;
+  swipeId?: number;
+  placement: "chips" | "gate";
+  items: ReviewItemView[];
+  resume?: GenerateAs;
+}
+
+export type FrontendToBackend =
+  | HelloRequest
+  | ResyncRequest
+  | RestartRequest
+  | PageRequest
+  | ActionRequest
+  | ChipRequest
+  | ViewOpenRequest
+  | StateGetRequest
+  | FixRequest
+  | EditRequest
+  | GmRequest
+  | GmPartRequest
+  | ChatExportRequest
+  | SectionsRequest
+  | MarkerRequest
+  | KeepRequest
+  | SettingsGetRequest
+  | SettingsSetRequest
+  | SettingsCaveatsRequest
+  | EditorRequest
+  | WorldRequest
+  | UiRequest
+  | MapRequest
+  | OrgPageRequest
+  | JournalRequest
+  | JobRequest
+  | LoreRequest
+  | SecrecyRequest
+  | PresetRequest
+  | DiagRequest
+  | MindsRequest
+  | RoutineRequest
+  | CharacterRequest
+  | ThingsRequest
+  | AgentsRequest
+  | CancelTurnRequest
+  | ChatKnowledgeRequest
+  | AssistantRequest
+  | WorkspaceRequest
+  | ReviewRequest
+  | PromptsRequest;
+
+// ---------------------------------------------------------------- responses (backend → frontend)
+
+/** Each extraction or agent change type's effective mode and where it comes from (DESIGN §11, D4 learning; AGENT-LOOP-PLAN §6). */
+export interface ExtractionModeView {
+  mode: BoundMode;
+  source: "pinned" | "learned" | "default" | "bound";
+  /** The connection whose learning applies (the extract step's), when known. */
+  connection: { id: string; name: string } | null;
+  accepted: number;
+  rejected: number;
+}
+
+/** Settings plus a derived view: effective modes, the reply's extraction types then the agents' change types. The previous build's registry shaped the settings; RPE carries them as JSON. */
+export interface SettingsResult {
+  settings: JsonObject;
+  extraction: Record<string, ExtractionModeView>;
+}
+
+/** Results per request type. */
+export interface ResultBodies {
+  /**
+   * `agentApi`: the outside-client level this build speaks (`AGENT_API`). `requestMs`: how long the
+   * frontend waits for each answer, the user's request timeout.
+   * `canStop`: this Lumiverse stops a generation for the engine run (DESIGN §5.1); without it, engine
+   * state may be missing from replies. An outside client (DESIGN §23) also learns this `build` and
+   * where its agent `kit` is (null when it has none), and an MCP server that checked in, its `client` id.
+   */
+  "lre.hello": { accepted: true; agentApi: number; requestMs: Limit; canStop: boolean; build?: string; kit?: KitReport | null; client?: string };
+  "lre.state.resync": { accepted: true };
+  "lre.restart": { start: boolean };
+  "lre.page": { accepted: true };
+  /** The player's message the action plays as; for an action done at once, off screen (DESIGN §11), its bookkeeping recorded on the head with no message and no reply (`pending` while a reply is in flight, `queued` what the held write waits on; `undo` its chip, null while pending; `said` what was done, in RPE's words); or, staged for the next message, whether it is staged now (false: the same tap cleared it). */
+  "lre.action": { messageId: MessageId } | { applied: true; pending: boolean; queued?: QueuedOn; undo?: string | null; said?: string } | { staged: boolean };
+  /** With `pending`, `queued` says what the held write waits on (engine, page or reply), as on every write's answer. */
+  "lre.chip": { applied: boolean; pending: boolean; queued?: QueuedOn; said?: string };
+  "lre.view.open": { materialized: boolean; pending: boolean; queued?: QueuedOn };
+  "lre.fix": { pending: boolean; queued?: QueuedOn; undo?: string | null };
+  /** `undo`: the chip that undoes the edit just written (the chat's GM edit chip for it), null while it waits for a reply in flight or when it changed nothing. */
+  "lre.edit": { pending: boolean; queued?: QueuedOn; undo: string | null };
+  "lre.gm": GmView;
+  "lre.gm.part": GmPartReply;
+  "lre.chat.export": ChatExport;
+  /** Every section in prompt order, and the section budget: the shared one, what the sent sections spend of it, and the Minds section's own. */
+  "lre.sections": { sections: SectionPreview[]; budget: { sections: number; used: number; minds: number } };
+  /** The chat's state view now, and its activity line (null when idle). */
+  "lre.state.get": { view: StateView; activity: Activity | null };
+  "lre.marker": { pending: boolean; queued?: QueuedOn; preview?: MarkerPreview };
+  "lre.keep": { pending: boolean; queued?: QueuedOn };
+  "lre.settings.get": SettingsResult;
+  "lre.settings.set": SettingsResult;
+  "lre.settings.caveats": { caveats: { code: string; message: string }[] };
+  /** `base`: the revision the draft started from (send it with the next edit); `stored`: whether a draft exists apart from the head; `version`: the working copy's version (see `EditorRequest`). */
+  "lre.editor": EditorAnswer;
+  /**
+   * `get` also carries `packKinds` and `packRelations`: every kind (label, extends, fields) and
+   * relation type the registered packs define, for Build's kind and relation pickers and typed
+   * field forms (a world kind or relation type with the same id wins); `packLabels`: each pack's own
+   * label, by its id, which Build shows wherever it names a pack; and `functions`: every
+   * function a formula may call outside an effect's arguments (the math built-ins, the engine's and
+   * the packs' formulas), for the expression editor. `sheet` answers the `sheet` preview: the
+   * sections, or null when the ruleset designs no sheet. `templates`, `chats` and `updates` answer their ops.
+   * `get` carries the world's `history` (oldest first; `list` leaves it out). `upgrade` says
+   * `pending` when the chat is mid-turn: its Upgrade lands when the turn ends.
+   */
+  "lre.world": { worlds?: WorldIndex[]; world?: WorldDoc; revision?: RevisionId; lint?: LintIssue[]; file?: JsonValue; packKinds?: Record<string, KindDef>; packRelations?: Record<string, RelationTypeDef>; packLabels?: Record<string, string>; functions?: string[]; sheet?: SheetSectionView[] | null; templates?: TemplateInfo[]; chats?: WorldChatInfo[]; history?: RevisionNote[]; pending?: boolean; updates?: TableUpdate[]; undo?: string; undone?: boolean; words?: string; limits?: { editOps: number; patchOps: number; noteChars: number }; revisions?: WorldRevisionInfo[]; next?: string | null; changes?: WorldChangesInfo };
+  "lre.ui": { done: true };
+  "lre.map": { display?: MapDisplay; walk?: { minutes: number; disabled?: string }; ways?: QuickestWay[]; travel?: TravelWay[] };
+  /** The page; null where the player character knows of no such organization. */
+  "lre.org": { page: OrgView | null };
+  /** The notes, oldest first. */
+  "lre.journal": { notes: JournalNote[] };
+  /** The chat's own knowledge choices after the request, null where it follows; `tidy`, its own Tidy up switch (absent: the world's). `engine` and `harnessBlocked` are retired: nothing sets them, for RPE plays every chat itself. */
+  "lre.chat.knowledge": { knowledge: boolean | null; narrator: NarratorView | null; engine?: "agents" | "harness"; tidy?: boolean; harnessBlocked?: string };
+  /** `start`, `cancel` and `dismiss` name the job; `list` returns the world's kept jobs. */
+  "lre.job": { jobId?: string; jobs?: JobSummary[] };
+  /**
+   * `save`: the world and the new entry's id; `books`, `entries` and `pins` answer theirs; `fields`
+   * and `mark`: the book's entries, as read after the write; `index` and `build`: the index.
+   */
+  "lre.lore": { worldId?: WorldId; id?: string; books?: LoreBookView[]; entries?: LoreBookEntryView[]; pins?: LorePinsView; problem?: string | null; index?: LoreIndexView };
+  /** `books` answers the user's books; every other op, the book as it stands now. */
+  "lre.secrecy": { books?: SecrecyBookView[]; book?: SecrecyBookPlan };
+  "lre.preset": { card: PresetCard };
+  /** `get`: the chat's records, oldest first, and its activity line now; `text`: the agent call's text, null when it is gone. */
+  "lre.diag": { records: JsonObject[]; activity: Activity | null; text?: string | null };
+  /** The run started, cancelled or asked about; null when the chat has had none since the extension started. */
+  "lre.minds": { run: MindsRunView | null };
+  /** Whether a run or read was under way to stop. */
+  "lre.cancel": { cancelled: boolean };
+  "lre.routine": RoutineReadResult;
+  "lre.character": CharacterResult;
+  /**
+   * `list`: the list (GM: and `here`, what the list adds); `thing`: the page and the choices (GM: and `gm`, what the page adds); `person`: the groups and the
+   * choices; `find`: the ids found, best first; `types`: the catalog's types; `tidy`: the run; `leave`: the run after it; `made`: what the chat made in play;
+   * `keep`: what was kept, then what is made in play after it.
+   */
+  "lre.things": { list?: ThingsList; here?: GmThingsList; thing?: ThingPage; gm?: GmThingExtras; person?: PersonThings; pick?: ThingPicks; found?: EntityId[]; types?: ThingType[]; tidy?: TidyRun; made?: MadeInPlay; kept?: KeepResult; classes?: VehicleClassChoice[]; cap?: number; use?: AccessChip[] };
+  /** `kit`: this build, where its kit is, and whether the asking session checked in since the extension started; every other op answers the `view`. */
+  "lre.agents": { view?: AgentsView; build?: string; kit?: KitReport | null; known?: boolean };
+  /** Every op: the chat's thread, the answer under way and the proposals, after the op. */
+  "lre.assistant": AssistantView;
+  /**
+   * `list` and each change: the files at the head after it (a held change isn't among them until it
+   * lands), and for a change whether it is held (`pending`) and the chip that undoes it (`undo`, null
+   * while it is held); `read`: the file's text, null when there is no such file; `session` and
+   * `rollback`: the main agent's session at the head, after the op.
+   */
+  "lre.workspace": { files?: WorkspaceFileView[]; text?: string | null; pending?: boolean; undo?: string | null; session?: SessionView };
+  /** Every op: the chat's review cards after it; `apply` and `reject` at a gate, how to start the turn it resumes (`start`; null when nothing waits on a reply). */
+  "lre.review": { cards: ReviewCardView[]; start?: GenerateAs | null };
+  "lre.prompts": { test: PromptTestView };
+}
+
+export type ResultMessage = {
+  [K in keyof ResultBodies]: Envelope<"lre.result"> & { reqId: string; request: K; body: ResultBodies[K] };
+}[keyof ResultBodies];
+
+export type ErrorCode =
+  | "bad_request"
+  | "not_found"
+  | "not_world_chat"
+  /** The `base` revision is stale; reload and retry. */
+  | "conflict"
+  /** The chat is paused on a user-message edit; resolve Keep or Discard first (DESIGN §4.3). */
+  | "paused"
+  | "validation"
+  | "forbidden"
+  | "unavailable"
+  | "internal";
+
+export interface ErrorMessage extends Envelope<"lre.error"> {
+  /** Absent for errors not tied to a request. */
+  reqId: string | null;
+  code: ErrorCode;
+  message: string;
+  lint?: LintIssue[];
+}
+
+/**
+ * A world's working copy changed: its draft written, discarded or committed (DESIGN §23). Sent to
+ * every session of the user after the reply to the request that changed it, so a Build open on that
+ * world reloads what another window or an outside agent did.
+ */
+export interface DraftChanged extends Envelope<"lre.draft.changed"> {
+  worldId: WorldId;
+  /** The working copy's version now (see `EditorRequest`). */
+  version: number;
+  stored: boolean;
+  /** The revision the draft started from, or the head when none is stored. */
+  base: RevisionId | null;
+}
+
+/** What the engine is doing for a chat now (the HUD's and the drawer's in-flight line), or null when idle. Player-safe: a step's label, never a name. */
+export interface ActivityPush extends Envelope<"lre.activity"> {
+  chatId: ChatId;
+  activity: Activity | null;
+}
+
+/** A GM's minds run moved on or ended (`lre.minds`), sent to the session that started it: GM data, shown only behind the GM gate. */
+export interface MindsRunUpdate extends Envelope<"lre.minds.update"> {
+  chatId: ChatId;
+  run: MindsRunView;
+}
+
+/**
+ * The engine prepared the chat's next generation: the frontend open on that chat starts it (DESIGN
+ * §5.1). Only the page holding the turn's claim is asked, and it starts each `turn` once.
+ */
+export interface GeneratePush extends Envelope<"lre.generate"> {
+  chatId: ChatId;
+  as: GenerateAs;
+  turn: string;
+  /** A swipe no chip's choice asked anything of, while the swipe ask is on: the page asks first (restart.ts), and its claim carries the answer. */
+  ask?: true;
+}
+
+/**
+ * The MCP servers this account has seen changed (DESIGN §23): one checked in, connected or went,
+ * or the notice was dismissed; sent to every session of the user. A page's hello gets it too while
+ * an update notice is waiting for that user.
+ */
+export interface AgentsChanged extends Envelope<"lre.agents.changed"> {
+  view: AgentsView;
+}
+
+/**
+ * The GM assistant's thread in a chat changed (`lre.assistant`): a message, a proposal, or the answer
+ * under way. Sent to the sessions that asked about that chat's assistant: GM data, shown only behind
+ * the GM gate.
+ */
+export interface AssistantUpdate extends Envelope<"lre.assistant.update"> {
+  chatId: ChatId;
+  view: AssistantView;
+}
+
+/** A chat's review cards changed (`lre.review`): a card made, answered or lapsed. Sent to the sessions that asked about that chat's cards. */
+export interface ReviewUpdate extends Envelope<"lre.review.update"> {
+  chatId: ChatId;
+  cards: ReviewCardView[];
+}
+
+/** Update now (DESIGN §23): asks the MCP servers that checked in as `client` to check the extension's kit now; sent to every session of the user, and the others ignore it. */
+export interface KitReload extends Envelope<"lre.kit.reload"> {
+  client: string;
+}
+
+/**
+ * Reconnect in Lumiverse (DESIGN §23): asks the processes of the Lumiverse-run server `client`
+ * whose client holds another build's tools to answer the calls in flight and exit, so Lumiverse's
+ * client connects again and lists the tools anew. Sent to those processes' sessions alone.
+ */
+export interface KitReconnect extends Envelope<"lre.kit.reconnect"> {
+  client: string;
+}
+
+export type BackendToFrontend = StateSnapshot | StateDelta | ResultMessage | ErrorMessage | JobUpdate | DraftChanged | ActivityPush | MindsRunUpdate | GeneratePush | AgentsChanged | AssistantUpdate | ReviewUpdate | KitReload | KitReconnect;

@@ -1,0 +1,677 @@
+// What a player or a character does with their money (DESIGN §25.3, §25.5, §25.8–§25.10): cash at
+// a machine or a branch, cards (freeze, report lost, replace), autopay, standing flows, applying
+// for credit, payment preferences; and the GM's controls that aren't fields. Each is an effect the
+// engine validates; the actions that offer them read only what the player could do in the world.
+
+import type { JsonObject, JsonValue } from "../../../shared/json";
+import type { EntityId } from "../../../shared/ids";
+import type { LedgerEvent, PostingLine } from "../../../shared/ledger";
+import { ACCOUNT_STATUSES, AUTOPAY_MODES, CARD_STATES, CLASS_TRAITS, FINANCE_EVENTS, FLOW_KINDS, FLOW_SHORTFALLS, isAccountClass, isCredit, payeeKey, type AtmFeature, type CreditApplication, type Owner } from "../../../shared/finance";
+import { hashParts } from "../../../shared/hash";
+import { formatMoney, type EntityDef } from "../../../shared/world";
+import { calendarOf, dateAt } from "../../../engine/calendar";
+import { EXTERNAL_ACCOUNT_PREFIX } from "../../../engine/events";
+import { GONE_FIELD } from "../../../engine/scope";
+import { labelOf, numOf, objOf, optionalService, own, strOf } from "../../../engine/pack-kit";
+import type { EffectContext, ReadContext, Rejection } from "../../../engine/registry";
+import { kindIs, placeOfEntity } from "../../../engine/scope";
+import { passMemo } from "../../../engine/read-pass";
+import { membersOf } from "../../../engine/selector";
+import { decide, type Decision } from "./credit";
+import type { OpenAccount } from "./module";
+import { fallsBackOn } from "./flows";
+import { isOpened, reject, spendOf } from "./journal";
+import { availableOf, balance, bankSide, canSpend, classOf, debtorsOf, external, holdersOf, householdOf, managesAccount, managesParty, openerOf, productOf, rightsOf, shownLabel, statusOf, traitsOf, worldProducts } from "./model";
+import { accountFeature, asUnit, cardProblem, cardRoom, cardsOn, cashAccount, cashAdvanceFee, depositAccount, featureFor, isParty, mayUse, payeeAccount, posting, notice } from "./pay";
+import { say } from "../../../shared/lines";
+
+function money(ctx: ReadContext, cents: number): string {
+  return formatMoney(cents, ctx.world.currency);
+}
+
+/** The nearest place feature of a kind where someone is: their place, then the places it is inside. */
+function featureAt<T>(ctx: ReadContext, who: EntityId, field: "atm" | "branch"): { place: string; feature: T } | null {
+  let cur: string | undefined = placeOfEntity(ctx.state, who) ?? undefined;
+  for (let guard = 0; cur && guard < 32; guard++) {
+    const p = own(ctx.world.places, cur);
+    const f = objOf(p?.fields[field]);
+    if (typeof f.bank === "string" && f.bank !== "") return { place: cur, feature: f as unknown as T };
+    cur = p?.parent;
+  }
+  return null;
+}
+
+/**
+ * Whether cash needs a machine or branch for this person: the top level's rule, and only in a world
+ * that places at least one. A world with none (an older one migrated, or one that leaves banking
+ * offstage) would otherwise leave cash out of reach at the top level altogether.
+ */
+function cashNeedsAMachine(ctx: ReadContext, who: EntityId): boolean {
+  if (!featureFor(ctx, who, "atm")) return false;
+  return Object.values(ctx.world.places).some((p) => ["atm", "branch"].some((f) => { const bank = objOf(p.fields[f]).bank; return typeof bank === "string" && bank !== ""; }));
+}
+
+/** A person's active debit card on an account. */
+function debitCard(ctx: ReadContext, who: EntityId, account: EntityId): EntityId | null {
+  return cardsOn(ctx.state, account).find((c) => strOf(own(ctx.state.entities, c)?.fields.holder) === who && cardProblem(ctx, c, who) === null) ?? null;
+}
+
+/**
+ * Cash from an account into the person's wallet (DESIGN §25.8). Where cash needs a machine (the
+ * top level), they must be at a branch of the account's bank (no card needed, no limit, no fee) or
+ * at a cash machine, which takes an active card on the account, its own limit and the card's daily
+ * limit, and another bank's machine its surcharge plus the account's out-of-network fee; a credit
+ * account's cash is a cash advance, with its fee. Below that, money moves freely.
+ */
+export function withdraw(ctx: ReadContext, who: EntityId, account: EntityId, raw: number): LedgerEvent[] | Rejection {
+  const cents = Math.round(raw);
+  if (!(cents > 0)) return reject("bad_amount", say("why_the_amount_must_be_positive"));
+  if (!canSpend(ctx.state, account, who) || !traitsOf(ctx, account)?.pays || traitsOf(ctx, account)?.cash) return reject("not_owner", say("why_who_cant_draw_cash_from_account", { who: labelOf(ctx, who), account: labelOf(ctx, account) }));
+  if (statusOf(ctx.state, account) !== "open") return reject("declined", say("why_account_is_g", { account: labelOf(ctx, account), g: statusOf(ctx.state, account).replace(/_/g, " ") }));
+  const wallet = cashAccount(ctx, who);
+  if (!wallet) return reject("no_wallet", say("why_payer_has_nowhere_to_carry_cash", { payer: labelOf(ctx, who) }));
+  const p = productOf(ctx, account);
+  if (!p) return reject("missing_account", say("why_no_such_account"));
+  const t = traitsOf(ctx, account);
+  const atTop = cashNeedsAMachine(ctx, who);
+  // The fees post apart from the cash: a bank's own charges may overdraw, so they're exempt from the funds check, but the cash itself never is.
+  const machine: PostingLine[] = [];
+  const advanceLines: PostingLine[] = [];
+  const extra: LedgerEvent[] = [];
+  let fees = 0;
+  let card: EntityId | null = null;
+  let where = "";
+  if (atTop) {
+    const branch = featureAt<{ bank: string }>(ctx, who, "branch");
+    const atm = featureAt<AtmFeature>(ctx, who, "atm");
+    if (branch && branch.feature.bank === p.institution) where = say("econ_at_place", { place: own(ctx.world.places, branch.place)?.name ?? say("econ_the_branch") });
+    else if (atm) {
+      card = debitCard(ctx, who, account);
+      if (!card) return reject("no_card", cardsOn(ctx.state, account).length > 0 ? say("why_none_of_who_s_cards_on_account", { who: labelOf(ctx, who), account: labelOf(ctx, account) }) : say("why_account_has_no_card_for_a_cash", { account: labelOf(ctx, account) }));
+      if (typeof atm.feature.limit === "number" && cents > atm.feature.limit) return reject("over_limit", say("why_the_machine_gives_at_most_limit_at", { limit: money(ctx, atm.feature.limit) }));
+      if (cardRoom(ctx, card, "atm") < cents) return reject("over_limit", say("why_card_has_atm_left_of_its_daily", { card: labelOf(ctx, card), atm: money(ctx, cardRoom(ctx, card, "atm")) }));
+      where = say("econ_at_place", { place: own(ctx.world.places, atm.place)?.name ?? say("econ_a_cash_machine") });
+      if (accountFeature(ctx, account, "fees") && atm.feature.bank !== p.institution) {
+        const surcharge = Math.max(0, Math.round(numOf(atm.feature.fee)));
+        if (surcharge > 0) machine.push({ account: external(`atm:${atm.feature.bank}`), amount: surcharge });
+        if (p.fees.atm > 0) machine.push({ account: bankSide(p.institution), amount: p.fees.atm });
+        fees += surcharge + p.fees.atm;
+      }
+      if (Number.isFinite(cardRoom(ctx, card, "atm"))) {
+        const day = dateAt(calendarOf(ctx.world), ctx.state.clock).dayIndex;
+        const s = spendOf(ctx.state, card, day);
+        extra.push({ type: FINANCE_EVENTS.spend, data: { card, day, purchase: s.purchase, atm: s.atm + cents } });
+      }
+    } else return reject("no_atm", say("why_theres_no_cash_machine_or_institution_bank", { institution: p.institution }));
+  }
+  const advance = cashAdvanceFee(ctx, account, cents);
+  if (advance > 0) {
+    advanceLines.push({ account: bankSide(p.institution), amount: advance });
+    fees += advance;
+  }
+  const total = cents + fees;
+  if (availableOf(ctx, account) < total) return reject("declined", say("why_account_cant_cover_currency", { account: labelOf(ctx, account), currency: money(ctx, total) }));
+  const charge = (lines: PostingLine[], memo: string, category: string): LedgerEvent[] => {
+    const cents = lines.reduce((a, l) => a + l.amount, 0);
+    return cents > 0 ? posting([{ account, amount: -cents }, ...lines], { memo, kind: "fee", category }) : [];
+  };
+  const memo = say("memo_cash_withdrawal", { where: where || undefined, fees: fees > 0 ? money(ctx, fees) : undefined });
+  // Fees first, so the cash is checked against what they leave: a rebased view that can't cover it drops the unit, fees and all.
+  // Cash from a credit account is a cash advance, which runs its own interest from the day it's drawn.
+  return asUnit([...charge(machine, say("econ_cash_machine_fees"), "atm"), ...charge(advanceLines, say("econ_cash_advance_fee"), "cash_advance"), ...posting([{ account, amount: -cents }, { account: wallet, amount: cents }], { memo, kind: "withdrawal", category: t?.revolving ? "cash_advance" : "transfer", ...(card ? { card } : {}) }), ...extra]);
+}
+
+/**
+ * Cash from the wallet into an account. Where cash needs a machine, at a branch of the account's
+ * bank it is available at once; at one of its bank's machines that takes deposits it is held for
+ * the account's hold days where holds run.
+ */
+export function deposit(ctx: ReadContext, who: EntityId, account: EntityId, raw: number): LedgerEvent[] | Rejection {
+  const cents = Math.round(raw);
+  if (!(cents > 0)) return reject("bad_amount", say("why_the_amount_must_be_positive"));
+  const unusable = mayUse(ctx, who, account, "into");
+  if (unusable) return unusable;
+  // Cash goes into a bank account; a wallet or a locked account doesn't take it at a machine or a branch.
+  if (traitsOf(ctx, account)?.cash || traitsOf(ctx, account)?.locked) return reject("not_owner", say("why_who_cant_pay_cash_into_account", { who: labelOf(ctx, who), account: labelOf(ctx, account) }));
+  const wallet = cashAccount(ctx, who);
+  if (!wallet || availableOf(ctx, wallet) < cents) return reject("declined", say("why_who_doesnt_have_cents_in_cash", { who: labelOf(ctx, who), cents: money(ctx, cents) }));
+  const p = productOf(ctx, account);
+  if (!p) return reject("missing_account", say("why_no_such_account"));
+  if (traitsOf(ctx, account)?.liability && cents > -balance(ctx.state, account)) return reject("overpay", say("why_to_owes_only_currency", { to: labelOf(ctx, account), currency: money(ctx, Math.max(0, -balance(ctx.state, account))) }));
+  let held = false;
+  let where = "";
+  if (cashNeedsAMachine(ctx, who)) {
+    const branch = featureAt<{ bank: string }>(ctx, who, "branch");
+    const atm = featureAt<AtmFeature>(ctx, who, "atm");
+    if (branch && branch.feature.bank === p.institution) where = say("econ_at_place", { place: own(ctx.world.places, branch.place)?.name ?? say("econ_the_branch") });
+    else if (atm && atm.feature.deposits === true && atm.feature.bank === p.institution) {
+      where = say("econ_at_place", { place: own(ctx.world.places, atm.place)?.name ?? say("econ_a_cash_machine") });
+      held = accountFeature(ctx, account, "holds") && p.hold_days > 0;
+    } else return reject("no_atm", say("why_theres_no_institution_bank_branch_or_deposit", { institution: p.institution }));
+  }
+  const lines: PostingLine[] = [
+    { account: wallet, amount: -cents },
+    { account, amount: cents },
+  ];
+  const events: LedgerEvent[] = posting(lines, { memo: say("memo_cash_deposit_where", { where: where || undefined }), kind: "deposit", category: "transfer" });
+  if (traitsOf(ctx, account)?.liability) events.push({ type: FINANCE_EVENTS.cardPaid, data: { account, cents } });
+  if (held) events.push({ type: FINANCE_EVENTS.hold, data: { id: `dep:${hashParts(account, ctx.state.clock, cents).slice(0, 10)}`, account, cents, until: ctx.state.clock + p.hold_days * 1440, kind: "deposit", memo: say("memo_cash_deposit") } });
+  return asUnit(events);
+}
+
+/** A card's new state, by its holder (frozen and unfrozen; reported lost, for good). */
+export function setCardState(ctx: ReadContext, who: EntityId, card: EntityId, state: string): LedgerEvent[] | Rejection {
+  const e = own(ctx.state.entities, card);
+  if (e?.kind !== "card") return reject("not_card", say("why_card_isnt_a_payment_card", { card: labelOf(ctx, card) }));
+  if (strOf(e.fields.holder) !== who && !managesAccount(ctx, strOf(e.fields.account), who)) return reject("not_owner", say("why_account_isnt_party_s", { account: e.name, party: labelOf(ctx, who) }));
+  if (!(CARD_STATES as readonly string[]).includes(state)) return reject("bad_state", say("why_a_card_cant_be_v", { v: state }));
+  const now = strOf(e.fields.state, "active");
+  if (now === state) return [];
+  if (now === "lost" || now === "cancelled") return reject("bad_state", say("why_name_is_now_replace_it", { name: e.name, now: now }));
+  return [{ type: "set", entity: card, field: "state", value: state }];
+}
+
+/** A replacement for a card: a new card on the same account and in the same hands, its gear card in the holder's keeping, the old one cancelled. */
+export function replaceCard(ctx: EffectContext, who: EntityId, card: EntityId): LedgerEvent[] | Rejection {
+  const e = own(ctx.state.entities, card);
+  if (e?.kind !== "card") return reject("not_card", say("why_card_isnt_a_payment_card", { card: labelOf(ctx, card) }));
+  const holder = strOf(e.fields.holder);
+  if (holder !== who && !managesAccount(ctx, strOf(e.fields.account), who)) return reject("not_owner", say("why_account_isnt_party_s", { account: e.name, party: labelOf(ctx, who) }));
+  if (strOf(e.fields.state) === "cancelled" && strOf(e.fields.replaced_by) !== "") return reject("bad_state", say("why_name_was_already_replaced", { name: e.name }));
+  let n = 2;
+  while (own(ctx.state.entities, `${card}_r${n}`)) n++;
+  const id = `${card}_r${n}`;
+  const last4 = String(1000 + (Number.parseInt(hashParts(card, n).slice(0, 6), 16) % 9000));
+  const fields: JsonObject = { ...e.fields, state: "active", replaces: card, last4 };
+  delete fields.replaced_by;
+  delete fields.item;
+  const out: LedgerEvent[] = [{ type: "spawn", entity: { id, kind: "card", name: e.name, tier: "background", fields, relations: [] } }, { type: "set", entity: card, field: "state", value: "cancelled" }, { type: "set", entity: card, field: "replaced_by", value: id }];
+  const spawn = optionalService(ctx, "gear.spawn");
+  const oldItem = strOf(e.fields.item);
+  if (spawn && ctx.levelOf(holder, "gear") >= 1) {
+    const place = oldItem !== "" ? own(ctx.state.entities, oldItem)?.relations.find((r) => r.type === "in")?.to : undefined;
+    const made = spawn(ctx, { name: own(ctx.state.entities, oldItem)?.name ?? e.name, owner: holder, holder: place && own(ctx.state.entities, place) && !own(ctx.state.entities, oldItem)?.fields.lost ? place : holder, salt: `card:${id}` });
+    if (Array.isArray(made)) {
+      out.push(...made);
+      const item = made.find((x) => x.type === "spawn");
+      if (item?.type === "spawn") out.push({ type: "set", entity: id, field: "item", value: item.entity.id });
+    }
+  }
+  const account = strOf(e.fields.account);
+  const p = productOf(ctx, account);
+  if (p && p.fees.card_replacement > 0 && accountFeature(ctx, account, "fees")) out.push(...posting([{ account, amount: -p.fees.card_replacement }, { account: bankSide(p.institution), amount: p.fees.card_replacement }], { memo: say("memo_name_replacement", { name: e.name }), kind: "fee", category: "card_replacement" }));
+  return asUnit(out);
+}
+
+/** A name in why something was refused, as the player may read it (`shownLabel`): the refusal reaches the narrator and the decline chip. */
+function said(ctx: ReadContext, id: string): string {
+  return shownLabel(ctx, ctx.world.pov, id);
+}
+
+/**
+ * What's wrong with a credit account's autopay drawing on `from` when `who` sets it (DESIGN
+ * §25.1), or null: an account that pays and isn't credit, which `who` may spend from or manages,
+ * and which is the account's debtor's own money: theirs to spend, or theirs by its worth, as a
+ * child's savings is the child's though their custodian spends it. So a business's loan pays from
+ * the business's money, a manager's own card or loan from their own, and a custodial card from the
+ * custodial money.
+ */
+export function autopaySourceProblem(ctx: ReadContext, who: EntityId, account: EntityId, from: EntityId): Rejection | null {
+  const t = traitsOf(ctx, from);
+  if ((!canSpend(ctx.state, from, who) && !managesAccount(ctx, from, who)) || !t?.pays || t.liability) return reject("bad_account", say("why_who_cant_pay_from_from", { who: said(ctx, who), from: said(ctx, from) }));
+  const debtors = debtorsOf(ctx.state, account);
+  if (!debtors.some((d) => canSpend(ctx.state, from, d) || rightsOf(ctx.state, from, d)?.worth === true)) return reject("bad_account", say("why_account_is_paid_from_who_s_own", { account: said(ctx, account), who: said(ctx, debtors[0] ?? who), from: said(ctx, from) }));
+  return null;
+}
+
+/** A credit account's autopay, by whoever manages it: how much, and from where (`autopaySourceProblem`). */
+export function setAutopay(ctx: ReadContext, who: EntityId, account: EntityId, mode: string, from: string, cents: number): LedgerEvent[] | Rejection {
+  const cls = classOf(ctx, account);
+  if (!cls || !isCredit(cls)) return reject("not_credit", say("why_account_isnt_a_card_or_a_loan", { account: labelOf(ctx, account) }));
+  if (!managesAccount(ctx, account, who)) return reject("not_owner", say("why_account_isnt_who_s_to_change", { account: labelOf(ctx, account), who: labelOf(ctx, who) }));
+  if (!(AUTOPAY_MODES as readonly string[]).includes(mode)) return reject("bad_mode", say("why_autopay_cant_be_mode", { mode: mode }));
+  const source = from === "" ? null : autopaySourceProblem(ctx, who, account, from);
+  if (source) return source;
+  if (mode === "fixed" && !(cents > 0)) return reject("bad_amount", say("why_fixed_autopay_needs_an_amount"));
+  const out: LedgerEvent[] = [{ type: "set", entity: account, field: "autopay", value: mode }];
+  if (from !== "") out.push({ type: "set", entity: account, field: "autopay_from", value: from });
+  if (mode === "fixed") out.push({ type: "set", entity: account, field: "autopay_cents", value: Math.round(cents) });
+  return out;
+}
+
+const FLOW_PARAM_FIELDS: Record<string, string> = { label: "", kind: "flow_kind", from: "from", to: "to", amount: "amount_cents", every: "every", interval: "interval", at: "at", start: "start", end: "end", count: "count", shortfall: "shortfall", retry_days: "retry_days", retries: "retries", fallback: "fallback", roll: "roll", category: "category" };
+
+/** A flow's fields from an action's parameters; a parameter left out leaves the field as it is. */
+function flowFields(args: Record<string, JsonValue>): { fields: JsonObject; label?: string } | Rejection {
+  const fields: JsonObject = {};
+  let label: string | undefined;
+  for (const [param, field] of Object.entries(FLOW_PARAM_FIELDS)) {
+    const v = args[param];
+    if (v === undefined || v === null || v === "") continue;
+    if (param === "label") label = String(v).slice(0, 80);
+    else fields[field] = v;
+  }
+  if (typeof fields.flow_kind === "string" && !(FLOW_KINDS as readonly string[]).includes(fields.flow_kind)) return reject("bad_flow", say("why_a_flow_cant_be_a_flow_kind", { flow_kind: fields.flow_kind }));
+  if (typeof fields.shortfall === "string" && !(FLOW_SHORTFALLS as readonly string[]).includes(fields.shortfall)) return reject("bad_flow", say("why_theres_no_shortfall_policy_shortfall", { shortfall: fields.shortfall }));
+  if (typeof fields.amount_cents === "number") fields.amount_cents = Math.round(fields.amount_cents);
+  const every = args.every;
+  if (every === "once") {
+    delete fields.every;
+    fields.once = strOf(args.once);
+    if (fields.once === "") return reject("bad_flow", say("why_a_one_off_flow_needs_its_date"));
+  } else if (every !== undefined && every !== null && every !== "") {
+    if (!["day", "week", "month", "year"].includes(String(every))) return reject("bad_flow", say("why_a_flow_cant_fall_every_every", { every: String(every) }));
+    fields.once = "";
+    if (typeof args.weekday === "number") fields.weekdays = [args.weekday];
+    else if (every !== "week") fields.weekdays = [];
+    if (typeof args.day === "number") fields.days = [args.day];
+    else if (every === "week" || every === "day") fields.days = [];
+    if (typeof args.month === "number") fields.months = [args.month];
+    else if (every !== "year") fields.months = [];
+  } else {
+    if (typeof args.weekday === "number") fields.weekdays = [args.weekday];
+    if (typeof args.day === "number") fields.days = [args.day];
+    if (typeof args.month === "number") fields.months = [args.month];
+  }
+  return { fields, ...(label !== undefined ? { label } : {}) };
+}
+
+/**
+ * Whether a party may run standing payments from `from` (DESIGN §25.1): themselves, a business or
+ * a trust they manage, or an account they manage, by their role on it or on its owner. A role that
+ * may only spend, an authorized user's, makes payments but sets up and changes no standing ones.
+ */
+export function mayPayFrom(ctx: ReadContext, who: EntityId, from: string): boolean {
+  return from === who || (isParty(ctx, from) && managesParty(ctx.state, from, who)) || managesAccount(ctx, from, who);
+}
+
+/**
+ * The holders of an entity whose role counts its worth: an account's, a business's owners, a trust's beneficiaries. Kept for a read
+ * pass: a money view asks it of every account and party again and again, through whom money is for and whose interests reach where.
+ */
+function worthHolders(ctx: ReadContext, id: string): EntityId[] {
+  return passMemo([ctx.state, ctx.state.entities], `economy.worth_holders\u0000${id}`, () => holdersOf(ctx.state, id).filter((h) => rightsOf(ctx.state, id, h)?.worth === true));
+}
+
+/** How many holders deep money is followed, both to whom it is for (`whoseMoney`) and to what a party's own interests reach (`interestsOf`). */
+const WORTH_DEPTH = 4;
+
+/**
+ * Whom `who`'s own interests are (DESIGN §25.1): them, their household and its members, each party
+ * any of those counts the worth of (a business they own, and so may draw from; a trust they benefit
+ * from), and in turn each party those count the worth of (a business their business owns), as deep
+ * as `whoseMoney` follows money. Money a manager only manages reaches none of them. Kept for a read
+ * pass, since it walks every party of the chat.
+ */
+export function interestsOf(ctx: ReadContext, who: EntityId): ReadonlySet<EntityId> {
+  return passMemo([ctx.state, ctx.state.entities, ctx.world], `economy.interests\u0000${who}`, () => {
+    const household = householdOf(ctx, who);
+    const kin = household === null ? [who] : [who, household, ...membersOf(ctx.registry, ctx.world, ctx.state, household)];
+    const out = new Set<EntityId>(kin);
+    const parties = Object.keys(ctx.state.entities).filter((id) => !out.has(id) && isParty(ctx, id));
+    let reached: ReadonlySet<EntityId> = out;
+    for (let depth = 0; depth < WORTH_DEPTH && reached.size > 0; depth++) {
+      const next = new Set(parties.filter((id) => !out.has(id) && worthHolders(ctx, id).some((h) => reached.has(h))));
+      for (const id of next) out.add(id);
+      reached = next;
+    }
+    return out;
+  });
+}
+
+/**
+ * Whom the money `side` is for (`all`): a party paying for itself, or the holders an account counts
+ * the worth of, and in turn whom those are for (a business's owners, a trust's beneficiaries),
+ * `WORTH_DEPTH` holders deep; and whom it ends with (`last`), who hold it for no one further. Kept
+ * for a read pass: a money view asks it of every account it may pay from, for every payee.
+ */
+function whoseMoney(ctx: ReadContext, side: string): { all: ReadonlySet<EntityId>; last: ReadonlySet<EntityId> } {
+  return passMemo([ctx.state, ctx.state.entities, ctx.world], `economy.whose_money\u0000${side}`, () => {
+    const all = new Set<EntityId>();
+    const last = new Set<EntityId>();
+    let next = isParty(ctx, side) ? [side] : worthHolders(ctx, side);
+    for (let depth = 0; depth < WORTH_DEPTH && next.length > 0; depth++) {
+      const deeper: EntityId[] = [];
+      for (const p of next.filter((q) => !all.has(q))) {
+        all.add(p);
+        const holders = worthHolders(ctx, p);
+        if (holders.length === 0 || depth === WORTH_DEPTH - 1) last.add(p);
+        else deeper.push(...holders);
+      }
+      next = deeper;
+    }
+    return { all, last };
+  });
+}
+
+/** Whether a party is someone's own self or family, a person or a household, rather than something they own. */
+function personal(ctx: ReadContext, id: string): boolean {
+  const kind = own(ctx.state.entities, id)?.kind ?? "";
+  return kind !== "" && (kindIs(ctx.registry, ctx.world, kind, "person") || kindIs(ctx.registry, ctx.world, kind, "household"));
+}
+
+/** What money from `from` is to `who`, for the fiduciary rule: whom it is for besides them (`forHolder`), whom it ends with besides them (`people`), and whether it's wholly theirs. Kept for a read pass, as `whoseMoney` is. */
+function moneyOf(ctx: ReadContext, who: EntityId, from: string): { forHolder: ReadonlySet<EntityId>; people: ReadonlySet<EntityId>; wholly: boolean } {
+  return passMemo([ctx.state, ctx.state.entities, ctx.world], `economy.money_of\u0000${who}\u0000${from}`, () => {
+    const { all, last } = whoseMoney(ctx, from);
+    return {
+      forHolder: new Set([...all].filter((p) => p !== who)),
+      people: new Set([...last].filter((p) => p !== who)),
+      wholly: last.size > 0 && [...last].every((p) => p === who),
+    };
+  });
+}
+
+/**
+ * Whether `who` may spend `account` by a role of their own (an authorized user's card, a
+ * custodian's or a trustee's), so could move money on from it, where it isn't wholly the money's
+ * own people's: every holder of its worth someone the money ends with (`people`, a trust's
+ * beneficiary, a business's owner). A business the money passes through isn't one of them, any more
+ * than the business paying is: the till of a company that owns the café is as much in its
+ * custodian's reach, card in hand, as the café's own. Money paid to its own people is theirs
+ * whoever holds the card or the custodianship, so a parent who is trustee of a child's trust and
+ * custodian of the child's account pays the child; the custodian's power over that account is the
+ * custodian's role's, and no part of this rule.
+ */
+function inReach(ctx: ReadContext, who: EntityId, account: EntityId, people: ReadonlySet<EntityId>): boolean {
+  if (!canSpend(ctx.state, account, who)) return false;
+  const holders = worthHolders(ctx, account);
+  return !(holders.length > 0 && holders.every((h) => people.has(h)));
+}
+
+/**
+ * Whether money from `from` paid into `account` would land where `who` could move it on (DESIGN
+ * §25.1): an account in their reach (`inReach`), while the money isn't wholly theirs. A module asks
+ * it of where a payment it makes lands, a worker's pay into their deposit account.
+ */
+export function landsInReach(ctx: ReadContext, who: EntityId, account: EntityId, from: string): boolean {
+  const money = moneyOf(ctx, who, from);
+  return !money.wholly && inReach(ctx, who, account, money.people);
+}
+
+/**
+ * Whether money from `from`, which `who` only manages, paid to `to` would be for `who` (DESIGN
+ * §25.1): to one of their interests (`interestsOf`) or an account whose worth one of those counts,
+ * or to an outside payee typed as their own (its `payeeKey` is their id's or their name's, or their
+ * household's: "Jordan Ellis", " POV "), which the hub refuses by the same keys. A payment among
+ * whom the money itself is for (`whoseMoney`), the manager aside, is the money's own: the café's
+ * savings topping up its operating account, a trust paying its beneficiary though she's the
+ * trustee's daughter. An account in their reach (`inReach`) is theirs too, whoever's worth it is,
+ * unless the money is wholly theirs: a share of it is no way round the rest of its people, so a
+ * trustee who holds a tenth of the trust as a beneficiary pays the rest of it into no account he
+ * may spend. A payee named as someone in the world is judged where the payment lands
+ * (`payeeAccount`, the account named as `deposit` where it's theirs, else their deposit account),
+ * as much as by who they are. Money wholly theirs (a business they own outright) keeps no one else's
+ * interest, so it pays anything else they own; what goes to them, their household or its members
+ * still goes by a draw or a salary, so the books and taxes see it.
+ */
+export function paysFor(ctx: ReadContext, who: EntityId, to: string, from: string, opts: { deposit?: EntityId; interests?: ReadonlySet<EntityId> } = {}): boolean {
+  const interests = opts.interests ?? interestsOf(ctx, who);
+  const money = moneyOf(ctx, who, from);
+  const mine = (party: string): boolean => interests.has(party) && !money.forHolder.has(party) && (!money.wholly || personal(ctx, party));
+  const theirs = (account: EntityId): boolean => (!money.wholly && inReach(ctx, who, account, money.people)) || worthHolders(ctx, account).some(mine);
+  const id = to.startsWith(EXTERNAL_ACCOUNT_PREFIX) ? to.slice(EXTERNAL_ACCOUNT_PREFIX.length) : to;
+  const e = own(ctx.state.entities, id);
+  if (e?.kind === "account") return theirs(id);
+  if (e) {
+    const lands = payeeAccount(ctx, id, opts.deposit);
+    return mine(id) || (lands !== null && theirs(lands));
+  }
+  const key = payeeKey(id);
+  const household = householdOf(ctx, who);
+  return key !== "" && [who, household].some((p) => p !== null && (key === payeeKey(p) || key === payeeKey(own(ctx.state.entities, p)?.name ?? "")));
+}
+
+/**
+ * What's wrong with `who` running a standing payment from `from` to `to`, falling back on
+ * `fallback`, or null (DESIGN §25.1, §25.5). Each is money they may pay from. A fallback is the
+ * payer's own, as the money step draws on it (`fallsBackOn`): an outside name would pay with money
+ * nobody has, and someone else's account isn't the payer's to draw on. Money they reach only by
+ * managing it pays for whom it is, never for them (`paysFor`). That is a business's or a trust's
+ * account they hold no spending role on, and the business or trust itself paying as a party,
+ * whatever their role on it: a party's money is never a manager's own, though every managing role
+ * on it carries the spending right.
+ */
+function flowProblem(ctx: ReadContext, who: EntityId, from: string, to: string, fallback: string): Rejection | null {
+  if (!mayPayFrom(ctx, who, from)) return reject("not_owner", say("why_who_cant_pay_from_from", { who: said(ctx, who), from: said(ctx, from) }));
+  if (fallback !== "" && (!mayPayFrom(ctx, who, fallback) || !fallsBackOn(ctx, from, fallback))) {
+    return reject("not_owner", own(ctx.state.entities, fallback) ? say("why_who_cant_fall_back_on_fallback", { who: said(ctx, who), fallback: said(ctx, fallback) }) : say("why_a_fallback_is_an_account_of_who", { who: said(ctx, who), fallback: fallback }));
+  }
+  const managed = [from, fallback].filter((side) => side !== "" && side !== who && (isParty(ctx, side) || !canSpend(ctx.state, side, who)));
+  const paying = managed.find((side) => paysFor(ctx, who, to, side));
+  if (paying === undefined) return null;
+  if (isParty(ctx, paying)) return reject("not_owner", say("why_party_pays_for_itself_not_for_pov", { party: said(ctx, paying), pov: said(ctx, who) }));
+  const holder = holdersOf(ctx.state, paying).find((h) => managesParty(ctx.state, h, who)) ?? paying;
+  return reject("not_owner", say("why_paying_pays_for_holder_not_for_who", { paying: said(ctx, paying), holder: said(ctx, holder), who: said(ctx, who) }));
+}
+
+export function createFlow(ctx: ReadContext, who: EntityId, args: Record<string, JsonValue>): LedgerEvent[] | Rejection {
+  const made = flowFields(args);
+  if ("code" in made) return made;
+  const f = made.fields;
+  const from = strOf(f.from);
+  const to = strOf(f.to);
+  if (from === "" || to === "" || typeof f.amount_cents !== "number" || !(f.amount_cents > 0)) return reject("bad_flow", say("why_a_flow_needs_who_pays_who_is"));
+  const problem = flowProblem(ctx, who, from, to, strOf(f.fallback));
+  if (problem) return problem;
+  if (f.once === undefined && f.every === undefined) return reject("bad_flow", say("why_a_flow_needs_a_schedule"));
+  const label = made.label ?? say("econ_payment_to_to", { to: labelOf(ctx, to) });
+  const toMine = own(ctx.state.entities, to)?.kind === "account" && rightsOf(ctx.state, to, who) !== null;
+  const fields: JsonObject = { flow_kind: toMine ? "transfer" : "bill", shortfall: "skip", status: "active", ...f };
+  const id = `flow_${who}_${hashParts(who, label, ctx.state.clock).slice(0, 8)}`;
+  const entity: EntityDef = { id, kind: "flow", name: label, tier: "background", fields, relations: [] };
+  return [{ type: "spawn", entity }];
+}
+
+/** What a change may clear on a standing payment, by the parameter that names it (`flow_update`'s and `economy.flow_edit`'s `clear`). */
+const CLEARABLE = ["at", "start", "end", "count", "roll", "retry_days", "retries", "fallback", "category"] as const;
+
+/**
+ * A standing payment's new name, when it has one, and the fields a comma list of parameters
+ * clears (`end,count`), each set to nothing; a parameter that can't be cleared is refused.
+ */
+function renameAndClear(current: string, id: EntityId, name: string | undefined, clear: JsonValue | undefined): LedgerEvent[] | Rejection {
+  const names = typeof clear === "string" ? clear.split(",").map((s) => s.trim()).filter((s) => s !== "") : [];
+  const bad = names.find((n) => !(CLEARABLE as readonly string[]).includes(n));
+  if (bad !== undefined) return reject("bad_flow", say("why_a_standing_payments_g_cant_be_cleared", { g: bad.replace(/_/g, " ") }));
+  const out: LedgerEvent[] = [...new Set(names)].map((n): LedgerEvent => ({ type: "set", entity: id, field: FLOW_PARAM_FIELDS[n] ?? n, value: null }));
+  const label = name?.trim().slice(0, 80) ?? "";
+  if (label !== "" && label !== current) out.push({ type: FINANCE_EVENTS.flowRenamed, data: { flow: id, name: label } });
+  return out;
+}
+
+export function updateFlow(ctx: ReadContext, who: EntityId, flow: EntityId, args: Record<string, JsonValue>): LedgerEvent[] | Rejection {
+  const e = own(ctx.state.entities, flow);
+  if (e?.kind !== "flow") return reject("not_flow", say("why_flow_isnt_a_standing_payment", { flow: labelOf(ctx, flow) }));
+  if (!mayPayFrom(ctx, who, strOf(e.fields.from))) return reject("not_owner", say("why_account_isnt_who_s_to_change", { account: e.name, who: labelOf(ctx, who) }));
+  const made = flowFields(args);
+  if ("code" in made) return made;
+  const more = renameAndClear(e.name, flow, made.label, args.clear);
+  if ("code" in more) return more;
+  const both = more.find((x) => x.type === "set" && x.field in made.fields);
+  if (both && both.type === "set") return reject("bad_flow", say("why_a_standing_payments_g_cant_be_both", { g: both.field.replace(/_/g, " ") }));
+  // The payment as it will be: what changes, what's cleared, and the rest as it was.
+  const cleared = new Set(more.flatMap((x) => (x.type === "set" ? [x.field] : [])));
+  const after = (field: string): string => (cleared.has(field) ? "" : strOf(made.fields[field] ?? e.fields[field]));
+  const problem = flowProblem(ctx, who, after("from"), after("to"), after("fallback"));
+  if (problem) return problem;
+  return [...Object.entries(made.fields).map(([field, value]): LedgerEvent => ({ type: "set", entity: flow, field, value })), ...more];
+}
+
+/** GM: a standing payment's name, and the fields a comma list of parameters clears (`economy.flow_edit`). */
+export function editFlow(ctx: ReadContext, flow: EntityId, name: string | undefined, clear: JsonValue | undefined): LedgerEvent[] | Rejection {
+  const e = own(ctx.state.entities, flow);
+  if (e?.kind !== "flow") return reject("not_flow", say("why_flow_isnt_a_standing_payment", { flow: labelOf(ctx, flow) }));
+  return renameAndClear(e.name, flow, name, clear);
+}
+
+export function setFlowStatus(ctx: ReadContext, who: EntityId, flow: EntityId, status: "active" | "paused" | "ended"): LedgerEvent[] | Rejection {
+  const e = own(ctx.state.entities, flow);
+  if (e?.kind !== "flow") return reject("not_flow", say("why_flow_isnt_a_standing_payment", { flow: labelOf(ctx, flow) }));
+  if (!mayPayFrom(ctx, who, strOf(e.fields.from))) return reject("not_owner", say("why_account_isnt_who_s_to_change", { account: e.name, who: labelOf(ctx, who) }));
+  const out: LedgerEvent[] = [{ type: "set", entity: flow, field: "status", value: status }];
+  if (status === "ended") out.push({ type: "set", entity: flow, field: GONE_FIELD, value: true });
+  return out;
+}
+
+/** The entity id an opened account gets: its first owner and product, with a disambiguating hash. */
+function newAccountId(ctx: ReadContext, spec: OpenAccount): EntityId {
+  const base = `${spec.owners[0]?.party ?? "acct"}_${spec.product}`;
+  let id = spec.id ?? `${base}_${hashParts(base, spec.name, ctx.state.clock).slice(0, 6)}`;
+  while (own(ctx.state.entities, id)) id = `${id}x`;
+  return id;
+}
+
+/**
+ * Opens an account from a product: the account (opened now), a loan's disbursement, a card in its holder's hands.
+ * An agent's tool (`plain`) gets what the call gives and nothing else: its due day, statement day and the account its
+ * minimum is paid from are set only when the spec gives them, and its name, a loan's payout memo and its card's name
+ * are the caller's words. The player's own opening keeps the engine's defaults for each.
+ */
+export function openAccount(ctx: ReadContext, spec: OpenAccount): LedgerEvent[] | Rejection {
+  const products = worldProducts(ctx.world);
+  const cls = own(products, spec.product)?.class ?? (isAccountClass(spec.product) ? spec.product : null);
+  if (!cls) return { code: "bad_product", reason: say("why_theres_no_product_g", { g: spec.product.replace(/_/g, " ") }), choices: Object.keys(products).sort(), said: spec.product };
+  const holder = spec.owners[0]?.party;
+  if (!holder || !own(ctx.state.entities, holder)) return reject("missing_entity", say("why_an_account_needs_an_owner"));
+  const id = newAccountId(ctx, spec);
+  const cal = calendarOf(ctx.world);
+  const d = dateAt(cal, ctx.state.clock);
+  const opened = `${String(d.year).padStart(4, "0")}-${String(d.month).padStart(2, "0")}-${String(d.day).padStart(2, "0")}`;
+  const t = CLASS_TRAITS[cls];
+  const fields: JsonObject = { owners: spec.owners.map((o) => ({ party: o.party, role: o.role, ...(o.share !== undefined ? { share: o.share } : {}) })), product: spec.product, opening: 0, opened, status: "open" };
+  if (spec.apr_pct !== undefined) fields.apr_pct = spec.apr_pct;
+  if (t.revolving && typeof spec.cents === "number") fields.limit = Math.round(spec.cents);
+  if (t.installment && spec.term_months !== undefined) {
+    fields.term_months = spec.term_months;
+    fields.months_left = spec.term_months;
+  }
+  if (spec.due_day !== undefined) fields.due_day = spec.due_day;
+  else if (spec.plain !== true && t.installment) fields.due_day = Math.min(28, d.day);
+  if (spec.statement_day !== undefined) fields.statement_day = spec.statement_day;
+  else if (spec.plain !== true && t.revolving) fields.statement_day = Math.min(28, d.day);
+  const autopay = spec.autopay_from ?? (spec.plain !== true && t.installment ? depositAccount(ctx, holder) : undefined);
+  if (autopay !== undefined && autopay !== null) {
+    fields.autopay = "minimum";
+    fields.autopay_from = autopay;
+  }
+  if (spec.secured_by) fields.secured_by = spec.secured_by;
+  const out: LedgerEvent[] = [{ type: "spawn", entity: { id, kind: "account", name: spec.name, tier: "background", fields, relations: [] } }, { type: FINANCE_EVENTS.open, data: { accounts: [id] } }];
+  if (t.installment && typeof spec.cents === "number" && spec.cents > 0) {
+    const into = spec.into ?? depositAccount(ctx, holder) ?? external(holder);
+    out.push(...posting([{ account: id, amount: -Math.round(spec.cents) }, { account: into, amount: Math.round(spec.cents) }], { memo: spec.memo ?? say("memo_name_loan_paid_out", { name: spec.name }), kind: "deposit", category: "loan" }));
+  }
+  if (spec.card && (t.revolving || t.transactional)) {
+    const cardId = `${id}_card`;
+    out.push({ type: "spawn", entity: { id: cardId, kind: "card", name: spec.card_name ?? (/\bcard$/i.test(spec.name) ? spec.name : say("name_name_card", { name: spec.name })), tier: "background", fields: { account: id, holder, network: cls === "charge_card" ? "charge" : t.revolving ? "credit" : "debit", state: "active" }, relations: [] } });
+  }
+  for (const o of spec.owners) if (o.role === "owner" || o.role === "joint") if (isParty(ctx, o.party) && t.liability) out.push({ type: FINANCE_EVENTS.credit, data: { person: o.party, kind: "opened", account: id } });
+  return out;
+}
+
+/**
+ * What a credit application brings, for a module (`api.applyCredit`), the player's action or an agent's tool. The tool gives
+ * the call's own rate (`apr_pct`) and limit, the score the tables are read at for someone with none (`scoreAssumed`), asks
+ * that it be opened `force`d whatever the lending rules say (their decline comes back in the decision), and has whatever the
+ * tables supplied come back `apart` (`filled`) from the call's own fields, to be recorded as filled in.
+ */
+export type CreditRequest = CreditApplication & { into?: string; id?: EntityId; name?: string; apr_pct?: number; limit?: number; scoreAssumed?: number; force?: true; apart?: true; memo?: string; card_name?: string };
+
+/** What a credit application came to: the lender's decision, the events that open it, and (asked `apart`) the events that set what the tables supplied. */
+export interface CreditMade {
+  decision: Decision;
+  events: LedgerEvent[];
+  filled: LedgerEvent[];
+}
+
+/**
+ * Applying for credit: where credit reports run, a hard inquiry and the lender's decision at the
+ * applicant's score; anywhere, no more than a lender extends. Approved, the account opens at the
+ * decided APR and limit, with a loan's principal paid to `into` (an account the applicant may pay
+ * into, or the outside); declined, the decision says why and only the inquiry is made, unless it is
+ * asked `force`d: then the account opens as an approved one does, with the same fields and events.
+ */
+export function creditApplication(ctx: ReadContext, who: EntityId, app: CreditRequest): CreditMade | Rejection {
+  if (!isParty(ctx, who)) return reject("missing_entity", say("why_no_party", { party: labelOf(ctx, who) }));
+  const reports = featureFor(ctx, who, "credit");
+  const decision = decide(ctx, who, app, reports);
+  if ("code" in decision) return decision;
+  const inquiry: LedgerEvent[] = reports ? [{ type: FINANCE_EVENTS.credit, data: { person: who, kind: "inquiry", note: app.product.replace(/_/g, " ") } }] : [];
+  if (!decision.approved && app.force !== true) return { decision, events: inquiry, filled: [] };
+  if (app.into !== undefined && own(ctx.state.entities, app.into)) {
+    const unusable = mayUse(ctx, who, app.into, "into");
+    if (unusable) return unusable;
+  }
+  const revolving = CLASS_TRAITS[decision.cls].revolving;
+  const apr = app.apr_pct ?? decision.apr ?? decision.tables.apr;
+  // A card's or line's limit is the call's when it gave one (or asked for an amount the lender extended); else the lender's, from the tables.
+  const asked = app.limit ?? (revolving && app.cents !== undefined && (!decision.approved || decision.limit === app.cents) ? app.cents : undefined);
+  const limit = revolving ? (asked ?? decision.limit ?? decision.tables.limit ?? undefined) : undefined;
+  const amount = revolving ? (app.apart === true && asked === undefined ? undefined : limit) : app.cents;
+  const aprAside = app.apart === true && app.apr_pct === undefined && apr !== null;
+  const opened = openAccount(ctx, { ...(app.id ? { id: app.id } : {}), name: app.name ?? decision.label, product: app.product, owners: [{ party: who, role: "owner" }], ...(amount !== undefined ? { cents: amount } : {}), ...(app.into !== undefined ? { into: app.into } : {}), ...(app.term_months !== undefined ? { term_months: app.term_months } : {}), ...(apr !== null && !aprAside ? { apr_pct: apr } : {}), ...(app.secured_by ? { secured_by: app.secured_by } : {}), card: revolving, ...(app.apart === true ? { plain: true as const } : {}), ...(app.memo !== undefined ? { memo: app.memo } : {}), ...(app.card_name !== undefined ? { card_name: app.card_name } : {}) });
+  if ("code" in opened) return opened;
+  const spawned = opened.find((e) => e.type === "spawn");
+  const account = spawned !== undefined && "entity" in spawned ? spawned.entity.id : "";
+  const filled: LedgerEvent[] = [];
+  if (account !== "" && aprAside && apr !== null) filled.push({ type: "set", entity: account, field: "apr_pct", value: apr });
+  if (account !== "" && app.apart === true && revolving && asked === undefined && limit !== undefined) filled.push({ type: "set", entity: account, field: "limit", value: Math.round(limit) });
+  return { decision, events: [...inquiry, ...opened], filled };
+}
+
+/** The player's (or anyone's) application for credit, with the note that says how it went. */
+export function applyForCredit(ctx: ReadContext, who: EntityId, product: string, cents: number | undefined, term: number | undefined, securedBy?: EntityId): LedgerEvent[] | Rejection {
+  const made = creditApplication(ctx, who, { product, ...(cents !== undefined ? { cents } : {}), ...(term !== undefined ? { term_months: term } : {}), ...(securedBy ? { secured_by: securedBy } : {}) });
+  if ("code" in made) return made;
+  const d = made.decision;
+  const note = d.approved ? notice("bill", "credit_approved", { product: d.label.toLowerCase(), apr: d.apr, ...(d.limit ? { limit: money(ctx, d.limit) } : {}) }, who, ctx.state.clock) : notice("decline", "credit_declined", { product: d.label.toLowerCase(), reason: d.reason }, who, ctx.state.clock);
+  return [...made.events, ...note];
+}
+
+/** A party's payment preferences, set by them: a list of tiers, or that list as JSON text (an action's parameters are scalars). */
+export function setPayPrefs(ctx: ReadContext, who: EntityId, tiers: JsonValue | undefined): LedgerEvent[] | Rejection {
+  if (!isParty(ctx, who)) return reject("missing_entity", say("why_no_party", { party: labelOf(ctx, who) }));
+  let raw = tiers;
+  if (typeof tiers === "string") {
+    try {
+      raw = JSON.parse(tiers) as JsonValue;
+    } catch {
+      return reject("bad_tiers", say("why_payment_preferences_are_a_list_of_ways"));
+    }
+  }
+  const list = Array.isArray(raw) ? raw.map((t) => objOf(t)).filter((t) => typeof t.use === "string" && t.use !== "") : null;
+  if (!list) return reject("bad_tiers", say("why_payment_preferences_are_a_list_of_ways"));
+  return [{ type: "set", entity: who, field: "pay_prefs", value: list }];
+}
+
+/**
+ * GM: closes an account that owes and holds nothing, and has nothing still to come in (an opening
+ * that posts when its holder's money opens); its cards are cancelled.
+ */
+export function closeAccount(ctx: ReadContext, account: EntityId): LedgerEvent[] | Rejection {
+  const e = own(ctx.state.entities, account);
+  if (e?.kind !== "account") return reject("not_account", say("why_account_isnt_an_account", { account: labelOf(ctx, account) }));
+  if (balance(ctx.state, account) !== 0) return reject("not_empty", say("why_account_still_has_account2_on_it", { account: labelOf(ctx, account), account2: money(ctx, balance(ctx.state, account)) }));
+  const opening = Math.round(numOf(e.fields.opening));
+  if (opening !== 0 && !isOpened(ctx.state, account, openerOf(ctx.state, account))) return reject("not_empty", say("why_account_opens_with_opening_still_to_post", { account: labelOf(ctx, account), opening: money(ctx, opening) }));
+  return [{ type: FINANCE_EVENTS.status, data: { account, status: "closed" } }, ...cardsOn(ctx.state, account).map((c): LedgerEvent => ({ type: "set", entity: c, field: "state", value: "cancelled" }))];
+}
+
+/** GM: an account's status; closing it is closing the account, with the same checks. */
+export function setStatus(ctx: ReadContext, account: EntityId, status: string): LedgerEvent[] | Rejection {
+  if (own(ctx.state.entities, account)?.kind !== "account") return reject("not_account", say("why_account_isnt_an_account", { account: labelOf(ctx, account) }));
+  if (!(ACCOUNT_STATUSES as readonly string[]).includes(status)) return reject("bad_status", say("why_an_account_cant_be_status", { status: status }));
+  if (statusOf(ctx.state, account) === status) return [];
+  return status === "closed" ? closeAccount(ctx, account) : [{ type: FINANCE_EVENTS.status, data: { account, status } }];
+}
+
+export function releaseHold(ctx: ReadContext, account: EntityId, hold: string): LedgerEvent[] | Rejection {
+  if (!own(ctx.state.entities, account)) return reject("not_account", say("why_account_isnt_an_account", { account: labelOf(ctx, account) }));
+  return [{ type: FINANCE_EVENTS.hold, data: { id: hold, account, release: true } }];
+}
+
+/** The holders of an account who may act for it (its POV first when the POV is one). */
+export function actorOf(ctx: ReadContext, account: EntityId): EntityId | null {
+  const holders = holdersOf(ctx.state, account);
+  return holders.includes(ctx.world.pov) ? ctx.world.pov : (holders[0] ?? null);
+}

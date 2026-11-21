@@ -1,0 +1,651 @@
+// The formula environment (DESIGN §3 Rules, §10, §11): what a predicate, requirement, modifier,
+// derived field or effect argument can read. Pure: it reads the world document, the state and the
+// registry's formula functions, never the wall clock or ambient randomness.
+//
+// Names, in lookup order (a dotted path is one lookup):
+//   vars        caller-supplied values: action params, `event.*` for event triggers, `track.*`, …
+//   bindings    `self`, `actor`, `target`, ref params …: the bare name is the entity id;
+//               `self.cash` its field (derived fields computed, defaults applied); `self.name`,
+//               `self.kind`, `self.tier`, `self.id`
+//   pov         the POV entity, like a binding
+//   here        the place of `self` (or the POV); `here.security` reads the place's fields
+//   stage.<id>  a track's current stage
+//   level.<d>   the effective level of `self` in domain d
+//   clock names clock, minute (of day), hour, day (index since the epoch's date), weekday, date,
+//               month, year, daypart
+//   <entityId>  any entity in the state, as for a binding; `<placeId>.<field>` a place's field
+//
+// Functions: math built-ins (expr), then the engine's (`BUILTIN_FUNCTIONS`, below), then the
+// registry's formulas. Among the engine's:
+//   table(id, key, column)         a cell of one of the world's pinned data tables, or null
+//   table_step(id, value, column)  the cell of the row whose numeric key is the largest ≤ value
+//   roll(notation)                 a dice total, only where the environment has a generator: effect
+//                                  arguments (DESIGN §11); anywhere else null, and a lint error
+//
+// Effect arguments: a string starting with `=` is a formula; a string naming a binding is that
+// entity's id; any other value is taken literally (objects and arrays element-wise).
+
+import type { JsonObject, JsonValue } from "../shared/json";
+import { hasOwn, isRecord } from "../shared/json";
+import type { DomainId, EntityId, KindId } from "../shared/ids";
+import { DOMAINS } from "../shared/ids";
+import type { BandDef, FieldDef, KindDef, PoolDef, WorldDoc } from "../shared/world";
+import { EFFECT_ONLY_FUNCTIONS } from "../shared/world";
+import { calendarOf, clockAt, dateAt, dayPartAt, holidaysOn, nextTimeOfDay, parseHHMM } from "./calendar";
+import { DiceError, rollDice } from "./dice";
+import { calendarIn } from "./holidays";
+import type { EnvVars, ExprEnv, Value } from "./expr";
+import { compile, ExprError, MATH_FUNCTIONS, runProgram } from "./expr";
+import type { ReadContext } from "./registry";
+import type { Registry } from "./registry-impl";
+import type { Rng } from "./rng";
+import type { EntityState } from "./state";
+import { own } from "./pack-kit";
+
+export interface ScopeInput {
+  reg: Registry;
+  ctx: ReadContext;
+  /** Name → entity id. `self` defaults to the POV. */
+  bindings?: Record<string, EntityId>;
+  vars?: EnvVars;
+  /** The effect's own generator: only effect arguments get one, and with it `roll()` (DESIGN §11). */
+  rng?: Rng;
+  /**
+   * The instant the clock names read (`clock`, `month`, `weekday`, `today_at`, …): a flow
+   * occurrence's own, when it is worked out ahead of the state's clock; the state's clock without one.
+   */
+  at?: number;
+}
+
+/**
+ * The engine's own formula functions, as `call` below handles them, each with its parameters
+ * (`?`: may be left out); the authors' reference lists them (`bun run reference`).
+ */
+export const BUILTIN_FUNCTIONS: Readonly<Record<string, readonly string[]>> = {
+  field: ["entity", "field"],
+  rel: ["entity", "type", "to?"],
+  has_rel: ["entity", "type", "to?"],
+  rel_count: ["entity", "type"],
+  rel_field: ["from", "type", "to", "field"],
+  stage: ["track"],
+  since: ["track"],
+  place: ["entity"],
+  at: ["entity", "place"],
+  level: ["entity", "domain"],
+  knows: ["entity", "subject"],
+  fired: ["rule"],
+  attempts: ["track"],
+  revealed: ["track", "stage?"],
+  band: ["entity", "field"],
+  next_time: ["time"],
+  today_at: ["time"],
+  hours: ["n"],
+  days: ["n"],
+  holiday: [],
+  count_at: ["place", "kind?"],
+  table: ["table", "key", "column"],
+  table_step: ["table", "value", "column"],
+  roll: ["notation"],
+};
+
+/**
+ * Every function a formula outside an effect argument may call: the math built-ins, the engine's
+ * and the registry's formulas, sorted (Build's expression editor offers them).
+ */
+export function formulaFunctions(reg: Registry): string[] {
+  const names = new Set<string>([...MATH_FUNCTIONS, ...Object.keys(BUILTIN_FUNCTIONS), ...reg.formulas.keys()]);
+  for (const name of EFFECT_ONLY_FUNCTIONS) names.delete(name);
+  return [...names].sort();
+}
+
+export interface ScopeInput {
+  reg: Registry;
+  ctx: ReadContext;
+  /** Name → entity id. `self` defaults to the POV. */
+  bindings?: Record<string, EntityId>;
+  vars?: EnvVars;
+}
+
+const ENGINE_SLICE = "engine";
+
+/**
+ * A kind's own definition: the world's, else the registry's. A world kind with a pack kind's id lies
+ * over it (DESIGN §4.1): its label wins, and `kindParent`, `fieldDef` and `kindFields` read the two
+ * together, so its fields join the pack's rather than replace them.
+ */
+export function kindDef(reg: Registry, world: WorldDoc, kind: KindId): KindDef | undefined {
+  return own(world.kinds, kind) ?? reg.kinds.get(kind);
+}
+
+/** The kind `kind` builds on: the world's Extends for it, else the pack's of the same id. */
+export function kindParent(reg: Registry, world: WorldDoc, kind: KindId): KindId | undefined {
+  return own(world.kinds, kind)?.extends ?? reg.kinds.get(kind)?.extends;
+}
+
+/**
+ * How far the engine's own walks go: up a kind's chain (`kindIs`, `fieldDef`, `kindFields`), up a thing's holders to find its place
+ * (`placeOfEntity`), and up the place tree as far as a visit of the POV counts (`seen.ts`). Settings read once when RPE starts
+ * (`engine.maxKindChain`, `engine.maxHolderDepth`, `places.maxVisitDepth`), 32 each by default, for every fold of every chat alike.
+ */
+export interface WalkLimits {
+  kindChain: number;
+  holderDepth: number;
+  visitDepth: number;
+}
+
+export const WALK_DEFAULTS: Readonly<WalkLimits> = Object.freeze({ kindChain: 32, holderDepth: 32, visitDepth: 32 });
+
+/** The setting each walk is read from. */
+export const WALK_SETTINGS: Readonly<Record<keyof WalkLimits, string>> = Object.freeze({ kindChain: "engine.maxKindChain", holderDepth: "engine.maxHolderDepth", visitDepth: "places.maxVisitDepth" });
+
+/** A walk cut short by its setting: which walk, where it began, the last step it took, and the setting. */
+export interface WalkCut {
+  walk: keyof WalkLimits;
+  from: string;
+  at: string;
+  limit: number;
+}
+
+let limits: Readonly<WalkLimits> = WALK_DEFAULTS;
+let reached: ((cut: WalkCut) => void) | null = null;
+/** The chains cut so far, each told once; and, by what was walked (a state, a world), its own, for the answers that show it. */
+const told = new Set<string>();
+const cutIn = new WeakMap<object, Map<string, WalkCut>>();
+
+/**
+ * Sets the engine's walks for every fold of the process (RPE sets them once, when it starts); a walk not given keeps what it was. Who
+ * is told of a chain one cuts (the log) is replaced when given.
+ */
+export function setWalkLimits(next: Partial<WalkLimits>, onReached?: (cut: WalkCut) => void): void {
+  const whole = (n: number | undefined, d: number): number => (n === undefined || !Number.isFinite(n) ? d : Math.max(1, Math.floor(n)));
+  limits = Object.freeze({ kindChain: whole(next.kindChain, limits.kindChain), holderDepth: whole(next.holderDepth, limits.holderDepth), visitDepth: whole(next.visitDepth, limits.visitDepth) });
+  if (onReached) reached = onReached;
+  told.clear();
+}
+
+export function walkLimits(): Readonly<WalkLimits> {
+  return limits;
+}
+
+/** A walk over `over` (a state, or a world for a kind's chain) cut short: kept with it, and told once for each chain. */
+export function walkCut(over: object, walk: keyof WalkLimits, from: string, at: string): void {
+  const cut: WalkCut = { walk, from, at, limit: limits[walk] };
+  const key = `${walk}\u0000${from}`;
+  let mine = cutIn.get(over);
+  if (!mine) {
+    mine = new Map();
+    cutIn.set(over, mine);
+  }
+  mine.set(key, cut);
+  if (told.has(key)) return;
+  if (told.size >= 10_000) told.clear();
+  told.add(key);
+  reached?.(cut);
+}
+
+/** The walks cut short over each of `over` (a state, its world), for an answer that depends on them to say where each stopped. */
+export function walkCuts(...over: object[]): WalkCut[] {
+  return over.flatMap((o) => [...(cutIn.get(o)?.values() ?? [])]);
+}
+
+/** True when `kind` is `ancestor` or inherits from it. */
+export function kindIs(reg: Registry, world: WorldDoc, kind: KindId, ancestor: KindId): boolean {
+  let id: KindId | undefined = kind;
+  for (let guard = 0; id; guard++) {
+    if (guard >= limits.kindChain) {
+      walkCut(world, "kindChain", kind, id);
+      return false;
+    }
+    if (id === ancestor) return true;
+    id = kindParent(reg, world, id);
+  }
+  return false;
+}
+
+/** A field's definition, searched up the kind's inheritance chain, the world's kind before the pack's at each step. */
+export function fieldDef(reg: Registry, world: WorldDoc, kind: KindId, field: string): FieldDef | undefined {
+  let id: KindId | undefined = kind;
+  for (let guard = 0; id; guard++) {
+    if (guard >= limits.kindChain) {
+      walkCut(world, "kindChain", kind, id);
+      return undefined;
+    }
+    const mine: KindDef | undefined = own(world.kinds, id);
+    const pack: KindDef | undefined = reg.kinds.get(id);
+    if (!mine && !pack) return undefined;
+    const f = (mine && own(mine.fields, field)) ?? (pack && own(pack.fields, field));
+    if (f) return f;
+    id = mine?.extends ?? pack?.extends;
+  }
+  return undefined;
+}
+
+/** Every field of a kind, ancestors first, overridden by descendants; at each step the world's kind over the pack's. */
+export function kindFields(reg: Registry, world: WorldDoc, kind: KindId): Record<string, FieldDef> {
+  const chain: KindId[] = [];
+  let id: KindId | undefined = kind;
+  for (let guard = 0; id; guard++) {
+    if (!own(world.kinds, id) && !reg.kinds.has(id)) break;
+    if (guard >= limits.kindChain) {
+      walkCut(world, "kindChain", kind, id);
+      break;
+    }
+    chain.unshift(id);
+    id = kindParent(reg, world, id);
+  }
+  const out: Record<string, FieldDef> = {};
+  for (const step of chain) Object.assign(out, reg.kinds.get(step)?.fields, own(world.kinds, step)?.fields);
+  return out;
+}
+
+/** The band a value falls in (`min` inclusive, `max` exclusive), or null. */
+export function bandOf(bands: readonly BandDef[] | undefined, value: number): BandDef | null {
+  if (!bands) return null;
+  for (const b of bands) if ((b.min === undefined || value >= b.min) && (b.max === undefined || value < b.max)) return b;
+  return null;
+}
+
+export function toValue(v: JsonValue | undefined): Value | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean") return v;
+  return undefined;
+}
+
+/** The value as an object, or an empty one. */
+export function asObject(v: JsonValue | undefined): JsonObject {
+  return isRecord(v) ? (v as JsonObject) : {};
+}
+
+/** The object elements of a JSON array (anything else: none). */
+export function objects(v: JsonValue | undefined): JsonObject[] {
+  const out: JsonObject[] = [];
+  if (Array.isArray(v)) for (const x of v) if (isRecord(x)) out.push(x as JsonObject);
+  return out;
+}
+
+function str(v: Value | undefined): string {
+  return v === null || v === undefined ? "" : String(v);
+}
+
+function num(v: Value | undefined): number {
+  if (typeof v === "number") return v;
+  if (typeof v === "boolean") return v ? 1 : 0;
+  if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
+  return 0;
+}
+
+/** The place an entity is at: its `place` field, else the place of what holds it (`in`) or what it is on (`on`), as many up as `engine.maxHolderDepth` says. */
+export function placeOfEntity(state: { entities: Record<EntityId, EntityState> }, id: EntityId): string | null {
+  let cur: EntityId | undefined = id;
+  for (let guard = 0; cur; guard++) {
+    if (guard >= limits.holderDepth) {
+      walkCut(state, "holderDepth", id, cur);
+      return null;
+    }
+    const e: EntityState | undefined = own(state.entities, cur);
+    if (!e) return null;
+    const p = e.fields.place;
+    if (typeof p === "string" && p !== "") return p;
+    cur = e.relations.find((r) => r.type === "in" || r.type === "on")?.to;
+  }
+  return null;
+}
+
+/** The field a GM's Remove sets and Restore clears; an Upgrade's `remove` pick sets it too, and nothing else writes it. */
+export const GONE_FIELD = "gone";
+
+/**
+ * Whether an entity is out of the world: a GM removed it (its `gone` field), or it is inside
+ * something that was. It stays in state, so Undo and Restore bring it back whole, but no player
+ * view, palette or simulation process sees it; the GM view lists it as gone.
+ */
+export function isGone(state: { entities: Record<EntityId, EntityState> }, id: EntityId): boolean {
+  let cur: EntityId | undefined = id;
+  for (let guard = 0; cur && guard < 32; guard++) {
+    const e: EntityState | undefined = own(state.entities, cur);
+    if (!e) return false;
+    if (e.fields[GONE_FIELD] === true) return true;
+    cur = e.relations.find((r) => r.type === "in" || r.type === "on")?.to;
+  }
+  return false;
+}
+
+/** Whether `place` is `ancestor` or lies inside it. */
+export function placeWithin(world: WorldDoc, place: string | null, ancestor: string): boolean {
+  let id: string | undefined = place ?? undefined;
+  for (let guard = 0; id && guard < 32; guard++) {
+    if (id === ancestor) return true;
+    id = own(world.places, id)?.parent;
+  }
+  return false;
+}
+
+export function engineSlice(state: { packs: Record<string, JsonObject> }): JsonObject {
+  return state.packs[ENGINE_SLICE] ?? {};
+}
+
+function sliceRecord(state: { packs: Record<string, JsonObject> }, key: string): JsonObject {
+  const v = engineSlice(state)[key];
+  return isRecord(v) ? (v as JsonObject) : {};
+}
+
+/** What a derived field's formula gives for an entity, whatever value of its own the field holds: the figure that stays readable beside a stated value. Undefined for a field with no formula. */
+export function formulaFigure(reg: ScopeInput["reg"], ctx: ScopeInput["ctx"], id: EntityId, field: string): Value | undefined {
+  const e = own(ctx.state.entities, id);
+  const def = e ? fieldDef(reg, ctx.world, e.kind, field) : undefined;
+  return def?.derived === undefined ? undefined : runProgram(compile(def.derived), scopeEnv({ reg, ctx, bindings: { self: id } }));
+}
+
+/** Builds the environment. One environment per evaluation context; it is cheap. */
+export function scopeEnv(input: ScopeInput): ExprEnv {
+  const { reg, ctx } = input;
+  const world = ctx.world;
+  const state = ctx.state;
+  const bindings: Record<string, EntityId> = { self: world.pov, ...input.bindings };
+  const vars = input.vars ?? {};
+  const self = bindings.self ?? world.pov;
+  const now = input.at ?? state.clock;
+  let derivedDepth = 0;
+
+  const entityValue = (id: EntityId, rest: readonly string[]): Value | undefined => {
+    const e = own(state.entities, id);
+    if (!e) return undefined;
+    if (rest.length === 0) return id;
+    const [head, ...tail] = rest;
+    if (head === undefined) return id;
+    if (tail.length === 0) {
+      if (head === "id") return id;
+      if (head === "name") return e.name;
+      if (head === "kind") return e.kind;
+      if (head === "tier") return e.tier;
+      if (head === "agent") return e.agent;
+      if (head === "place") return placeOfEntity(state, id);
+    }
+    const def = fieldDef(reg, world, e.kind, head);
+    let raw: JsonValue | undefined = own(e.fields, head);
+    // A field the ruleset works out reads the value it holds of its own, when it holds one; null returns it to its formula (`formulaFigure` still gives the formula's figure).
+    if (def?.derived !== undefined && tail.length === 0 && (raw === undefined || raw === null)) {
+      if (derivedDepth > 8) return 0;
+      derivedDepth++;
+      try {
+        return runProgram(compile(def.derived), scopeEnv({ reg, ctx, bindings: { self: id }, ...(input.at !== undefined ? { at: input.at } : {}) }));
+      } finally {
+        derivedDepth--;
+      }
+    }
+    if (raw === undefined) raw = def?.default;
+    // An unset pool with no default is full (DESIGN §11): new characters start at their max.
+    if (raw === undefined && tail.length === 0 && def?.pool) return poolMax(reg, ctx, id, def.pool) ?? undefined;
+    for (const seg of tail) {
+      if (!isRecord(raw)) return undefined;
+      raw = own(raw as JsonObject, seg);
+    }
+    return toValue(raw);
+  };
+
+  const clockValue = (name: string): Value | undefined => {
+    const cal = calendarOf(world);
+    const d = dateAt(cal, now);
+    switch (name) {
+      case "clock":
+        return now;
+      case "minute":
+        return d.minuteOfDay;
+      case "hour":
+        return Math.floor(d.minuteOfDay / 60);
+      case "day":
+        return d.dayIndex;
+      case "weekday":
+        return d.weekday;
+      case "date":
+        return d.day;
+      case "month":
+        return d.month;
+      case "year":
+        return d.year;
+      case "daypart":
+        return dayPartAt(cal, now).id;
+      default:
+        return undefined;
+    }
+  };
+
+  const lookup = (path: readonly string[]): Value | undefined => {
+    const [head, ...rest] = path;
+    if (head === undefined) return undefined;
+    if (Object.prototype.hasOwnProperty.call(vars, head)) {
+      let cur: Value | EnvVars | undefined = vars;
+      for (const seg of path) {
+        if (cur === null || typeof cur !== "object" || !Object.prototype.hasOwnProperty.call(cur, seg)) return undefined;
+        cur = (cur as EnvVars)[seg];
+      }
+      if (cur !== null && typeof cur === "object") return undefined;
+      return cur;
+    }
+    if (Object.prototype.hasOwnProperty.call(bindings, head)) {
+      const id = bindings[head];
+      return id === undefined ? undefined : entityValue(id, rest);
+    }
+    if (head === "pov") return entityValue(world.pov, rest);
+    if (head === "here") {
+      const place = placeOfEntity(state, self);
+      if (rest.length === 0) return place;
+      return place ? toValue(own(own(world.places, place)?.fields ?? {}, rest[0] ?? "")) : undefined;
+    }
+    if (head === "stage" && rest.length === 1) {
+      const t = rest[0] ?? "";
+      return own(state.tracks, t)?.stage ?? own(world.tracks, t)?.start;
+    }
+    if (head === "level" && rest.length === 1 && (DOMAINS as readonly string[]).includes(rest[0] ?? "")) {
+      return ctx.levelOf(self, rest[0] as DomainId);
+    }
+    if (rest.length === 0) {
+      const c = clockValue(head);
+      if (c !== undefined) return c;
+    }
+    if (own(state.entities, head)) return entityValue(head, rest);
+    if (own(world.places, head)) return rest.length === 0 ? head : toValue(own(own(world.places, head)?.fields ?? {}, rest[0] ?? ""));
+    return undefined;
+  };
+
+  const call = (name: string, args: Value[]): Value | undefined => {
+    const a0 = args[0];
+    const a1 = args[1];
+    const a2 = args[2];
+    switch (name) {
+      case "field":
+        return entityValue(str(a0), [str(a1)]);
+      case "rel":
+      case "has_rel": {
+        const e = own(state.entities, str(a0));
+        return !!e && e.relations.some((r) => r.type === str(a1) && (a2 === undefined || r.to === str(a2)));
+      }
+      case "rel_count": {
+        const e = own(state.entities, str(a0));
+        return e ? e.relations.filter((r) => r.type === str(a1)).length : 0;
+      }
+      case "rel_field": {
+        // rel_field(from, type, to, field)
+        const e = own(state.entities, str(a0));
+        const r = e?.relations.find((x) => x.type === str(a1) && x.to === str(a2));
+        return toValue(r?.fields?.[str(args[3])]) ?? null;
+      }
+      case "stage":
+        return own(state.tracks, str(a0))?.stage ?? own(world.tracks, str(a0))?.start ?? null;
+      case "since": {
+        const t = own(state.tracks, str(a0));
+        return t ? now - t.since : now;
+      }
+      case "place":
+        return placeOfEntity(state, str(a0));
+      case "at":
+        return placeWithin(world, placeOfEntity(state, str(a0)), str(a1));
+      case "level":
+        return (DOMAINS as readonly string[]).includes(str(a1)) && own(state.entities, str(a0)) ? ctx.levelOf(str(a0), str(a1) as DomainId) : 0;
+      case "knows": {
+        const e = own(state.entities, str(a0));
+        return !!e && e.relations.some((r) => r.type === "knows" && r.to === str(a1));
+      }
+      case "fired": {
+        const f = sliceRecord(state, "fired")[str(a0)];
+        return isRecord(f) && typeof f.n === "number" ? f.n : 0;
+      }
+      case "attempts": {
+        const n = sliceRecord(state, "attempts")[str(a0)];
+        return typeof n === "number" ? n : 0;
+      }
+      case "revealed": {
+        const r = sliceRecord(state, "revealed")[str(a0)];
+        return Array.isArray(r) && (a1 === undefined || r.includes(str(a1)));
+      }
+      case "band": {
+        const e = own(state.entities, str(a0));
+        if (!e) return "";
+        const def = fieldDef(reg, world, e.kind, str(a1));
+        const v = entityValue(str(a0), [str(a1)]);
+        return bandOf(def?.bands, num(v))?.label ?? "";
+      }
+      case "next_time": {
+        try {
+          return nextTimeOfDay(calendarOf(world), now, parseHHMM(str(a0)));
+        } catch {
+          return now;
+        }
+      }
+      case "today_at": {
+        try {
+          const cal = calendarOf(world);
+          return clockAt(cal, dateAt(cal, now).dayIndex, parseHHMM(str(a0)));
+        } catch {
+          return now;
+        }
+      }
+      case "hours":
+        return num(a0) * 60;
+      case "days":
+        return num(a0) * 1440;
+      case "holiday": {
+        const cal = calendarIn(ctx);
+        return holidaysOn(cal, dateAt(cal, now).dayIndex)[0]?.label ?? "";
+      }
+      case "count_at": {
+        // count_at(place, kind?): entities at a place, optionally of a kind (with inheritance)
+        let n = 0;
+        for (const [id, e] of Object.entries(state.entities)) {
+          if (!placeWithin(world, placeOfEntity(state, id), str(a0))) continue;
+          if (a1 !== undefined && !kindIs(reg, world, e.kind, str(a1))) continue;
+          n++;
+        }
+        return n;
+      }
+      case "table":
+      case "table_step": {
+        // table(id, key, column): a cell of the world's pinned data table; table_step(id, value,
+        // column): the cell of the row whose numeric key is the largest at or below value
+        // (DESIGN §11). Tables are pinned per revision, so both are deterministic and allowed anywhere.
+        const table = own(world.tables, str(a0));
+        const rows: JsonObject = table && isRecord(table.rows) ? (table.rows as JsonObject) : {};
+        let key: string | null = str(a1);
+        if (name === "table_step") {
+          key = null;
+          for (const k of Object.keys(rows)) {
+            const at = k.trim() === "" ? NaN : Number(k);
+            if (Number.isFinite(at) && at <= num(a1) && (key === null || at > Number(key))) key = k;
+          }
+        }
+        const row = key === null ? undefined : own(rows, key);
+        return isRecord(row) && hasOwn(row, str(a2)) ? (toValue((row as JsonObject)[str(a2)]) ?? null) : null;
+      }
+      case "roll": {
+        // Effect arguments only (DESIGN §11): the effect's own generator, the total recorded in its
+        // event. Elsewhere there is no generator and a roll is nothing (lint flags it).
+        if (!input.rng) return null;
+        try {
+          return rollDice(str(a0), input.rng).total;
+        } catch (e) {
+          if (e instanceof DiceError) return null;
+          throw e;
+        }
+      }
+      default: {
+        const fn = reg.formulas.get(name);
+        return fn ? fn(ctx, ...args) : undefined;
+      }
+    }
+  };
+
+  return { lookup, call };
+}
+
+/** Pool reads in progress: a max that reads its own pool stops here instead of recursing. */
+let poolReads = 0;
+
+/**
+ * A pool's max for an entity (DESIGN §11): `max` names a field of the entity (derived ones
+ * computed) or is a formula with the entity as `self`. Null when it doesn't read as a number.
+ */
+export function poolMax(reg: Registry, ctx: ReadContext, entity: EntityId, pool: PoolDef): number | null {
+  const e = own(ctx.state.entities, entity);
+  if (!e || typeof pool.max !== "string" || poolReads > 8) return null;
+  poolReads++;
+  try {
+    const src = fieldDef(reg, ctx.world, e.kind, pool.max) ? `self.${pool.max}` : pool.max;
+    const v = evalExpr(src, scopeEnv({ reg, ctx, bindings: { self: entity } }), null);
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+    return Number.isFinite(n) ? n : null;
+  } finally {
+    poolReads--;
+  }
+}
+
+/** A pool's floor for an entity: its `min` as a number, or as a formula with the entity as `self` (0 where it doesn't read as one); 0 when unset. */
+export function poolMin(reg: Registry, ctx: ReadContext, entity: EntityId, pool: PoolDef): number {
+  if (pool.min === undefined) return 0;
+  if (typeof pool.min === "number") return pool.min;
+  if (!own(ctx.state.entities, entity) || poolReads > 8) return 0;
+  poolReads++;
+  try {
+    const v = Number(evalExpr(pool.min, scopeEnv({ reg, ctx, bindings: { self: entity } }), 0));
+    return Number.isFinite(v) ? v : 0;
+  } finally {
+    poolReads--;
+  }
+}
+
+/** Evaluates a formula; parse errors and unknown names yield `fallback`. */
+export function evalExpr(src: string | number | boolean | undefined, env: ExprEnv, fallback: Value = 0): Value {
+  if (src === undefined) return fallback;
+  if (typeof src !== "string") return src;
+  try {
+    return runProgram(compile(src), env);
+  } catch (e) {
+    if (e instanceof ExprError) return fallback;
+    throw e;
+  }
+}
+
+export function truthy(v: Value): boolean {
+  return v !== false && v !== null && v !== 0 && v !== "";
+}
+
+/** Effect-argument evaluation (see the header). */
+export function evalArg(value: JsonValue, env: ExprEnv, bindings: Record<string, EntityId>): JsonValue {
+  if (typeof value === "string") {
+    if (value.startsWith("=")) return evalExpr(value.slice(1), env, null);
+    if (Object.prototype.hasOwnProperty.call(bindings, value)) return bindings[value] ?? value;
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((v) => evalArg(v, env, bindings));
+  if (isRecord(value)) {
+    const out: JsonObject = {};
+    for (const [k, v] of Object.entries(value as JsonObject)) out[k] = evalArg(v, env, bindings);
+    return out;
+  }
+  return value;
+}
+
+export function evalArgs(args: Record<string, JsonValue>, env: ExprEnv, bindings: Record<string, EntityId>): Record<string, JsonValue> {
+  const out: Record<string, JsonValue> = {};
+  for (const [k, v] of Object.entries(args)) out[k] = evalArg(v, env, bindings);
+  return out;
+}

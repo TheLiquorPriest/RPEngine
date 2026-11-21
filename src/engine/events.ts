@@ -1,0 +1,628 @@
+// Core event types and marker reducers (DESIGN §3 Effects → Events, §4.3 markers).
+//
+// These and the pack-registered event types are the only code the reference fold and the
+// optimized fold share (DESIGN §14). Validation answers "may this event apply to this state?";
+// a rebased view drops an event whose validation fails. Reducers mutate a working copy.
+
+import { say } from "../shared/lines";
+import type { JsonValue } from "../shared/json";
+import { readAdjudication } from "../shared/adjudication";
+import { readClaims } from "../shared/claims";
+import { hasOwn, isRecord, safeKey } from "../shared/json";
+import type { DomainId, EntityId, Level } from "../shared/ids";
+import { BANDS, DOMAINS, INTERRUPT_CLASSES } from "../shared/ids";
+import { SPEED_THRESHOLD_MINUTES } from "../shared/time-reach";
+import { dropPassMemo } from "./read-pass";
+import type {
+  AddEvent,
+  ClockEvent,
+  CoreEvent,
+  EntityPicks,
+  LedgerEvent,
+  LinkEvent,
+  MarkerBody,
+  MaterializeEvent,
+  PostEvent,
+  RetiredTimeControl,
+  SetEvent,
+  SpawnEvent,
+  StageEvent,
+  TimeControl,
+  TimelapseEvent,
+  UnlinkEvent,
+  UpgradePick,
+  UpgradePicks,
+} from "../shared/ledger";
+import { APART_GROUP, UPGRADE_ASPECTS } from "../shared/ledger";
+import { clockPlus, clockSeconds } from "./calendar";
+import { unpinPause } from "./engine-pack";
+import type { Advice, EventTypeDef, ReadContext, Rejection } from "./registry";
+import type { WorldState } from "./state";
+import { touch } from "./touched";
+import { migrate, type MarkerEnv } from "./upgrade";
+import { forgetWhereabouts } from "./whereabouts";
+
+/** Accounts outside the world: counterparties without numeric money (DESIGN §9.2). */
+export const EXTERNAL_ACCOUNT_PREFIX = "economy.external:";
+
+/** Looks up a registered event type; the engine registers the core types first. */
+export interface EventTypes {
+  get(type: string): EventTypeDef | undefined;
+}
+
+function reject(code: string, reason: string): Rejection {
+  return { code, reason };
+}
+
+function hasEntity(state: Readonly<WorldState>, id: EntityId): boolean {
+  return safeKey(id) && hasOwn(state.entities, id);
+}
+
+/** An entity's display name for describers (never a raw id when a name exists). */
+function nameOf(ctx: ReadContext, id: EntityId): string {
+  if (id === ctx.world.pov) return "you";
+  return (hasEntity(ctx.state, id) ? ctx.state.entities[id]?.name : undefined) ?? (hasOwn(ctx.world.places, id) ? ctx.world.places[id]?.name : undefined) ?? id;
+}
+
+const setDef: EventTypeDef<SetEvent> = {
+  type: "set",
+  validate: (e, ctx) => {
+    if (!hasEntity(ctx.state, e.entity)) return reject("missing_entity", say("why_no_entity_who", { who: e.entity }));
+    if (!safeKey(e.field)) return reject("bad_field", say("why_not_a_field_name"));
+    return e.atMost && (typeof e.value !== "number" || !Number.isFinite(e.value)) ? reject("bad_value", say("why_a_cap_is_a_finite_number")) : null;
+  },
+  apply: (e, state) => {
+    const entity = hasEntity(state, e.entity) ? state.entities[e.entity] : undefined;
+    if (!entity || !safeKey(e.field)) return;
+    // A cap lowers only: a number already at or below it stays (`SetEvent.atMost`).
+    const current = entity.fields[e.field];
+    if (e.atMost && typeof current === "number" && typeof e.value === "number" && current <= e.value) return;
+    entity.fields[e.field] = e.value;
+  },
+  // A number a cap lowers is told: what it was and what it is held to (a number already under the cap is left as it is, and nothing is said).
+  advise: (e, ctx) => {
+    const current = e.atMost && hasEntity(ctx.state, e.entity) && safeKey(e.field) ? ctx.state.entities[e.entity]?.fields[e.field] : undefined;
+    return typeof current === "number" && typeof e.value === "number" && current > e.value ? { code: "capped", values: { entity: e.entity, field: e.field, was: current, now: e.value } } : null;
+  },
+  touches: (e) => [{ entity: e.entity, field: e.field }],
+  describe: (e, ctx) => say("ev_set", { name: nameOf(ctx, e.entity), field: e.field.replace(/_/g, " "), ...(typeof e.value === "string" || typeof e.value === "number" || typeof e.value === "boolean" ? { value: String(e.value), ...(e.atMost ? { atMost: true } : {}) } : {}) }),
+};
+
+const addDef: EventTypeDef<AddEvent> = {
+  type: "add",
+  validate: (e, ctx) => {
+    if (!hasEntity(ctx.state, e.entity)) return reject("missing_entity", say("why_no_entity_who", { who: e.entity }));
+    if (!safeKey(e.field)) return reject("bad_field", say("why_not_a_field_name"));
+    // A field that holds no number does not refuse the event: it applies and leaves the field as it is, and `advise` says so (plan §6.7).
+    return Number.isFinite(e.delta) ? null : reject("bad_delta", say("why_delta_must_be_finite"));
+  },
+  apply: (e, state) => {
+    const entity = hasEntity(state, e.entity) ? state.entities[e.entity] : undefined;
+    if (!entity || !safeKey(e.field)) return;
+    const current = entity.fields[e.field];
+    if (current !== undefined && typeof current !== "number") return;
+    entity.fields[e.field] = (current ?? 0) + e.delta;
+  },
+  advise: (e, ctx) => {
+    const current = hasEntity(ctx.state, e.entity) && safeKey(e.field) ? ctx.state.entities[e.entity]?.fields[e.field] : undefined;
+    return current !== undefined && typeof current !== "number" ? { code: "not_numeric", values: { entity: e.entity, field: e.field } } : null;
+  },
+  touches: (e) => [{ entity: e.entity, field: e.field }],
+  describe: (e, ctx) => say("ev_add", { name: nameOf(ctx, e.entity), field: e.field.replace(/_/g, " "), delta: `${e.delta >= 0 ? "+" : ""}${e.delta}` }),
+};
+
+function isAccount(state: Readonly<WorldState>, account: EntityId): boolean {
+  return account.startsWith(EXTERNAL_ACCOUNT_PREFIX) || hasEntity(state, account);
+}
+
+const postDef: EventTypeDef<PostEvent> = {
+  type: "post",
+  validate: (e, ctx) => {
+    if (e.lines.length < 2) return reject("unbalanced", say("why_a_posting_needs_two_lines"));
+    let sum = 0;
+    for (const line of e.lines) {
+      if (!Number.isSafeInteger(line.amount)) return reject("bad_amount", say("why_amounts_are_integer_cents"));
+      if (!isAccount(ctx.state, line.account)) return reject("missing_account", say("why_no_account_account", { account: line.account }));
+      sum += line.amount;
+    }
+    return sum === 0 ? null : reject("unbalanced", say("why_posting_sums_to_sum", { sum: sum }));
+  },
+  apply: (e, state) => {
+    for (const line of e.lines) if (safeKey(line.account)) state.accounts[line.account] = (hasOwn(state.accounts, line.account) ? (state.accounts[line.account] ?? 0) : 0) + line.amount;
+  },
+  touches: (e) => e.lines.filter((l) => !l.account.startsWith(EXTERNAL_ACCOUNT_PREFIX)).map((l) => ({ entity: l.account, aspect: "posted" })),
+  describe: (e) => e.memo,
+};
+
+const linkDef: EventTypeDef<LinkEvent> = {
+  type: "link",
+  // Both ends are entities, except that a `knows` link may point at a place (hearing of it, DESIGN §7).
+  validate: (e, ctx) => (hasEntity(ctx.state, e.from) && (hasEntity(ctx.state, e.to) || (e.rel === "knows" && safeKey(e.to) && hasOwn(ctx.world.places, e.to))) ? null : reject("missing_entity", say("why_link_from_to", { from: e.from, to: e.to }))),
+  apply: (e, state) => {
+    const entity = hasEntity(state, e.from) ? state.entities[e.from] : undefined;
+    if (!entity) return;
+    entity.relations = entity.relations.filter((r) => !(r.type === e.rel && r.to === e.to));
+    entity.relations.push({ type: e.rel, to: e.to, ...(e.fields ? { fields: e.fields } : {}), ...(e.until !== undefined ? { until: e.until } : {}) });
+  },
+  touches: (e) => [{ entity: e.from, rel: e.rel, to: e.to }],
+  describe: (e, ctx) => say("ev_link", { from: nameOf(ctx, e.from), rel: e.rel.replace(/_/g, " "), to: nameOf(ctx, e.to) }),
+};
+
+const unlinkDef: EventTypeDef<UnlinkEvent> = {
+  type: "unlink",
+  validate: (e, ctx) => {
+    const entity = hasEntity(ctx.state, e.from) ? ctx.state.entities[e.from] : undefined;
+    return entity && entity.relations.some((r) => r.type === e.rel && r.to === e.to) ? null : reject("missing_relation", say("why_no_rel_from_from_to_to", { rel: e.rel, from: e.from, to: e.to }));
+  },
+  apply: (e, state) => {
+    const entity = hasEntity(state, e.from) ? state.entities[e.from] : undefined;
+    if (entity) entity.relations = entity.relations.filter((r) => !(r.type === e.rel && r.to === e.to));
+  },
+  touches: (e) => [{ entity: e.from, rel: e.rel, to: e.to }],
+  describe: (e, ctx) => say("ev_unlink", { from: nameOf(ctx, e.from), rel: e.rel.replace(/_/g, " "), to: nameOf(ctx, e.to) }),
+};
+
+const spawnDef: EventTypeDef<SpawnEvent> = {
+  type: "spawn",
+  validate: (e, ctx) => (!safeKey(e.entity.id) ? reject("bad_id", say("why_not_an_entity_id")) : hasEntity(ctx.state, e.entity.id) ? reject("exists", say("why_entity_id_exists", { id: e.entity.id })) : null),
+  apply: (e, state) => {
+    const d = e.entity;
+    if (!safeKey(d.id)) return;
+    state.entities[d.id] = {
+      kind: d.kind,
+      name: d.name,
+      tier: d.tier,
+      fields: structuredClone(d.fields),
+      relations: structuredClone(d.relations),
+      levels: { ...(d.levels ?? {}) },
+      agent: d.agent === true,
+      // Only when given, so a spawn without them folds to the same state as before they existed.
+      ...(d.class ? { class: structuredClone(d.class) } : {}),
+      ...(d.tags ? { tags: [...d.tags] } : {}),
+    };
+  },
+  touches: (e) => [{ entity: e.entity.id, aspect: "spawned" }],
+  describe: (e) => say("entity_appears", { name: e.entity.name }),
+};
+
+const stageDef: EventTypeDef<StageEvent> = {
+  type: "stage",
+  validate: (e, ctx) => {
+    const track = safeKey(e.track) && hasOwn(ctx.world.tracks, e.track) ? ctx.world.tracks[e.track] : undefined;
+    if (!track) return reject("missing_track", say("why_no_track_track", { track: e.track }));
+    if (!safeKey(e.to) || !hasOwn(track.stages, e.to)) return reject("missing_stage", say("why_no_stage_to_in_track", { to: e.to, track: e.track }));
+    if (e.from === undefined) return null;
+    // A move holds only where the track still stands where it moved from (DESIGN §10): replayed after
+    // the story got there another way, it isn't made, and paid for, twice.
+    const at = (hasOwn(ctx.state.tracks, e.track) ? ctx.state.tracks[e.track]?.stage : undefined) ?? track.start;
+    if (at === e.from) return null;
+    const label = (stage: string): string => (hasOwn(track.stages, stage) ? track.stages[stage]?.label : undefined) ?? stage;
+    return reject("stage_moved", say("why_track_is_at_at_now_no_longer", { track: track.label, at: label(at), from: label(e.from) }));
+  },
+  apply: (e, state) => {
+    if (safeKey(e.track)) state.tracks[e.track] = { stage: e.to, since: typeof e.since === "number" ? e.since : state.clock };
+  },
+  // Labels, not ids; whether the player may see a track's stages is the caller's check (eventVisible).
+  describe: (e, ctx) => {
+    const track = hasOwn(ctx.world.tracks, e.track) ? ctx.world.tracks[e.track] : undefined;
+    const stage = track && hasOwn(track.stages, e.to) ? track.stages[e.to]?.label : undefined;
+    return say("ev_stage", { ...(track?.label !== undefined ? { track: track.label } : {}), ...(stage !== undefined ? { stage } : {}) });
+  },
+};
+
+// The clock is summed in whole seconds (`clockPlus`): a part of a minute is kept exactly, and a sum of any number of them never reads the minute before.
+const clockDef: EventTypeDef<ClockEvent> = {
+  type: "clock",
+  validate: (e) => (Number.isFinite(e.minutes) && e.minutes >= 0 ? null : reject("bad_minutes", say("why_minutes_must_be_0"))),
+  apply: (e, state) => {
+    state.clock = clockPlus(state.clock, e.minutes);
+  },
+  describe: (e) => {
+    const seconds = clockSeconds(e.minutes);
+    return seconds % 60 === 0 ? say("ev_clock_min", { min: seconds / 60 }) : seconds < 60 ? say("ev_clock_s", { s: seconds }) : say("ev_clock_min_s", { min: Math.floor(seconds / 60), s: seconds % 60 });
+  },
+};
+
+const timelapseDef: EventTypeDef<TimelapseEvent> = {
+  type: "timelapse",
+  validate: (e) => (e.to >= e.from ? null : reject("bad_interval", say("why_timelapse_ends_before_it_starts"))),
+  apply: () => undefined,
+  describe: (e) => say("ev_timelapse", { minutes: e.to - e.from }),
+};
+
+/** Registers the core event types; `materialize` needs the full table to validate nested events. */
+export function coreEventTypes(lookup: () => EventTypes): EventTypeDef[] {
+  const materializeDef: EventTypeDef<MaterializeEvent> = {
+    type: "materialize",
+    validate: (e, ctx) => {
+      if (!hasEntity(ctx.state, e.entity)) return reject("missing_entity", say("why_no_entity_who", { who: e.entity }));
+      // Detail is sampled once per entity and domain (DESIGN §9.2): a second one, such as a carried
+      // ✎ cash fix's when the new swipe already opened the accounts, would post their opening again.
+      if (hasOwn(ctx.state.materialized, `${e.entity}:${e.domain}`)) return reject("materialized", say("why_domain_detail_for_entity_is_already_recorded", { domain: e.domain, entity: nameOf(ctx, e.entity) }));
+      // Nested events validate in sequence against the state they will see: a lone one sees the
+      // state as it is, so only several need a scratch copy, and the last of them needs no applying.
+      if (e.events.length <= 1) return e.events[0] ? validateEvent(lookup(), e.events[0], ctx) : null;
+      const scratch = structuredClone(ctx.state) as WorldState;
+      for (const [i, inner] of e.events.entries()) {
+        const failure = validateEvent(lookup(), inner, { ...ctx, state: scratch });
+        if (failure) return failure;
+        if (i < e.events.length - 1) applyEvent(lookup(), inner, scratch, { ...ctx, state: scratch });
+      }
+      return null;
+    },
+    apply: (e, state, ctx) => {
+      for (const inner of e.events) applyEvent(lookup(), inner, state, ctx);
+      state.materialized[`${e.entity}:${e.domain}`] = { generatorVersion: e.generatorVersion, tablesRevision: e.tablesRevision };
+    },
+    describe: (e) => say("ev_materialized", { entity: e.entity, domain: e.domain }),
+  };
+  const defs: EventTypeDef<CoreEvent>[] = [setDef, addDef, postDef, linkDef, unlinkDef, spawnDef, stageDef, clockDef, materializeDef, timelapseDef];
+  return defs as EventTypeDef[];
+}
+
+export function validateEvent(types: EventTypes, event: LedgerEvent, ctx: ReadContext): Rejection | null {
+  const def = types.get(event.type);
+  if (!def) return reject("unknown_event", say("why_unknown_event_type_type", { type: event.type }));
+  return def.validate(event, ctx);
+}
+
+/** What an event that validated will apply with, and says did not add up: asked on the state it will see, before it applies. Null when it advises nothing. */
+export function adviseEvent(types: EventTypes, event: LedgerEvent, ctx: ReadContext): Advice | null {
+  return types.get(event.type)?.advise?.(event, ctx) ?? null;
+}
+
+/** The core types that keep where everyone is as they apply: a move re-reads the one it moves (`observing`), the rest move nobody. */
+const KEEP_WHEREABOUTS = new Set(["set", "add", "post", "link", "unlink", "spawn", "stage", "clock", "timelapse", "materialize"]);
+
+export function applyEvent(types: EventTypes, event: LedgerEvent, state: WorldState, ctx: ReadContext): void {
+  const def = types.get(event.type);
+  if (def) def.apply(event, state, ctx);
+  // What a read pass kept for the state no longer holds (DESIGN §9.6).
+  dropPassMemo(state);
+  // A pack's event may move anyone, and a number added to a place moves its holder off it: where everyone is is read afresh.
+  if (!KEEP_WHEREABOUTS.has(event.type) || (event.type === "add" && event.field === "place")) forgetWhereabouts(state);
+}
+
+/**
+ * A list's units as `[from, to)` index ranges: a run of contiguous events that share a `group`,
+ * else one event (DESIGN §4.3, with event groups).
+ */
+export function eventUnits(events: readonly LedgerEvent[]): [number, number][] {
+  const out: [number, number][] = [];
+  let i = 0;
+  while (i < events.length) {
+    const group = events[i]?.group;
+    let j = i + 1;
+    if (group !== undefined) while (j < events.length && events[j]?.group === group) j++;
+    out.push([i, j]);
+    i = j;
+  }
+  return out;
+}
+
+/**
+ * The unit a unit kept apart stands with (`APART_GROUP`): the one right after it whose group it
+ * names, as `[from, to)`; null for any other unit.
+ */
+export function apartHost(events: readonly (LedgerEvent | undefined)[], [from, to]: [number, number]): [number, number] | null {
+  const group = events[from]?.group;
+  if (group === undefined || !group.startsWith(APART_GROUP) || events[to]?.group !== group.slice(APART_GROUP.length)) return null;
+  let end = to + 1;
+  while (end < events.length && events[end]?.group === events[to]?.group) end++;
+  return [to, end];
+}
+
+/** The groups a unit is tied to (`EventBase.tiedTo`), every member's. */
+export function tiesOf(unit: readonly { tiedTo?: readonly string[] }[]): string[] {
+  return [...new Set(unit.flatMap((ev) => ev.tiedTo ?? []))];
+}
+
+/** Why a rebased view drops a unit tied to one it dropped (`EventBase.tiedTo`). */
+export const TIED_DROP = "what it was made to put right didn't happen here";
+
+/**
+ * Applies, in order, each unit whose events all validate; a unit with any failing member is
+ * skipped whole. A unit kept apart (`APART_GROUP`) is tried with the unit it stands with: both
+ * apply if both fit, else that unit is tried alone and the one kept apart is skipped. A unit tied
+ * to one skipped before it (`EventBase.tiedTo`) is skipped too. Returns the events applied. Plans,
+ * reads and prefix replays use it.
+ */
+export function applyValidUnits(types: EventTypes, events: readonly LedgerEvent[], state: WorldState, context: (state: Readonly<WorldState>) => ReadContext): LedgerEvent[] {
+  const out: LedgerEvent[] = [];
+  // The groups of the units skipped so far.
+  const skipped = new Set<string>();
+  const fits = (unit: readonly LedgerEvent[]): boolean => {
+    const scratch = structuredClone(state);
+    return unit.every((ev) => {
+      const ctx = context(scratch);
+      if (validateEvent(types, ev, ctx)) return false;
+      applyEvent(types, ev, scratch, ctx);
+      return true;
+    });
+  };
+  const apply = (unit: readonly LedgerEvent[]): void => {
+    for (const ev of unit) {
+      applyEvent(types, ev, state, context(state));
+      out.push(ev);
+    }
+  };
+  const skip = (unit: readonly LedgerEvent[]): void => {
+    const group = unit[0]?.group;
+    if (group !== undefined) skipped.add(group);
+  };
+  const units = eventUnits(events);
+  for (let u = 0; u < units.length; u++) {
+    const [from, to] = units[u] ?? [0, 0];
+    const unit = events.slice(from, to);
+    const host = apartHost(events, [from, to]);
+    if (host) {
+      const hosted = events.slice(host[0], host[1]);
+      if (fits([...unit, ...hosted])) apply([...unit, ...hosted]);
+      else {
+        skip(unit);
+        if (fits(hosted)) apply(hosted);
+        else skip(hosted);
+      }
+      u++;
+      continue;
+    }
+    if (tiesOf(unit).some((t) => skipped.has(t))) {
+      skip(unit);
+      continue;
+    }
+    if (unit.length > 1) {
+      if (fits(unit)) apply(unit);
+      else skip(unit);
+      continue;
+    }
+    for (const ev of unit) {
+      const ctx = context(state);
+      if (validateEvent(types, ev, ctx)) {
+        skip(unit);
+        break;
+      }
+      applyEvent(types, ev, state, ctx);
+      out.push(ev);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- markers
+
+export const TIME_CONTROLS: readonly TimeControl[] = ["tick", "scale", "pause", "interrupt", "speed_through", "montage", "unit_cap"];
+/** Controls earlier builds wrote: a stored marker stays valid, with its body as it was clamped then (record paths hash it). */
+const RETIRED_TIME_CONTROLS: readonly RetiredTimeControl[] = ["npc_calls"];
+
+/** Bounds for time controls (DESIGN §9.2): minutes per tick, the time scale, the Speed-through threshold and the unit cap. */
+export const TIME_BOUNDS = Object.freeze({ tick: [0, 1440], scale: [0.25, 10], thresholdMinutes: SPEED_THRESHOLD_MINUTES, agentDays: [1, 600], events: [1, 5000] } as const);
+
+function clamp(v: number, [lo, hi]: readonly [number, number], integer = true): number {
+  const x = Math.min(hi, Math.max(lo, v));
+  return integer ? Math.round(x) : x;
+}
+
+/** A time control's value, clamped to its bounds; undefined when it isn't that control's shape. */
+function timeValue(control: TimeControl | RetiredTimeControl, to: unknown): JsonValue | undefined {
+  const num = typeof to === "number" && Number.isFinite(to) ? to : null;
+  switch (control) {
+    case "tick":
+      return num === null ? undefined : clamp(num, TIME_BOUNDS.tick);
+    case "scale":
+      return num === null ? undefined : clamp(num, TIME_BOUNDS.scale, false);
+    case "npc_calls":
+      // Retired: read as the earlier build clamped it.
+      return num === null ? undefined : clamp(num, [0, 50]);
+    case "pause":
+      return typeof to === "boolean" ? to : undefined;
+    case "interrupt":
+      return to === "stop" || to === "note" || to === "ignore" ? to : undefined;
+    case "montage":
+      return to === "key" || to === "day" || to === "week" ? to : undefined;
+    case "speed_through":
+      return isRecord(to) && (to.mode === "offer" || to.mode === "auto") && typeof to.thresholdMinutes === "number" && Number.isFinite(to.thresholdMinutes) ? { mode: to.mode, thresholdMinutes: clamp(to.thresholdMinutes, TIME_BOUNDS.thresholdMinutes) } : undefined;
+    case "unit_cap":
+      return isRecord(to) && typeof to.agentDays === "number" && typeof to.events === "number" && Number.isFinite(to.agentDays) && Number.isFinite(to.events) ? { agentDays: clamp(to.agentDays, TIME_BOUNDS.agentDays), events: clamp(to.events, TIME_BOUNDS.events) } : undefined;
+  }
+}
+
+/** The most picks one Upgrade marker may carry: it is stored on a message, so it stays small. */
+export const UPGRADE_PICKS_MAX = 5000;
+
+function isPick(v: unknown): v is UpgradePick {
+  return v === "take" || v === "keep";
+}
+
+/**
+ * An Upgrade's picks from outside: entity, field, relation type and target keys must be safe map
+ * keys and every pick one of its values. Anything else, or more than `UPGRADE_PICKS_MAX` picks,
+ * makes the whole marker invalid, since a pick quietly dropped could take a value the owner meant
+ * to keep. Entities left with no picks are dropped.
+ */
+function validPicks(raw: unknown): UpgradePicks | null {
+  if (!isRecord(raw)) return null;
+  const out: UpgradePicks = {};
+  let count = 0;
+  for (const [id, p] of Object.entries(raw)) {
+    if (!safeKey(id) || !isRecord(p)) return null;
+    const picks: EntityPicks = {};
+    for (const [key, v] of Object.entries(p)) {
+      if (key === "entity") {
+        if (v !== "take" && v !== "keep" && v !== "remove") return null;
+        picks.entity = v;
+        count++;
+      } else if (key === "fields") {
+        if (!isRecord(v)) return null;
+        const fields: Record<string, UpgradePick> = {};
+        for (const [field, pick] of Object.entries(v)) {
+          if (!safeKey(field) || !isPick(pick)) return null;
+          fields[field] = pick;
+          count++;
+        }
+        if (Object.keys(fields).length > 0) picks.fields = fields;
+      } else if (key === "relations") {
+        if (!isRecord(v)) return null;
+        const relations: Record<string, Record<string, UpgradePick>> = {};
+        for (const [rel, targets] of Object.entries(v)) {
+          if (!safeKey(rel) || !isRecord(targets)) return null;
+          const byTarget: Record<string, UpgradePick> = {};
+          for (const [to, pick] of Object.entries(targets)) {
+            if (!safeKey(to) || !isPick(pick)) return null;
+            byTarget[to] = pick;
+            count++;
+          }
+          if (Object.keys(byTarget).length > 0) relations[rel] = byTarget;
+        }
+        if (Object.keys(relations).length > 0) picks.relations = relations;
+      } else {
+        const aspect = UPGRADE_ASPECTS.find((a) => a === key);
+        if (!aspect || !isPick(v)) return null;
+        picks[aspect] = v;
+        count++;
+      }
+      if (count > UPGRADE_PICKS_MAX) return null;
+    }
+    if (Object.keys(picks).length > 0) out[id] = picks;
+  }
+  return out;
+}
+
+/**
+ * A marker body from outside (a request, a stored or imported ledger), checked and clamped; null
+ * when it isn't one. Domains, bands and interrupt classes come from their fixed lists; entity,
+ * scene type and activity keys must be safe map keys; levels are whole numbers 0–4; an Upgrade's
+ * picks pass `validPicks`.
+ */
+export function validMarkerBody(raw: unknown): MarkerBody | null {
+  if (!isRecord(raw)) return null;
+  const scope = isRecord(raw.scope) ? raw.scope : null;
+  switch (raw.kind) {
+    case "migrate": {
+      if (typeof raw.to !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(raw.to)) return null;
+      if (raw.merge === undefined) return { kind: "migrate", to: raw.to };
+      const merge = validPicks(raw.merge);
+      return merge ? { kind: "migrate", to: raw.to, merge } : null;
+    }
+    case "resolve": {
+      const domain = DOMAINS.find((d) => d === raw.domain);
+      const to = raw.to;
+      if (!domain || !scope || typeof to !== "number" || !Number.isInteger(to) || to < 0 || to > 4) return null;
+      const level = to as Level;
+      if (scope.all === true) return { kind: "resolve", domain, scope: { all: true }, to: level };
+      const band = BANDS.find((b) => b === scope.tier);
+      if (band) return { kind: "resolve", domain, scope: { tier: band }, to: level };
+      return safeKey(scope.entity) ? { kind: "resolve", domain, scope: { entity: scope.entity }, to: level } : null;
+    }
+    case "time": {
+      const control = [...TIME_CONTROLS, ...RETIRED_TIME_CONTROLS].find((c) => c === raw.control);
+      if (!control || !scope) return null;
+      const to = timeValue(control, raw.to);
+      if (to === undefined) return null;
+      if (scope.all === true) return { kind: "time", control, scope: { all: true }, to };
+      if (safeKey(scope.sceneType)) return { kind: "time", control, scope: { sceneType: scope.sceneType }, to };
+      if (safeKey(scope.activity)) return { kind: "time", control, scope: { activity: scope.activity }, to };
+      const interrupt = INTERRUPT_CLASSES.find((c) => c === scope.interrupt);
+      return interrupt ? { kind: "time", control, scope: { interrupt }, to } : null;
+    }
+    case "adjudicate": {
+      if (raw.to === null) return { kind: "adjudicate", to: null };
+      const to = readAdjudication(raw.to);
+      return to ? { kind: "adjudicate", to } : null;
+    }
+    case "claims": {
+      if (raw.to === null) return { kind: "claims", to: null };
+      const to = readClaims(raw.to);
+      return to ? { kind: "claims", to } : null;
+    }
+    // Retired: how typed attempts were read as checks. It parses so a ledger that holds one still folds, and carries nothing.
+    case "infer":
+      return { kind: "infer", to: null };
+    default:
+      return null;
+  }
+}
+
+function setTimeControl(state: WorldState, body: Extract<MarkerBody, { kind: "time" }>): void {
+  const t = state.time;
+  const scope = body.scope;
+  const to = body.to;
+  switch (body.control) {
+    case "tick":
+      if ("sceneType" in scope && typeof to === "number") t.sceneTicks[scope.sceneType] = to;
+      return;
+    case "scale":
+      if (typeof to === "number") t.scale = to;
+      return;
+    case "pause":
+      if (typeof to !== "boolean") return;
+      t.paused = to;
+      // Pausing holds the clock in the scene where it is pressed, even over a pause left behind in another.
+      if (to) unpinPause(state);
+      return;
+    case "interrupt":
+      if ("interrupt" in scope && (to === "stop" || to === "note" || to === "ignore")) t.interrupts[scope.interrupt] = to;
+      return;
+    case "speed_through":
+      if ("activity" in scope && isRecord(to) && (to.mode === "offer" || to.mode === "auto") && typeof to.thresholdMinutes === "number") {
+        t.speedThrough[scope.activity] = { mode: to.mode, thresholdMinutes: to.thresholdMinutes };
+      }
+      return;
+    case "montage":
+      if (to === "key" || to === "day" || to === "week") t.montage = to;
+      return;
+    case "unit_cap":
+      if (isRecord(to) && typeof to.agentDays === "number" && typeof to.events === "number") t.unitCap = { agentDays: to.agentDays, events: to.events };
+      return;
+    case "npc_calls":
+      // Retired: nothing reads it.
+      return;
+  }
+}
+
+function setLevel(state: WorldState, domain: DomainId, scope: Extract<MarkerBody, { kind: "resolve" }>["scope"], to: Level): void {
+  if ("all" in scope) state.realism.levels[domain] = to;
+  else if ("tier" in scope) {
+    if (hasOwn(state.realism.tierCaps, scope.tier)) state.realism.tierCaps[scope.tier][domain] = to;
+  } else {
+    const entity = hasEntity(state, scope.entity) ? state.entities[scope.entity] : undefined;
+    if (!entity) return;
+    entity.levels[domain] = to;
+    // A level set for one entity in play is a change an Upgrade keeps by default.
+    touch(state, { entity: scope.entity, aspect: "levels" });
+  }
+}
+
+/**
+ * Applies a marker's intent and returns the Journal notes it makes. `migrate` switches the revision
+ * in force; with picks it also merges the revision's definition changes into the state, reading the
+ * revisions through `env` (`upgrade.ts`). The body is re-checked here, so a marker that slipped past
+ * the write path (an old or imported ledger) can never index state with an unchecked key.
+ */
+export function applyMarker(state: WorldState, raw: Exclude<MarkerBody, { kind: "migrate" }>): string[];
+export function applyMarker(state: WorldState, raw: MarkerBody, env: MarkerEnv): string[];
+export function applyMarker(state: WorldState, raw: MarkerBody, env?: MarkerEnv): string[] {
+  const body = validMarkerBody(raw);
+  if (!body) return [];
+  switch (body.kind) {
+    case "migrate":
+      if (!env) throw new Error("an Upgrade marker needs the world revisions to apply");
+      return migrate(state, body, env);
+    case "resolve":
+      setLevel(state, body.domain, body.scope, body.to);
+      return [];
+    case "time":
+      setTimeControl(state, body);
+      return [];
+    case "adjudicate":
+      if (body.to === null) delete state.adjudication;
+      else state.adjudication = body.to;
+      return [];
+    case "claims":
+      if (body.to === null) delete state.claims;
+      else state.claims = body.to;
+      return [];
+    case "infer":
+      // Retired: nothing reads it.
+      return [];
+  }
+}

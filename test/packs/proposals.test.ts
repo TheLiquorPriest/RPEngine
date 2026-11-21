@@ -1,0 +1,161 @@
+// Narration proposals the extractor makes from real replies: uncatalogued purchases at their
+// narrated price, NPCs handing over untracked items, and "Pay another way" retries.
+import { describe, expect, test } from "bun:test";
+import { applyEffects } from "../../src/engine/effects";
+import { createRegistry } from "../../src/engine/registry-impl";
+import { resolveAction } from "../../src/engine/resolve";
+import { createRng } from "../../src/engine/rng";
+import { Working } from "../../src/engine/working";
+import { materializeAll } from "../../src/engine/materialize";
+import { ALL_PACKS } from "../../src/packs/index";
+import type { ReadContext } from "../../src/engine/registry";
+import { unpricedCap } from "../../src/packs/economy/core/model";
+import { isRecord, type JsonObject } from "../../src/shared/json";
+import { buildGearView } from "../../src/packs/gear/core/view";
+import { modernUsWorld } from "./riverton";
+import { startState } from "./support";
+
+/** The POV's money as the Money panel shows it. */
+const moneyView = (ctx: ReadContext) => ctx.query("economy.finance")(ctx, ctx.world.pov, true);
+
+const reg = createRegistry(ALL_PACKS);
+
+function setup(): Working {
+  const world = modernUsWorld("p", "R");
+  const w = new Working(reg, world, startState(world));
+  materializeAll(reg, w, world.pov, "run");
+  return w;
+}
+
+/** A proposal through its channel as the read applies it (`applyProposals`): whole, its type in it, which the thing facts' channels read the fact from. */
+function propose(w: Working, type: string, p: JsonObject): ReturnType<typeof applyEffects> | string {
+  const proposal = { type, ...p };
+  const ch = reg.proposals.get(type);
+  const bad = ch?.validate(proposal, w.ctx);
+  if (bad) return bad.code;
+  return applyEffects(reg, w, ch?.toEffects(proposal, w.ctx) ?? [], { bindings: {}, rng: createRng("p") });
+}
+
+describe("narration proposals", () => {
+  test("an uncatalogued purchase is charged at its narrated price (capped at the world's unpricedCap); without a price it is owned with nothing charged until one is set", () => {
+    const world = modernUsWorld("p", "R");
+    const economy = world.packs.economy;
+    if (economy) economy.config = { ...economy.config, unpricedCap: 50_000 };
+    const w = new Working(reg, world, startState(world));
+    materializeAll(reg, w, world.pov, "run");
+    const gum = { type: "purchase", item: "gum", name: "a pack of gum" };
+    expect(w.ctx.query("economy.unpriced")(w.ctx, gum)).toBe(true);
+    const before = structuredClone(w.state.accounts);
+    const owned = propose(w, "purchase", gum);
+    expect(typeof owned === "string" ? owned : owned.rejected).toEqual([]);
+    expect(w.state.accounts).toEqual(before);
+    expect(Object.values(w.state.entities).filter((e) => e.name === "a pack of gum" && e.fields.owner === "you")).toHaveLength(1);
+    // Priced on its chip, only its charge is made: no second pack.
+    const charged = propose(w, "purchase", { ...gum, playerPrice: 200, owned: true });
+    expect(typeof charged === "string" ? charged : charged.rejected).toEqual([]);
+    expect(Object.values(w.state.entities).filter((e) => e.name === "a pack of gum")).toHaveLength(1);
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Bought a pack of gum")?.cents).toBe(-214);
+    const r = propose(w, "purchase", { item: "gum", name: "a pack of gum", price: 200 });
+    expect(typeof r === "string" ? r : r.rejected).toEqual([]);
+    // $2 and its 7% sales tax, at the top Money level.
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Bought a pack of gum")?.cents).toBe(-214);
+    propose(w, "purchase", { item: "antique astrolabe", price: 9_000_000 });
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Bought antique astrolabe")?.cents).toBe(-53_500);
+  });
+
+  test("without an authored cap, the cap is the dearest catalog row's top price, else 500 of the currency", () => {
+    const world = modernUsWorld("p", "R");
+    const rows = Object.values(world.tables["economy.catalog"]?.rows ?? {});
+    const dearest = Math.max(...rows.map((row) => (isRecord(row.price_cents) && typeof row.price_cents.max === "number" ? row.price_cents.max : 0)));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(unpricedCap(world)).toBe(dearest);
+    expect(unpricedCap({ ...world, tables: {} })).toBe(500 * 10 ** world.currency.decimals);
+  });
+
+  test("an NPC can hand the POV an item the world didn't track: made as the giver's and held for them, or the POV's when it's a gift (ITEMS-SPEC §4.6); the POV can't give what it doesn't have", () => {
+    const w = setup();
+    const made = (name: string) => Object.values(w.state.entities).find((e) => e.name.toLowerCase() === name);
+    const r = propose(w, "give", { item: "thermos", from: "maya", to: "you" });
+    expect(typeof r === "string" ? r : r.rejected).toEqual([]);
+    // No giving words: it stays Maya's, and the POV holds it for her.
+    expect([made("thermos")?.fields.owner, made("thermos")?.relations.some((l) => l.type === "in" && l.to === "you")]).toEqual(["maya", true]);
+    const gift = propose(w, "give", { item: "scarf", from: "maya", to: "you", basis: "gift" });
+    expect(typeof gift === "string" ? gift : gift.rejected).toEqual([]);
+    expect([made("scarf")?.fields.owner, made("scarf")?.relations.some((l) => l.type === "in" && l.to === "you")]).toEqual(["you", true]);
+    expect(propose(w, "give", { item: "sandwich", from: "you", to: "maya" })).toBe("missing_entity");
+  });
+
+  test("Pay another way: a purchase retried with a method or a specific account pays from it", () => {
+    const w = setup();
+    const r = propose(w, "purchase", { category: "electronics", name: "a speaker", method: "savings" });
+    expect(typeof r === "string" ? r : r.rejected).toEqual([]);
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Bought a speaker")?.account).toBe("Savings");
+    const s = propose(w, "purchase", { category: "electronics", name: "a cable", from: "card" });
+    expect(typeof s === "string" ? s : s.rejected).toEqual([]);
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Bought a cable")?.account).toBe("Visa card");
+  });
+
+  test("the Buy action takes an optional stated price: an uncatalogued item at that price, a catalog item without one", () => {
+    const w = setup();
+    const gum = resolveAction(reg, w, { action: "buy", params: { item: "gum", price: 200 } }, createRng("g"));
+    expect(gum.rejected).toEqual([]);
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Bought gum")?.cents).toBe(-214);
+    const milk = resolveAction(reg, w, { action: "buy", params: { item: "milk_whole" } }, createRng("m"));
+    expect(milk.ok).toBe(true);
+    expect(milk.rejected).toEqual([]);
+    // The player's own stated price isn't capped like a narrated one: above what they can pay, it declines.
+    const outboard = resolveAction(reg, w, { action: "buy", params: { item: "spare outboard engine", price: 900_000 } }, createRng("o"));
+    expect(outboard.rejected[0]?.rejection.code).toBe("declined");
+    expect(moneyView(w.ctx).recent.some((t) => t.memo === "Bought spare outboard engine")).toBe(false);
+    const surfboard = resolveAction(reg, w, { action: "buy", params: { item: "used surfboard", price: 90_000 } }, createRng("s"));
+    expect(surfboard.rejected).toEqual([]);
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Bought used surfboard")?.cents).toBe(-96_300);
+    // A kayak is a vehicle class: bought at the stated price, inside its band, as a kayak of the POV's.
+    const kayak = resolveAction(reg, w, { action: "buy", params: { item: "kayak", price: 90_000 } }, createRng("k"));
+    expect(kayak.rejected).toEqual([]);
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Bought Kayak or canoe (paddled, 1-2 seats)")?.cents).toBe(-96_300);
+    expect(Object.values(w.state.entities).filter((e) => e.kind === "vehicle" && e.fields.class === "kayak").map((e) => [e.fields.owner, e.fields.value])).toEqual([["you", 90_000]]);
+  });
+
+  test("free-text buys match a catalog row, preferring what the place sells: beers at a bar are pints", () => {
+    const w = setup();
+    w.world.places.cafe!.fields.tags = ["bar"];
+    w.state.entities.you!.fields.place = "cafe";
+    const beer = resolveAction(reg, w, { action: "buy", params: { item: "a round of beers" } }, createRng("b"));
+    expect(beer.rejected).toEqual([]);
+    expect(moneyView(w.ctx).recent.some((t) => t.memo.startsWith("Bought Beer at a bar"))).toBe(true);
+    expect(w.ctx.query("economy.unpriced")(w.ctx, { type: "purchase", item: "beers" })).toBe(false);
+    expect(resolveAction(reg, w, { action: "buy", params: { item: "a unicorn" } }, createRng("u")).rejected[0]?.rejection.code).toBe("unpriced");
+    const pizza = resolveAction(reg, w, { action: "buy", params: { item: "a large pepperoni pizza for delivery" } }, createRng("p"));
+    expect(pizza.rejected).toEqual([]);
+    expect(moneyView(w.ctx).recent.some((t) => t.memo.startsWith("Bought Pizza, large"))).toBe(true);
+  });
+
+  test("losing the wallet loses the cash in it, posted out of the books; the wallet shows as lost", () => {
+    const w = setup();
+    const cashBefore = moneyView(w.ctx).accounts.find((a) => a.id === "cash")?.cents ?? 0;
+    expect(cashBefore).toBeGreaterThan(0);
+    const lost = resolveAction(reg, w, { action: "lose", params: { item: "wallet" } }, createRng("l"));
+    expect(lost.rejected).toEqual([]);
+    expect(moneyView(w.ctx).accounts.find((a) => a.id === "cash")?.cents).toBe(0);
+    expect(moneyView(w.ctx).recent.find((t) => t.memo === "Lost with Wallet")?.cents).toBe(-cashBefore);
+    expect(w.state.entities.wallet?.relations.some((r) => r.type === "in")).toBe(false);
+    expect(buildGearView(w.ctx).elsewhere.find((i) => i.id === "wallet")?.where).toBe("Lost");
+    // Already lost: the palette no longer offers it (the effect would refuse it too).
+    expect(resolveAction(reg, w, { action: "lose", params: { item: "wallet" } }, createRng("l2")).failed?.requirement).toBe("item.lost != true");
+  });
+
+  test("economy.offers lists what the place sells, quoted there, in a stable order", () => {
+    const w = setup();
+    w.world.places.cafe!.fields.tags = ["cafe"];
+    w.state.entities.you!.fields.place = "cafe";
+    const offers = w.ctx.query("economy.offers")(w.ctx, "you");
+    expect(offers.length).toBeGreaterThan(0);
+    expect(offers.length).toBeLessThanOrEqual(24);
+    expect(new Set(offers.map((o) => o.category))).toEqual(new Set(["coffee", "meals_out"].filter((c) => offers.some((o) => o.category === c))));
+    expect(offers.every((o) => o.cents > 0 && o.name !== "")).toBe(true);
+    expect(w.ctx.query("economy.offers")(w.ctx, "you")).toEqual(offers);
+    w.state.entities.you!.fields.place = "park";
+    expect(w.ctx.query("economy.offers")(w.ctx, "you")).toEqual([]);
+  });
+});

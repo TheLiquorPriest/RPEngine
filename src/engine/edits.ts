@@ -1,0 +1,944 @@
+// Typed edits (DESIGN §7 GM edits, §12 ✎ fixes): what a ✎ fix or a GM edit writes, as events.
+// Each operation is checked against what it touches (a field's type, enum values, min and max, a
+// pool's evaluated max, derived and locked fields; a relation type's kinds and fields; a tier, a
+// place, a track's stages; the world's facets and their values) and then resolved through the core
+// effects, so the event validators and pack guards apply, money moves against the outside
+// correction account and a change to XP moves the level with it, as anywhere else (a level itself
+// is never written: it follows XP). Values are literals: a typed "=1+1" is text, never a formula.
+// A submit applies all or none and is one `fix` post entry on the head (§4.3), so undo, Keep,
+// swipes, Re-narrate and Re-run treat it like any fix. The entry keeps what it asked for, so one
+// that waited out a reply, or that a read now follows, is resolved again from it (`resolveFix`).
+// An agent's GM edit (AGENT-LOOP-PLAN §4, §15) is such a submit too, and may carry more than the
+// GM editor does: workspace changes (a file written, removed, moved with its pin, pinned or not,
+// DESIGN §4.4) and the clock set as its ✎ fix sets it, each as the events those make, in order.
+// A thing's changes are the things model's item ops (ITEMS-SPEC §3.5, `engine/thing-ops`), and so
+// is any move of a thing an older operation asks for (`put`, `move`, `link in`, `unlink in`, `set
+// place`): through the one location writer and its size rules; a player's ✎ on a thing of theirs
+// (`fix_item`) is one too, under the player's rules. A place made in play is the space pack's
+// (`space.place_op`), and an organization's change the orgs pack's (`orgs.op`, ORG-SPEC §7.2).
+
+import { hashParts } from "../shared/hash";
+import type { EntityId, FieldId } from "../shared/ids";
+import { BANDS, DOMAINS } from "../shared/ids";
+import type { JsonObject, JsonValue } from "../shared/json";
+import { hasOwn, isRecord, safeKey } from "../shared/json";
+import type { FixDirective, FixOp, LedgerEvent, PostEntry, WorkspaceOp } from "../shared/ledger";
+import type { Holding, MindLengths } from "../shared/minds";
+import type { EditOp } from "../shared/edit-ops";
+import { isBlobHash, isWorkspacePath } from "../shared/stores";
+import type { ChatScheduleChange, RoutineEntry } from "../shared/routines";
+import { ROUTINE_AWARENESS, ROUTINE_MODES, ROUTINE_ROLES, SKIP_LIVES } from "../shared/routines";
+import { isBand, tierOf } from "../shared/tiers";
+import type { EffectSpec, FieldDef, FieldType, WorldDoc } from "../shared/world";
+import { BUILTIN_RELATIONS, formatMoney, readSectionFeed, spanRecords } from "../shared/world";
+import { makeFieldsOf, parseItemFix, parseItemOp, parsePlaceOp, type ItemFix, type Spot } from "../shared/things";
+import { parseOrgOp } from "../shared/org-ops";
+import { FEED_EVENT } from "./feed";
+import { calendarOf, slotIndexAt } from "./calendar";
+import { parseDice } from "./dice";
+import { applyEffects, fieldBounds } from "./effects";
+import { ENGINE_EVENTS } from "./engine-pack";
+import { EXTERNAL_ACCOUNT_PREFIX } from "./events";
+import { labelOf, optionalQuery, optionalService, own } from "./pack-kit";
+import type { Rejection } from "./registry";
+import type { Registry } from "./registry-impl";
+import { materializeIfNeeded } from "./materialize";
+import { createRng, type Rng } from "./rng";
+import { fieldDef, GONE_FIELD, isGone, kindDef, kindIs, placeOfEntity } from "./scope";
+import { classOf, classProblems, classValues, tagsOf } from "./selector";
+import type { WorldState } from "./state";
+import { clockFix } from "./time";
+import { moveTrack } from "./tracks";
+import { Working } from "./working";
+import { workspaceOf, workspacePins, wsDelete, wsPin, wsWrite } from "./workspace";
+import { applyItemOp, type ItemOpOptions } from "./thing-ops";
+import { accessFor } from "./access";
+import { counterpartOf, linkEvents } from "./relations";
+import { householdOf, isThing, mayFixThing, restOf, whoseOf } from "./things";
+import { claimsOf } from "./realism";
+import { canSeeEntity, canSeePlace } from "./visibility";
+import { say } from "../shared/lines";
+
+export interface EditOptions {
+  /** The GM editor writes locked fields too; a player's ✎ fix can't. */
+  gm: boolean;
+  /** The chat run's seed: the edit's generator (spawn ids, level-up effects) forks from it and the operations. */
+  runSeed: string;
+  /** Resolved again after the story moved on (`resolveFix`): an operation whose outcome is already so is passed over, not refused. */
+  again?: boolean;
+  /** Who makes a thing's or a place's change (`made.by`): a turn role writing the story's own change (the Curator); absent, the GM, or the player for a ✎ fix. */
+  by?: string;
+  /** Whether a thing's change counts as confirmed (only then does a Built-in thing move); absent, as `gm` says. */
+  confirmed?: boolean;
+  /** The longest reason (`why`) a thing's change keeps (Settings → Changes from the reply); absent, as given. */
+  whyMax?: number;
+  /** How long the GM's words in a minds edit may be (Settings → Minds → Lengths): a longer one is refused; absent, as an edit resolved again has them, kept as given. */
+  mindLengths?: Readonly<MindLengths>;
+  /**
+   * The caller has opened the money the world gave the holder of a cash ✎ (the play panels, which draw nothing): a holder it gave
+   * no accounts keeps cash as the field it is, and none is drawn for them. Absent, the ✎ materializes the holder's money first.
+   */
+  opened?: boolean;
+}
+
+/**
+ * Refusals that mean what an operation asks for is already so: nothing to change, inside it or out
+ * of it already, removed or back already, a relation or a workspace file already gone. Resolving an
+ * edit again (`again`), such an operation is passed over, since the story already did what it asks.
+ */
+const ALREADY_SO: Record<string, true> = { no_change: true, already_inside: true, not_inside: true, gone: true, not_gone: true, missing_relation: true, missing_file: true };
+
+export type EditOutcome = { events: LedgerEvent[] } | { rejection: Rejection };
+
+/** The outside account GM money edits post against (DESIGN §9.2), shown as "Correction". */
+const CORRECTION = `${EXTERNAL_ACCOUNT_PREFIX}correction`;
+
+function reject(code: string, reason: string): Rejection {
+  return { code, reason };
+}
+
+/** A value's shape for a field type; a list's items are checked against its `of`. Null when it fits. */
+function shapeProblem(reg: Registry, w: Working, type: FieldType, def: FieldDef, value: JsonValue): string | null {
+  switch (type) {
+    case "number":
+    case "duration":
+      return typeof value === "number" && Number.isFinite(value) ? null : say("eng_must_be_a_number");
+    case "money":
+      return Number.isSafeInteger(value) ? null : say("eng_must_be_a_whole_amount");
+    case "date":
+      return (typeof value === "number" && Number.isFinite(value)) || typeof value === "string" ? null : say("eng_must_be_a_date");
+    case "bool":
+      return typeof value === "boolean" ? null : say("eng_must_be_yes_or_no");
+    case "text":
+      return typeof value === "string" ? null : say("eng_must_be_text");
+    case "enum":
+      return typeof value === "string" && (!def.values || def.values.includes(value)) ? null : say("eng_must_be_one_of_values", { values: (def.values ?? []).join(", ") });
+    case "dice":
+      if (typeof value !== "string") return say("eng_must_be_dice_like_2d6_1");
+      try {
+        parseDice(value);
+        return null;
+      } catch {
+        return say("eng_must_be_dice_like_2d6_1");
+      }
+    case "ref": {
+      // Null clears a reference (no owner, no employer).
+      if (value === null) return null;
+      const target = typeof value === "string" ? own(w.state.entities, value) : undefined;
+      if (def.ref) return target && kindIs(reg, w.world, target.kind, def.ref) ? null : say("eng_must_name_a_def", { def: (kindDef(reg, w.world, def.ref)?.label ?? def.ref).toLowerCase() });
+      return target || (typeof value === "string" && own(w.world.places, value)) ? null : say("eng_must_name_a_place_or_something_in");
+    }
+    case "list": {
+      if (!Array.isArray(value)) return say("eng_must_be_a_list");
+      if (!def.of) return null;
+      for (const item of value) {
+        const problem = shapeProblem(reg, w, def.of, { ...def, type: def.of }, item);
+        if (problem) return say("eng2_has_an_item_that_replace", { replace: problem.replace(/^must be /, "isn't ") });
+      }
+      return null;
+    }
+  }
+}
+
+/**
+ * Why `value` can't be stored in an entity's field of this definition, as words after its label
+ * ("must be between 3 and 18"), or null. Numbers are held to the bounds the `set` effect clamps to
+ * (a pool's evaluated max included), but refused rather than clamped: a fix stores what was typed.
+ */
+export function valueProblem(reg: Registry, w: Working, entity: EntityId, def: FieldDef, value: JsonValue): string | null {
+  const shape = shapeProblem(reg, w, def.type, def, value);
+  if (shape || typeof value !== "number" || (def.type !== "number" && def.type !== "money" && def.type !== "duration")) return shape;
+  const { min, max } = fieldBounds(reg, w.ctx, entity, def);
+  const show = (n: number): string => (def.type === "money" ? formatMoney(n, w.world.currency) : String(n));
+  if ((min === undefined || value >= min) && (max === undefined || value <= max)) return null;
+  if (min !== undefined && max !== undefined) return say("eng_must_be_between_min_and_max", { min: show(min), max: show(max) });
+  return min !== undefined ? say("eng_must_be_at_least_min", { min: show(min) }) : say("eng_must_be_at_most_value", { value: show(max ?? value) });
+}
+
+/** Runs effects with literal arguments; the first rejection (a level-up's included) refuses the edit. */
+function run(reg: Registry, w: Working, specs: EffectSpec[], rng: Rng): Rejection | null {
+  const out = applyEffects(reg, w, specs, { bindings: {}, rng, literal: true });
+  return out.rejected[0]?.rejection ?? null;
+}
+
+/** Applies ready-made events in order (a pack service's unit); the first rejection refuses the edit. */
+function applyAll(w: Working, events: readonly LedgerEvent[]): Rejection | null {
+  for (const ev of events) {
+    const rejection = w.apply(ev);
+    if (rejection) return rejection;
+  }
+  return null;
+}
+
+/** How an edit's item ops resolve: the GM's, so confirmed, unless the edit says who makes them and whether they are; a player's ✎ never moves a Built-in thing. */
+function itemOptions(opts: EditOptions, rng: Rng): ItemOpOptions {
+  return { by: opts.by ?? (opts.gm ? "gm" : "player"), confirmed: opts.confirmed ?? opts.gm, gm: opts.gm, salt: rng.seed, ...(opts.whyMax !== undefined ? { whyMax: opts.whyMax } : {}) };
+}
+
+/** A thing moved by an edit: the item op `move`, through the one location writer and its size rules. */
+function thingMove(w: Working, thing: EntityId, to: Spot, opts: EditOptions, rng: Rng): Rejection | null {
+  const out = applyItemOp(w, { do: "move", item: thing, to, why: "" }, itemOptions(opts, rng));
+  return "code" in out ? out : null;
+}
+
+/**
+ * A player's ✎ on a thing (`fix_item`, ITEMS-SPEC §10.3), under the player's rules whatever the
+ * edit's: a thing of theirs they can see (`mayFixThing`), moved or kept only where they can see,
+ * never on another person and never in a holder they may not use, a holder's room, load and depth
+ * counting (`room`); worn or taken off by them, in a slot of its own (Ready is in hand); sized, or
+ * its size left to its type or name again; made theirs, their household's or nobody's; lent for use
+ * to someone they know or that taken back; renamed; put back where it is kept; handed to someone
+ * here (to hold, lent, given, or given back). And a thing they add (Play's Add), theirs, where they
+ * can see, unless the chat holds them to the world. Never a confirmed change: a Built-in thing stays.
+ */
+function fixItemOp(reg: Registry, w: Working, change: ItemFix, opts: EditOptions, rng: Rng): Rejection | null {
+  const pov = w.world.pov;
+  const spotProblem = (spot: Spot): Rejection | null => {
+    if ("place" in spot) return canSeePlace(reg, w.world, w.state, pov, spot.place) ? null : reject("missing_place", say("why_no_such_place"));
+    if (spot.in === pov) return null;
+    const holder = own(w.state.entities, spot.in);
+    if (!holder || isGone(w.state, spot.in) || !canSeeEntity(reg, w.world, w.state, pov, spot.in)) return reject("missing_entity", say("why_no_such_holder"));
+    if (kindIs(reg, w.world, holder.kind, "person")) return reject("not_yours", say("why_name_isnt_yours_to_put_things_on", { name: holder.name }));
+    return accessFor(w.ctx, pov, spot.in).use !== null ? null : reject("not_yours", say("why_name_isnt_yours_to_use", { name: holder.name }));
+  };
+  // Someone the player character knows, for a grant; someone here with them, for a handover.
+  const partyProblem = (who: EntityId, here: boolean): Rejection | null => {
+    const e = own(w.state.entities, who);
+    if (who === pov || !e || isGone(w.state, who) || !canSeeEntity(reg, w.world, w.state, pov, who)) return reject("missing_entity", say("why_no_such_person"));
+    if (!here) return null;
+    if (!kindIs(reg, w.world, e.kind, "person")) return reject("not_a_person", say("why_to_cant_be_handed_anything", { to: e.name }));
+    const at = placeOfEntity(w.state, pov);
+    return at !== null && placeOfEntity(w.state, who) === at ? null : reject("not_here", say("why_name_isnt_here_to_take_it", { name: e.name }));
+  };
+  const options: ItemOpOptions = { ...itemOptions({ ...opts, gm: false, confirmed: false }, rng), room: true };
+  if (change.do === "make") {
+    if (claimsOf(w.world, w.state).mode === "hold") return reject("no_claims", say("why_this_chat_holds_you_to_the_world"));
+    const where = spotProblem(change.at);
+    if (where) return where;
+    const typed = change.type !== undefined || change.class !== undefined;
+    const made = applyItemOp(w, { do: "make", name: change.name, at: change.at, owner: pov, why: "", ...(change.type !== undefined ? { type: change.type } : {}), ...(change.class !== undefined ? { class: change.class } : {}), ...(change.details !== undefined ? { details: change.details } : {}), ...(!typed && change.is !== undefined ? makeFieldsOf(change.is) : {}), ...(change.description !== undefined ? { description: change.description } : {}), ...(change.size !== undefined ? { size: change.size } : {}), ...(change.qty !== undefined ? { qty: change.qty } : {}) }, options);
+    return "code" in made ? made : null;
+  }
+  const item = change.item;
+  if (!isThing(w.ctx, item) || isGone(w.state, item) || !canSeeEntity(reg, w.world, w.state, pov, item)) return reject("missing_entity", say("why_no_thing_thing", { thing: labelOf(w, item) }));
+  if (!mayFixThing(w.ctx, pov, item)) return reject("not_yours", say("why_item_isnt_yours_to_change", { item: labelOf(w, item) }));
+  const applied = (() => {
+    switch (change.do) {
+      case "move":
+        return spotProblem(change.to) ?? applyItemOp(w, { do: "move", item, to: change.to, why: "" }, options);
+      case "home":
+        return (change.home !== null && change.home !== "owner" ? spotProblem(change.home) : null) ?? applyItemOp(w, { do: "home", item, home: change.home }, options);
+      case "wear":
+        return applyItemOp(w, { do: "wear", item, who: pov, ...(change.off === true ? { off: true } : {}), ...(change.slot !== undefined ? { slot: change.slot } : {}) }, options);
+      case "size":
+        if (change.size !== null) return applyItemOp(w, { do: "label", item, size: change.size }, options);
+        return own(w.state.entities, item)?.fields.size === undefined ? reject("no_change", say("why_nothing_sets_its_size")) : (w.apply({ type: "set", entity: item, field: "size", value: null }) ?? {});
+      case "own": {
+        // Theirs, their household's or nobody's (§10.3): anyone else's is a Give, a Lend or a sale, told to the story.
+        const owner = change.owner === "self" ? pov : change.owner === "household" ? householdOf(w.ctx, pov) : null;
+        if (change.owner === "household" && owner === null) return reject("no_household", say("why_you_arent_in_a_household"));
+        return applyItemOp(w, { do: "own", item, owner, why: "" }, options);
+      }
+      case "grant":
+        if (change.until !== undefined && !(change.until > w.state.clock)) return reject("bad_until", say("why_an_end_is_after_now"));
+        return partyProblem(change.who, false) ?? applyItemOp(w, { do: "grant", item, who: change.who, basis: change.until !== undefined ? "loan" : "assign", by: pov, ...(change.until !== undefined ? { until: change.until } : {}) }, options);
+      case "revoke":
+        if (!own(w.state.entities, change.who)?.relations.some((r) => r.type === "uses" && r.to === item)) return reject("no_change", say("why_who_has_no_leave_to_use_it", { who: labelOf(w, change.who) }));
+        return partyProblem(change.who, false) ?? applyItemOp(w, { do: "revoke", item, who: change.who }, options);
+      case "label":
+        return applyItemOp(w, { do: "label", item, name: change.name }, options);
+      case "specs":
+        return applyItemOp(w, { do: "label", item, specs: change.specs }, options);
+      case "away": {
+        // Back where it is kept (`restOf`, as Put away takes it): a place or a holder they can see, or on its owner, who is them or someone here.
+        const rest = restOf(w.ctx, item).rest;
+        if (rest === null) return reject("no_rest", say("why_item_has_nowhere_its_kept", { item: labelOf(w, item) }));
+        if (rest !== "owner") return spotProblem(rest) ?? applyItemOp(w, { do: "move", item, to: rest, why: "" }, options);
+        const owner = whoseOf(w.ctx, item).owners[0];
+        if (owner === pov) return applyItemOp(w, { do: "move", item, to: { in: pov }, why: "" }, options);
+        if (owner === undefined) return reject("no_rest", say("why_item_has_nowhere_its_kept", { item: labelOf(w, item) }));
+        return partyProblem(owner, true) ?? applyItemOp(w, { do: "hand", item, to: owner, basis: "return", why: "" }, options);
+      }
+      case "hand":
+        if (change.basis === "loan" && change.until === undefined) return reject("bad_until", say("why_a_loan_needs_its_end"));
+        return partyProblem(change.to, true) ?? applyItemOp(w, { do: "hand", item, to: change.to, basis: change.basis, why: "", ...(change.until !== undefined ? { until: change.until } : {}) }, options);
+    }
+  })();
+  return "code" in applied ? applied : null;
+}
+
+/** The checks every field write shares: a field the kind may hold, never derived, locked only for the GM. */
+function writable(reg: Registry, w: Working, entity: EntityId, field: FieldId, opts: EditOptions): { def: FieldDef | undefined; label: string } | Rejection {
+  const e = own(w.state.entities, entity);
+  if (!e) return reject("missing_entity", say("why_no_entity_who", { who: labelOf(w, entity) }));
+  if (!safeKey(field)) return reject("bad_field", say("why_not_a_field_name"));
+  // Remove and Restore own `gone`, so the GM view's lists and every filter agree on it.
+  if (field === GONE_FIELD) return reject("reserved", say("why_use_remove_or_restore"));
+  const def = fieldDef(reg, w.world, e.kind, field);
+  const label = def?.label ?? field.replace(/_/g, " ");
+  if (def?.derived !== undefined) return reject("derived", say("why_label_is_worked_out_from_other_values", { label: label }));
+  if (def?.locked && !opts.gm) return reject("locked", say("why_label_is_locked", { label: label }));
+  return { def, label };
+}
+
+function setField(reg: Registry, w: Working, entity: EntityId, field: FieldId, value: JsonValue, opts: EditOptions, rng: Rng): Rejection | null {
+  const ok = writable(reg, w, entity, field, opts);
+  if ("code" in ok) return ok;
+  const problem = ok.def ? valueProblem(reg, w, entity, ok.def, value) : null;
+  if (problem) return reject("bad_value", `${ok.label} ${problem}`);
+  // Cash held in cash accounts is corrected by a balanced posting against the outside correction
+  // account (DESIGN §9.2), so the cash shown becomes the amount and the books still balance; cash
+  // without a cash account stays a field. The cash shown before the holder's money is materialized
+  // is the authored opening amount, so the accounts open first and the correction is measured from
+  // them (the fix records both).
+  if (field === "cash" && typeof value === "number") {
+    // A holder the world gave a cash account has what it authored opened first, so the correction is measured from it; one it gave
+    // none keeps the cash as a field, and nothing is drawn from the tables to make it up.
+    const service = optionalService(w.ctx, "economy.set_cash");
+    if ((service?.(w.ctx, entity, value) ?? null) !== null) {
+      if (opts.opened !== true) materializeIfNeeded(reg, w, entity, "money", opts.runSeed);
+      const corrected = service?.(w.ctx, entity, value) ?? null;
+      if (corrected !== null) return Array.isArray(corrected) ? applyAll(w, corrected) : corrected;
+    }
+  }
+  // A place set from the field editor is a move like any other (the one move path): out of whatever
+  // holds them and onto where they stand there, rather than the field alone.
+  if (field === "place" && typeof value === "string" && own(w.world.places, value)) return isThing(w.ctx, entity) ? thingMove(w, entity, { place: value }, opts, rng) : run(reg, w, [{ type: "move", args: { entity, to: value } }], rng);
+  return run(reg, w, [{ type: "set", args: { entity, field, value } }], rng);
+}
+
+function addField(reg: Registry, w: Working, entity: EntityId, field: FieldId, delta: number, opts: EditOptions, rng: Rng): Rejection | null {
+  const ok = writable(reg, w, entity, field, opts);
+  if ("code" in ok) return ok;
+  if (!Number.isFinite(delta) || delta === 0) return reject("bad_delta", say("why_add_a_number_other_than_0"));
+  if (ok.def && ok.def.type !== "number" && ok.def.type !== "money" && ok.def.type !== "duration") return reject("not_numeric", say("why_ok_isnt_a_number", { ok: ok.label }));
+  if (ok.def?.type === "money" && !Number.isSafeInteger(delta)) return reject("bad_delta", say("why_ok_moves_in_whole_amounts", { ok: ok.label }));
+  return run(reg, w, [{ type: "add", args: { entity, field, delta } }], rng);
+}
+
+/**
+ * A relation: its type known (the world's, a pack's or built in), its fields typed. The ends of kinds it does not take, a
+ * field past its bounds and someone related to themselves are recorded all the same (`editFindings` says so); a thing put
+ * inside itself, which the tree of where things are cannot hold, is refused.
+ */
+function linkOp(reg: Registry, w: Working, op: Extract<EditOp, { op: "link" }>, opts: EditOptions, rng: Rng): Rejection | null {
+  const def = own(w.world.relations, op.rel) ?? reg.relations.get(op.rel);
+  if (!def && !BUILTIN_RELATIONS.some((r) => r === op.rel)) return { code: "unknown_relation", reason: say("why_no_relation_type_g", { g: op.rel.replace(/_/g, " ") }), choices: relationTypes(reg, w.world), said: op.rel };
+  const from = own(w.state.entities, op.from);
+  const to = own(w.state.entities, op.to);
+  if (!from || !to) return reject("missing_entity", say("why_no_entity_who", { who: labelOf(w, from ? op.to : op.from) }));
+  if (op.from === op.to && op.rel === "in" && isThing(w.ctx, op.from)) return reject("self", say("why_name_cant_be_inside_itself", { name: from.name }));
+  // A thing linked `in` something is a thing moved into it.
+  if (op.rel === "in" && isThing(w.ctx, op.from)) return thingMove(w, op.from, { in: op.to }, opts, rng);
+  for (const [key, value] of Object.entries(op.fields ?? {})) {
+    const fdef = def ? own(def.fields, key) : undefined;
+    const problem = !safeKey(key) ? say("eng_isnt_a_field_name") : fdef ? shapeProblem(reg, w, fdef.type, fdef, value) : null;
+    if (problem) return reject("bad_value", `${fdef?.label ?? key.replace(/_/g, " ")} ${problem}`);
+  }
+  if (op.until !== undefined && !Number.isFinite(op.until)) return reject("bad_until", say("why_an_end_time_is_a_time"));
+  const link = { rel: op.rel, from: op.from, to: op.to, ...(op.fields && Object.keys(op.fields).length > 0 ? { fields: op.fields as JsonObject } : {}), ...(op.until !== undefined ? { until: Math.round(op.until) } : {}) };
+  const made = linkEvents(reg, w.world, w.state, link);
+  if (!Array.isArray(made)) {
+    // The world's rule on what a relation joins is the story's to bend here: the link, and the other side of a symmetric or inverse type, are recorded as given.
+    if (made.code !== "relation_kind") return made;
+    const back = counterpartOf(reg, w.world, op.rel);
+    const extra = { ...(link.fields ? { fields: link.fields } : {}), ...(link.until !== undefined ? { until: link.until } : {}) };
+    return applyAll(w, [{ type: "link", rel: op.rel, from: op.from, to: op.to, ...extra }, ...(back !== null && !(back === op.rel && op.from === op.to) ? [{ type: "link" as const, rel: back, from: op.to, to: op.from, ...extra }] : [])]);
+  }
+  return applyAll(w, made);
+}
+
+/** The relation types a world has: its own, the packs', and the built-in ones. */
+function relationTypes(reg: Registry, world: WorldDoc): string[] {
+  return [...new Set([...Object.keys(world.relations), ...reg.relations.keys(), ...BUILTIN_RELATIONS])].sort();
+}
+
+/** What an edit finds that the world's rules would have refused and the GM's edit records all the same: a code and its values, for the tool that records it to say. */
+export interface EditFinding {
+  code: string;
+  values: Record<string, JsonValue>;
+}
+
+/**
+ * What `op` finds on `w` as it stands, before it applies: someone given a life state who is out of the world; the player's
+ * character removed, or made an agent; more values on a facet than it takes; a relation between kinds it does not join,
+ * from someone to themselves, or with a field past its bounds. Each is applied anyway (R-73).
+ */
+export function editFindings(reg: Registry, w: Working, op: EditOp): EditFinding[] {
+  const named = (id: EntityId): string => own(w.state.entities, id)?.name ?? labelOf(w, id);
+  switch (op.op) {
+    case "life":
+      return isGone(w.state, op.entity) ? [{ code: "removed_life", values: { who: named(op.entity) } }] : [];
+    case "despawn":
+      return op.entity === w.world.pov ? [{ code: "pov_removed", values: { who: named(op.entity) } }] : [];
+    case "entity":
+      return op.agent === true && op.entity === w.world.pov ? [{ code: "pov_agent", values: { who: named(op.entity) } }] : [];
+    case "classify": {
+      const classes = classOf(op.class);
+      return classes ? classProblems(w.world, classes, named(op.entity)).filter((p) => p.code === "single_class").map((p) => ({ code: "single_class", values: { who: named(op.entity), problem: p.message } })) : [];
+    }
+    case "link": {
+      const def = own(w.world.relations, op.rel) ?? reg.relations.get(op.rel);
+      const from = own(w.state.entities, op.from);
+      const to = own(w.state.entities, op.to);
+      if (!from || !to) return [];
+      const label = def?.label ?? op.rel.replace(/_/g, " ");
+      const out: EditFinding[] = [];
+      if (op.from === op.to) out.push({ code: "related_to_self", values: { who: from.name, relation: label } });
+      if (def && def.from !== "*" && !kindIs(reg, w.world, from.kind, def.from)) out.push({ code: "relation_kind", values: { relation: label, end: "from", who: from.name, takes: kindDef(reg, w.world, def.from)?.label ?? def.from } });
+      if (def && def.to !== "*" && !kindIs(reg, w.world, to.kind, def.to)) out.push({ code: "relation_kind", values: { relation: label, end: "to", who: to.name, takes: kindDef(reg, w.world, def.to)?.label ?? def.to } });
+      for (const [key, value] of Object.entries(op.fields ?? {})) {
+        const fdef = def ? own(def.fields, key) : undefined;
+        if (!fdef || shapeProblem(reg, w, fdef.type, fdef, value) !== null || valueProblem(reg, w, op.from, fdef, value) === null) continue;
+        const { min, max } = fieldBounds(reg, w.ctx, op.from, fdef);
+        out.push({ code: "off_the_sheet", values: { key, name: from.name, value: JSON.stringify(value), type: fdef.type, ...(min !== undefined ? { min } : {}), ...(max !== undefined ? { max } : {}) } });
+      }
+      return out;
+    }
+    default:
+      return [];
+  }
+}
+
+/** Into a container (`in`), never inside itself; or out of it (`into: null`) to where the container stands. */
+function putOp(reg: Registry, w: Working, entity: EntityId, into: EntityId | null, opts: EditOptions, rng: Rng): Rejection | null {
+  const e = own(w.state.entities, entity);
+  if (!e) return reject("missing_entity", say("why_no_entity_who", { who: labelOf(w, entity) }));
+  if (isThing(w.ctx, entity)) {
+    if (into !== null) return thingMove(w, entity, { in: into }, opts, rng);
+    const place = placeOfEntity(w.state, entity);
+    if (!e.relations.some((r) => r.type === "in") || !place) return reject("not_inside", say("why_name_isnt_inside_anything", { name: e.name }));
+    return thingMove(w, entity, { place }, opts, rng);
+  }
+  const holders = e.relations.filter((r) => r.type === "in");
+  const specs: EffectSpec[] = holders.filter((r) => r.to !== into).map((r) => ({ type: "unlink", args: { rel: "in", from: entity, to: r.to } }));
+  if (into === null) {
+    if (holders.length === 0) return reject("not_inside", say("why_name_isnt_inside_anything", { name: e.name }));
+    const place = placeOfEntity(w.state, entity);
+    if (place) specs.push({ type: "set", args: { entity, field: "place", value: place } });
+    return run(reg, w, specs, rng);
+  }
+  const container = own(w.state.entities, into);
+  if (!container) return reject("missing_entity", say("why_no_entity_who", { who: labelOf(w, into) }));
+  // Walking up from the container must never reach the entity: nothing goes inside itself.
+  let cur: EntityId | undefined = into;
+  for (let guard = 0; cur && guard < 32; guard++) {
+    if (cur === entity) return reject("cycle", say("why_name_cant_go_inside_in", { name: e.name, in: container.name }));
+    cur = own(w.state.entities, cur)?.relations.find((r) => r.type === "in")?.to;
+  }
+  if (holders.some((r) => r.to === into)) return reject("already_inside", say("why_name_is_already_in_name2", { name: e.name, name2: container.name }));
+  // Only what holds things holds them, and only what can go inside something goes (DESIGN §7): no truck in a wallet, no phone in a bill.
+  const cannot = optionalQuery(w.ctx, "gear.hold_problem")?.(w.ctx, entity, into) ?? null;
+  if (cannot) return reject("cant_hold", cannot);
+  // A thing inside something has no place of its own: it is wherever its container is.
+  if (typeof e.fields.place === "string") specs.push({ type: "set", args: { entity, field: "place", value: null } });
+  specs.push({ type: "link", args: { rel: "in", from: entity, to: into } });
+  return run(reg, w, specs, rng);
+}
+
+/** Money into or out of an account against the correction account: the economy's posting with its history line, or a bare one. */
+function adjustOp(reg: Registry, w: Working, account: EntityId, cents: number, rng: Rng): Rejection | null {
+  if (!own(w.state.entities, account)) return reject("missing_entity", say("why_no_account_account", { account: labelOf(w, account) }));
+  if (!Number.isSafeInteger(cents) || cents === 0) return reject("bad_amount", say("why_an_adjustment_is_a_whole_amount_other"));
+  const adjust = optionalService(w.ctx, "economy.adjust");
+  if (adjust) {
+    const events = adjust(w.ctx, account, cents);
+    return Array.isArray(events) ? applyAll(w, events) : events;
+  }
+  return run(reg, w, [{ type: "post", args: { memo: say("eng_correction"), lines: [{ account, amount: cents }, { account: CORRECTION, amount: -cents }] } }], rng);
+}
+
+/**
+ * An entity's simulation detail. An entity that becomes an agent (or comes back as one) starts
+ * caught up, as a spawned one does: it never replays the slots it wasn't stepped through.
+ */
+function caughtUp(w: Working, entity: EntityId): Rejection | null {
+  return applyAll(w, [{ type: ENGINE_EVENTS.caught, data: { agent: entity, slot: slotIndexAt(calendarOf(w.world), w.state.clock) } }]);
+}
+
+function entityOp(w: Working, op: Extract<EditOp, { op: "entity" }>): Rejection | null {
+  const e = own(w.state.entities, op.entity);
+  if (!e) return reject("missing_entity", say("why_no_entity_who", { who: labelOf(w, op.entity) }));
+  const data: JsonObject = { entity: op.entity };
+  if (op.tier !== undefined) {
+    if (!tierOf(w.world, op.tier) && !isBand(op.tier)) return { code: "bad_tier", reason: say("why_no_tier_tier", { tier: op.tier }), choices: [...new Set([...Object.keys(w.world.tiers).filter((t) => tierOf(w.world, t)), ...BANDS])], said: op.tier };
+    data.tier = op.tier;
+  }
+  // The player's own character may be made an agent: whether the persona has a mind of its own is the owner's setting (`editFindings` says so).
+  if (op.agent !== undefined) data.agent = op.agent;
+  if (op.levels !== undefined) {
+    const levels: JsonObject = {};
+    for (const [domain, level] of Object.entries(op.levels)) {
+      if (!DOMAINS.some((d) => d === domain)) return { code: "bad_domain", reason: say("why_no_domain_domain", { domain: domain }), choices: [...DOMAINS], said: domain };
+      if (level !== null && level !== undefined && !(Number.isInteger(level) && level >= 0 && level <= 4)) return { code: "bad_level", reason: say("why_a_level_is_a_whole_number_0"), choices: ["0", "1", "2", "3", "4"], said: String(level) };
+      levels[domain] = level ?? null;
+    }
+    data.levels = levels;
+  }
+  if (Object.keys(data).length === 1) return reject("no_change", say("why_nothing_to_change"));
+  const wasAgent = e.agent;
+  const rejection = applyAll(w, [{ type: ENGINE_EVENTS.entity, data }]);
+  if (rejection) return rejection;
+  return op.agent === true && !wasAgent ? caughtUp(w, op.entity) : null;
+}
+
+/**
+ * Classes and tags, both whole: the chat holds them from then on, so they win over the world's
+ * definition until an Upgrade takes the revision's. One that reads the same as now is refused,
+ * since holding it would still keep an Upgrade from bringing the revision's in.
+ */
+function classifyOp(w: Working, op: Extract<EditOp, { op: "classify" }>): Rejection | null {
+  const e = own(w.state.entities, op.entity);
+  if (!e) return reject("missing_entity", say("why_no_entity_who", { who: labelOf(w, op.entity) }));
+  const classes = classOf(op.class);
+  if (!classes) return reject("bad_args", say("why_a_classification_is_facet_values"));
+  // A facet or a value the world does not have is refused with the world's own; more values than a one-valued facet takes are recorded (`editFindings` says so).
+  for (const [facet, values] of Object.entries(classes)) {
+    const def = hasOwn(w.world.classifications, facet) ? w.world.classifications[facet] : undefined;
+    if (!def) return { code: "unknown_facet", reason: say("why_name_is_classed_under_facet_which_isnt", { name: e.name, facet: facet }), choices: Object.keys(w.world.classifications), said: facet };
+    const unknown = values.find((v) => !hasOwn(def.values, v));
+    if (unknown !== undefined) return { code: "unknown_class", reason: say("why_name_is_classed_as_unknown_which_isnt", { name: e.name, unknown: unknown, def: def.label }), choices: Object.keys(def.values), said: unknown };
+  }
+  const problem = classProblems(w.world, classes, e.name).find((p) => p.code !== "single_class");
+  if (problem) return reject(problem.code, problem.message);
+  const tags = [...new Set(op.tags.map((t) => t.trim()).filter((t) => t !== ""))];
+  const sameAs = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((x) => b.includes(x));
+  const facets = new Set([...Object.keys(classes), ...Object.keys(w.world.classifications)]);
+  const unchanged = [...facets].every((f) => sameAs(classValues(w.world, w.state, op.entity, f), classes[f] ?? [])) && sameAs(tagsOf(w.world, w.state, op.entity), tags);
+  if (unchanged) return reject("no_change", say("why_nothing_to_change"));
+  // What it read as before, kept in the event so its player line can say only what changed, the
+  // same on every replay: which facets players see is read when the line is worded.
+  const was = Object.fromEntries([...facets].flatMap((f) => {
+    const values = classValues(w.world, w.state, op.entity, f);
+    return values.length > 0 ? [[f, [...values]]] : [];
+  }));
+  return applyAll(w, [{ type: ENGINE_EVENTS.classes, data: { entity: op.entity, class: classes, tags, was } }]);
+}
+
+/** A life state, and who is told it (DESIGN §8): everyone with the entity learns a change anyway. Nothing to do is refused. */
+function lifeOp(reg: Registry, w: Working, op: Extract<EditOp, { op: "life" }>, rng: Rng): Rejection | null {
+  const before = w.events.length;
+  const rejection = run(reg, w, [{ type: "life", args: { entity: op.entity, ...(op.to !== undefined ? { to: op.to } : {}), ...(op.tell !== undefined ? { tell: op.tell } : {}) } }], rng);
+  if (rejection) return rejection;
+  return w.events.length === before ? reject("no_change", say("why_nothing_to_change")) : null;
+}
+
+function spawnOp(reg: Registry, w: Working, op: Extract<EditOp, { op: "spawn" }>, rng: Rng): Rejection | null {
+  const name = op.name.trim();
+  if (name === "" || name.length > 80) return reject("bad_name", say("why_a_name_is_1_80_characters"));
+  if (op.id !== undefined && (!safeKey(op.id) || own(w.state.entities, op.id))) return reject("bad_id", say("why_id_is_taken_or_isnt_an_id", { id: op.id }));
+  if (op.tier !== undefined && !tierOf(w.world, op.tier)) return reject("bad_tier", say("why_no_tier_tier", { tier: op.tier }));
+  if (op.place !== undefined && !own(w.world.places, op.place)) return reject("missing_place", say("why_no_place_place", { place: labelOf(w, op.place) }));
+  const args: Record<string, JsonValue> = { kind: op.kind, name };
+  if (op.id !== undefined) args.id = op.id;
+  if (op.tier !== undefined) args.tier = op.tier;
+  if (op.place !== undefined) args.place = op.place;
+  if (op.agent !== undefined) args.agent = op.agent;
+  return run(reg, w, [{ type: "spawn", args }], rng);
+}
+
+/**
+ * Remove: out of the world, kept in state. Its relations go, and everyone's relations to it, so no
+ * one knows, holds or belongs to what isn't there; what is inside it stays inside and goes with it.
+ * Each pair is unlinked once: its own unlinks take the other side of a symmetric or inverse pair
+ * with them, so only what others still hold toward it afterwards is left to unlink.
+ */
+function despawnOp(reg: Registry, w: Working, entity: EntityId, rng: Rng): Rejection | null {
+  const e = own(w.state.entities, entity);
+  if (!e) return reject("missing_entity", say("why_no_entity_who", { who: labelOf(w, entity) }));
+  // The player's own character may be removed: that is a story event (`editFindings` says so).
+  if (e.fields[GONE_FIELD] === true) return reject("gone", say("why_name_is_already_removed", { name: e.name }));
+  // Where it is, read before its container lets go of it: taken out, it keeps that place, so Restore brings it back there.
+  const where = placeOfEntity(w.state, entity);
+  const contained = typeof e.fields.place !== "string" && e.relations.some((r) => r.type === "in");
+  const unlinked = run(reg, w, e.relations.map((r) => ({ type: "unlink", args: { rel: r.type, from: entity, to: r.to } })), rng.fork("own"));
+  if (unlinked) return unlinked;
+  const specs: EffectSpec[] = where && contained ? [{ type: "set", args: { entity, field: "place", value: where } }] : [];
+  for (const id of Object.keys(w.state.entities).sort()) {
+    if (id === entity) continue;
+    for (const r of own(w.state.entities, id)?.relations ?? []) if (r.to === entity && r.type !== "in") specs.push({ type: "unlink", args: { rel: r.type, from: id, to: entity } });
+  }
+  specs.push({ type: "set", args: { entity, field: GONE_FIELD, value: true } });
+  return run(reg, w, specs, rng.fork("others"));
+}
+
+function restoreOp(reg: Registry, w: Working, entity: EntityId, rng: Rng): Rejection | null {
+  const e = own(w.state.entities, entity);
+  if (!e) return reject("missing_entity", say("why_no_entity_who", { who: labelOf(w, entity) }));
+  if (e.fields[GONE_FIELD] !== true) return reject("not_gone", say("why_name_isnt_removed", { name: e.name }));
+  const rejection = run(reg, w, [{ type: "set", args: { entity, field: GONE_FIELD, value: false } }], rng);
+  if (rejection) return rejection;
+  // An agent comes back caught up: the slots it was away for aren't replayed.
+  return e.agent ? caughtUp(w, entity) : null;
+}
+
+/**
+ * A pack effect the GM may run (`EffectDef.gm`): an asset's price, say, which no entity field holds.
+ * Its arguments are literals, and it resolves through the effect's own checks and the event guards.
+ */
+function effectOp(reg: Registry, w: Working, op: Extract<EditOp, { op: "effect" }>, opts: EditOptions, rng: Rng): Rejection | null {
+  const def = reg.effects.get(op.effect);
+  if (!opts.gm || def?.gm !== true) return reject("not_editable", say("why_g_isnt_something_the_gm_view_can", { g: op.effect.replace(/[._]/g, " ") }));
+  const before = w.events.length;
+  const rejection = run(reg, w, [{ type: op.effect, args: op.args }], rng);
+  if (rejection) return rejection;
+  return w.events.length === before ? reject("no_change", say("why_nothing_to_change")) : null;
+}
+
+/**
+ * A workspace change (DESIGN §4.4) as its events: writing the text a file holds already changes
+ * nothing; a move is the file written at its new path and removed from its old one, its pin going
+ * with it; a pin or unpin needs the file, and a state it isn't in already.
+ */
+function workspaceOp(w: Working, op: WorkspaceOp): Rejection | null {
+  const files = workspaceOf(w.state);
+  switch (op.op) {
+    case "ws_write":
+      if (!isWorkspacePath(op.path) || !isBlobHash(op.hash)) return reject("bad_op", say("why_a_workspace_files_path_is_names_joined_2"));
+      if (own(files, op.path) === op.hash) return reject("no_change", say("why_the_file_already_holds_that_text"));
+      return w.apply(wsWrite(op.path, op.hash));
+    case "ws_delete":
+      // The event's own check refuses a file that isn't there (`missing_file`).
+      return w.apply(wsDelete(op.path));
+    case "ws_move": {
+      const hash = own(files, op.from);
+      if (hash === undefined) return reject("no_file", say("why_no_workspace_file_path", { path: op.from }));
+      if (!isWorkspacePath(op.to)) return reject("bad_op", say("why_a_workspace_files_path_is_names_joined"));
+      if (op.to === op.from) return reject("no_change", say("why_the_file_is_already_there"));
+      if (own(files, op.to) !== undefined) return reject("file_exists", say("why_there_is_a_workspace_file_to_already", { to: op.to }));
+      const events = [wsWrite(op.to, hash), wsDelete(op.from)];
+      if (own(workspacePins(w.state), op.from)) events.push(wsPin(op.to, true));
+      return applyAll(w, events);
+    }
+    case "ws_pin":
+      if (own(files, op.path) === undefined) return reject("no_file", say("why_no_workspace_file_path", { path: op.path }));
+      if ((own(workspacePins(w.state), op.path) === true) === op.pinned) return reject("no_change", op.pinned ? say("why_the_file_is_pinned_already") : say("why_the_file_isnt_pinned"));
+      return w.apply(wsPin(op.path, op.pinned));
+  }
+}
+
+function applyOp(reg: Registry, w: Working, op: FixOp, opts: EditOptions, rng: Rng): Rejection | null {
+  switch (op.op) {
+    case "set":
+      return setField(reg, w, op.entity, op.field, op.value, opts, rng);
+    case "fix_set":
+      // A field as the player's ✎ fix sets it, under the player's rules whatever the edit's (DESIGN §7.2).
+      return setField(reg, w, op.entity, op.field, op.value, { ...opts, gm: false }, rng);
+    case "fix_item":
+      return fixItemOp(reg, w, op.change, opts, rng);
+    case "add":
+      return addField(reg, w, op.entity, op.field, op.delta, opts, rng);
+    case "link":
+      return linkOp(reg, w, op, opts, rng);
+    case "unlink": {
+      // A thing taken out of what holds it lies where that stands.
+      const place = op.rel === "in" && isThing(w.ctx, op.from) && own(w.state.entities, op.from)?.relations.some((r) => r.type === "in" && r.to === op.to) ? placeOfEntity(w.state, op.from) : null;
+      return place ? thingMove(w, op.from, { place }, opts, rng) : run(reg, w, [{ type: "unlink", args: { rel: op.rel, from: op.from, to: op.to } }], rng);
+    }
+    case "move":
+      return isThing(w.ctx, op.entity) ? thingMove(w, op.entity, { place: op.to }, opts, rng) : run(reg, w, [{ type: "move", args: { entity: op.entity, to: op.to } }], rng);
+    case "put":
+      return putOp(reg, w, op.entity, op.into, opts, rng);
+    case "adjust":
+      return adjustOp(reg, w, op.account, op.cents, rng);
+    case "stage":
+      // The GM's Stage (DESIGN §10): on to a stage that follows, a real stage entry (effects, rewards, a reveal); back, only the stage.
+      return moveTrack(reg, w, op.track, op.to, hashParts("lre.edit.stage", opts.runSeed, op.track, op.to));
+    case "entity":
+      return entityOp(w, op);
+    case "classify":
+      return classifyOp(w, op);
+    case "life":
+      return lifeOp(reg, w, op, rng);
+    case "spawn":
+      return spawnOp(reg, w, op, rng);
+    case "despawn":
+      return despawnOp(reg, w, op.entity, rng);
+    case "restore":
+      return restoreOp(reg, w, op.entity, rng);
+    case "mind_pin":
+    case "mind_refresh":
+    case "mind_memory":
+    case "mind_intent":
+    case "mind_knowledge": {
+      // A character's mind, and what anyone knows, is the minds pack's (DESIGN §24.9, §24.11): it words the control as its events.
+      const edit = optionalService(w.ctx, "minds.edit");
+      if (!edit) return reject("no_minds", say("why_this_world_has_no_character_minds"));
+      const out = edit(w.ctx, op, opts.mindLengths);
+      return Array.isArray(out) ? applyAll(w, out) : out;
+    }
+    case "routine_follow":
+    case "routine_block":
+    case "schedule_override": {
+      // A character's routine and schedules in a chat are Cast life's (DESIGN §8): it words the control as its events.
+      const edit = optionalService(w.ctx, "castlife.edit");
+      if (!edit) return reject("no_castlife", say("why_this_world_has_no_cast_life"));
+      const out = edit(w.ctx, op);
+      return Array.isArray(out) ? applyAll(w, out) : out;
+    }
+    case "effect":
+      return effectOp(reg, w, op, opts, rng);
+    case "feed":
+      // A section's settings in this chat (DESIGN §6.11): one event, so its Undo is the fix's.
+      return w.apply({ type: FEED_EVENT, data: { section: op.section, to: op.to as JsonObject | null } });
+    case "item": {
+      // Taking a thing out of the world is the GM's Remove, as for anyone.
+      if (op.change.do === "remove") {
+        if (!opts.gm) return reject("gm_only", say("why_removing_a_thing_from_the_world_is"));
+        if (!isThing(w.ctx, op.change.item)) return reject("not_a_thing", say("why_id_isnt_a_thing", { id: labelOf(w, op.change.item) }));
+        return despawnOp(reg, w, op.change.item, rng);
+      }
+      const out = applyItemOp(w, op.change, itemOptions(opts, rng));
+      return "code" in out ? out : null;
+    }
+    case "place": {
+      // A place made in play is the space pack's (ITEMS-SPEC §6.2): it words the change as its events.
+      const change = optionalService(w.ctx, "space.place_op");
+      if (!change) return reject("no_places", say("why_this_world_cant_make_places_in_play"));
+      const out = change(w.ctx, op.change, { by: opts.by ?? (opts.gm ? "gm" : "player"), salt: rng.seed });
+      return "code" in out ? out : applyAll(w, out.events);
+    }
+    case "org": {
+      // An organization's change (ORG-SPEC §7.2) is the orgs pack's: it compiles to the packs' own
+      // effects with no actor, the GM's, so no power is asked, and its History line, run as one unit.
+      if (!opts.gm) return reject("gm_only", say("why_an_organizations_change_is_the_gms"));
+      const compile = optionalService(w.ctx, "orgs.op");
+      if (!compile) return reject("no_orgs", say("why_this_world_has_no_organizations"));
+      const specs = compile(w.ctx, op.change);
+      if (!Array.isArray(specs)) return specs;
+      const before = w.events.length;
+      const rejection = run(reg, w, specs, rng);
+      if (rejection) return rejection;
+      return w.events.length === before ? reject("no_change", say("why_nothing_to_change")) : null;
+    }
+    case "ws_write":
+    case "ws_delete":
+    case "ws_move":
+    case "ws_pin":
+      return workspaceOp(w, op);
+    case "clock": {
+      // The clock set as its ✎ fix sets it (DESIGN §9.2, §12), from where the operations before it leave the story.
+      const fixed = clockFix(reg, w.world, w.state, op.time, opts.runSeed);
+      if ("code" in fixed) return fixed;
+      if (fixed.events.length === 0) return reject("no_change", say("why_the_clock_already_reads_that_time"));
+      return applyAll(w, fixed.events);
+    }
+  }
+}
+
+/**
+ * Resolves operations in order against `state` (each sees the ones before it) into the events of
+ * one `fix` entry, or the first operation's rejection; nothing applies unless all do.
+ */
+export function resolveEdit(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, ops: readonly FixOp[], opts: EditOptions): EditOutcome {
+  const w = new Working(reg, world, state);
+  const rng = createRng(hashParts("lre.edit", opts.runSeed, JSON.stringify(ops)));
+  for (const [i, op] of ops.entries()) {
+    const mark = opts.again ? w.mark() : null;
+    const rejection = applyOp(reg, w, op, opts, rng.fork(`op:${i}`));
+    if (!rejection) continue;
+    if (mark && own(ALREADY_SO, rejection.code)) {
+      w.restore(mark);
+      continue;
+    }
+    return { rejection };
+  }
+  // What a GM sets them doing, and until when, is that activity's span (DESIGN §9.2), stamped as the
+  // whole edit leaves them, where they are: Activity and Activity ends read together whether set in
+  // one edit or one after the other, in either order. Only the edit's own fields count, never what its
+  // effects set: a Move brings the party along as idle, which takes no end of theirs. A player's ✎ of
+  // the activity takes no old end either.
+  const spans = ops.flatMap((op) => ((op.op === "set" || op.op === "fix_set") && (op.field === "activity_until" || (opts.gm && op.op === "set" && op.field === "activity")) ? [op.entity] : []));
+  for (const entity of new Set(spans)) {
+    const fields = own(w.state.entities, entity)?.fields;
+    if (typeof fields?.activity_until !== "number") continue;
+    const rejection = applyAll(w, spanRecords(entity, fields));
+    if (rejection) return { rejection };
+  }
+  // One submit is one unit: a rebased view keeps or drops it whole, as it does a purchase.
+  const group = w.events.length > 1 ? `edit:${hashParts(JSON.stringify(w.events)).slice(0, 10)}` : undefined;
+  return { events: group ? w.events.map((e) => ({ ...e, group })) : [...w.events] };
+}
+
+/**
+ * A GM edit or ✎ fix resolved again from what it asked for (`PostEntry.edit`) against `state`, the
+ * state it now follows (DESIGN §7, P2): after the reply it was held through, or after a read that
+ * now comes before it (a Re-read, a Retry read, a Re-run's). Its operations resolve as when it was
+ * made, with the same generator, except that one whose outcome is already so is passed over; a
+ * clock fix sets the clock to its time again. Null when the entry asked for nothing this can read:
+ * its own events stand.
+ */
+export function resolveFix(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, entry: Pick<PostEntry, "edit" | "gm">, runSeed: string): EditOutcome | null {
+  const asked: FixDirective | undefined = entry.edit;
+  if (!asked) return null;
+  if ("clock" in asked) {
+    const fixed = clockFix(reg, world, state, asked.clock, runSeed);
+    return "code" in fixed ? { rejection: fixed } : fixed;
+  }
+  const ops = parseFixOps(asked.ops);
+  return ops ? resolveEdit(reg, world, state, ops, { gm: entry.gm === true, runSeed, again: true }) : null;
+}
+
+const str = (v: unknown): v is string => typeof v === "string";
+
+/** An edit with more operations than its caller allows: how many it carries and the most. Told apart from one that cannot be read, so the caller refuses it naming its setting. */
+export interface TooMany {
+  tooMany: { count: number; most: number };
+}
+
+/** Operations from a request, each read by `one`: null when any is malformed or there are none; more than `most` (when a most is given) are told as such. */
+function parseOps<T>(raw: unknown, one: (o: Record<string, unknown>) => T | null, most?: number): T[] | TooMany | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  if (most !== undefined && raw.length > most) return { tooMany: { count: raw.length, most } };
+  const out: T[] = [];
+  for (const o of raw) {
+    const op = isRecord(o) ? one(o) : null;
+    if (op === null) return null;
+    out.push(op);
+  }
+  return out;
+}
+
+/**
+ * Operations from a request, checked for shape (the frontend is outside data): null when any is
+ * malformed or there are none, and more than `most` told as too many (`TooMany`). What they name is checked when they resolve.
+ */
+export function parseEditOps(raw: unknown): EditOp[] | null;
+export function parseEditOps(raw: unknown, most: number): EditOp[] | TooMany | null;
+export function parseEditOps(raw: unknown, most?: number): EditOp[] | TooMany | null {
+  return parseOps(raw, parseEditOp, most);
+}
+
+/**
+ * What a `fix` entry asks for (`FixDirective.ops`), checked for shape as `parseEditOps` checks a
+ * request's: the GM editor's operations, plus an agent's workspace changes and clock sets. A path's
+ * and a hash's form, and a time's, are checked when they resolve. The readers an earlier build's
+ * write named are read and ignored; its op that set them alone is no operation, so an entry holding
+ * it asks for nothing this reads and its own events stand (`resolveFix`).
+ */
+export function parseFixOps(raw: unknown): FixOp[] | null;
+export function parseFixOps(raw: unknown, most: number): FixOp[] | TooMany | null;
+export function parseFixOps(raw: unknown, most?: number): FixOp[] | TooMany | null {
+  return parseOps(raw, (o): FixOp | null => {
+    switch (o.op) {
+      case "ws_write":
+        return str(o.path) && str(o.hash) ? { op: "ws_write", path: o.path, hash: o.hash } : null;
+      case "ws_delete":
+        return str(o.path) ? { op: "ws_delete", path: o.path } : null;
+      case "ws_move":
+        return str(o.from) && str(o.to) ? { op: "ws_move", from: o.from, to: o.to } : null;
+      case "ws_pin":
+        return str(o.path) && typeof o.pinned === "boolean" ? { op: "ws_pin", path: o.path, pinned: o.pinned } : null;
+      case "clock":
+        return str(o.time) ? { op: "clock", time: o.time } : null;
+      case "fix_set":
+        return str(o.entity) && str(o.field) && o.value !== undefined ? { op: "fix_set", entity: o.entity, field: o.field, value: o.value as JsonValue } : null;
+      case "fix_item": {
+        const change = parseItemFix(o.change);
+        return change ? { op: "fix_item", change } : null;
+      }
+      default:
+        return parseEditOp(o);
+    }
+  }, most);
+}
+
+/** One GM editor operation, checked for shape: null when malformed. */
+function parseEditOp(o: Record<string, unknown>): EditOp | null {
+  switch (o.op) {
+    case "set":
+      return str(o.entity) && str(o.field) && o.value !== undefined ? { op: "set", entity: o.entity, field: o.field, value: o.value as JsonValue } : null;
+    case "add":
+      return str(o.entity) && str(o.field) && typeof o.delta === "number" ? { op: "add", entity: o.entity, field: o.field, delta: o.delta } : null;
+    case "link":
+      if (!str(o.rel) || !str(o.from) || !str(o.to) || (o.fields !== undefined && !isRecord(o.fields)) || (o.until !== undefined && typeof o.until !== "number")) return null;
+      return { op: "link", rel: o.rel, from: o.from, to: o.to, ...(isRecord(o.fields) ? { fields: o.fields as JsonObject } : {}), ...(typeof o.until === "number" ? { until: o.until } : {}) };
+    case "unlink":
+      return str(o.rel) && str(o.from) && str(o.to) ? { op: "unlink", rel: o.rel, from: o.from, to: o.to } : null;
+    case "move":
+      return str(o.entity) && str(o.to) ? { op: "move", entity: o.entity, to: o.to } : null;
+    case "put":
+      return str(o.entity) && (o.into === null || str(o.into)) ? { op: "put", entity: o.entity, into: o.into } : null;
+    case "adjust":
+      return str(o.account) && typeof o.cents === "number" ? { op: "adjust", account: o.account, cents: o.cents } : null;
+    case "stage":
+      return str(o.track) && str(o.to) ? { op: "stage", track: o.track, to: o.to } : null;
+    case "entity": {
+      if (!str(o.entity) || (o.tier !== undefined && !str(o.tier)) || (o.agent !== undefined && typeof o.agent !== "boolean")) return null;
+      if (o.levels !== undefined && !(isRecord(o.levels) && Object.values(o.levels).every((v) => v === null || typeof v === "number"))) return null;
+      const levels: Record<string, number | null> = isRecord(o.levels) ? Object.fromEntries(Object.entries(o.levels).map(([d, v]) => [d, typeof v === "number" ? v : null])) : {};
+      return { op: "entity", entity: o.entity, ...(str(o.tier) ? { tier: o.tier } : {}), ...(typeof o.agent === "boolean" ? { agent: o.agent } : {}), ...(isRecord(o.levels) ? { levels } : {}) };
+    }
+    case "classify": {
+      if (!str(o.entity) || !isRecord(o.class) || !Array.isArray(o.tags) || !o.tags.every(str)) return null;
+      const classes: Record<string, string[]> = {};
+      for (const [facet, values] of Object.entries(o.class)) {
+        if (!safeKey(facet) || !Array.isArray(values) || !values.every(str)) return null;
+        classes[facet] = values.filter(str);
+      }
+      return { op: "classify", entity: o.entity, class: classes, tags: o.tags.filter(str) };
+    }
+    case "life":
+      if (!str(o.entity) || (o.to !== undefined && !str(o.to)) || (o.tell !== undefined && !(Array.isArray(o.tell) && o.tell.every(str))) || (o.to === undefined && o.tell === undefined)) return null;
+      return { op: "life", entity: o.entity, ...(str(o.to) ? { to: o.to } : {}), ...(Array.isArray(o.tell) ? { tell: o.tell.filter(str) } : {}) };
+    case "spawn":
+      if (!str(o.kind) || !str(o.name) || [o.id, o.tier, o.place].some((v) => v !== undefined && !str(v)) || (o.agent !== undefined && typeof o.agent !== "boolean")) return null;
+      return { op: "spawn", kind: o.kind, name: o.name, ...(str(o.id) ? { id: o.id } : {}), ...(str(o.tier) ? { tier: o.tier } : {}), ...(str(o.place) ? { place: o.place } : {}), ...(typeof o.agent === "boolean" ? { agent: o.agent } : {}) };
+    case "despawn":
+    case "restore":
+      return str(o.entity) ? { op: o.op, entity: o.entity } : null;
+    case "mind_pin":
+      return str(o.entity) && (o.level === null || o.level === "live" || o.level === "near" || o.level === "far" || o.level === "background") ? { op: "mind_pin", entity: o.entity, level: o.level } : null;
+    case "mind_refresh":
+      return str(o.entity) ? { op: "mind_refresh", entity: o.entity } : null;
+    case "mind_memory":
+      if (!str(o.entity) || (o.part !== "note" && o.part !== "commitment" && o.part !== "plan") || !(o.id === null || str(o.id)) || !(o.value === null || isRecord(o.value))) return null;
+      return { op: "mind_memory", entity: o.entity, part: o.part, id: o.id, value: o.value as JsonObject | null };
+    case "mind_intent":
+      // Each part is optional (absent keeps it), but one of them must be there.
+      if (!str(o.entity) || (o.text !== undefined && !str(o.text)) || (o.approach !== undefined && o.approach !== null && o.approach !== "reactive" && o.approach !== "proactive") || (o.text === undefined && o.approach === undefined)) return null;
+      return { op: "mind_intent", entity: o.entity, ...(str(o.text) ? { text: o.text } : {}), ...(o.approach !== undefined ? { approach: o.approach } : {}) };
+    case "mind_knowledge":
+      // The holding's shape is checked when it resolves, against what the chat knows then.
+      if (!str(o.entity) || !str(o.fact) || !(o.holding === null || isRecord(o.holding))) return null;
+      return { op: "mind_knowledge", entity: o.entity, fact: o.fact, holding: o.holding as unknown as Holding | null };
+    case "routine_follow": {
+      // Each part is optional (absent keeps it), but one of them must be there; null returns it to the world's (the role and the skip life to their level's).
+      const mode = o.mode === undefined || o.mode === null || ROUTINE_MODES.some((m) => m === o.mode);
+      const awareness = o.awareness === undefined || o.awareness === null || ROUTINE_AWARENESS.some((a) => a === o.awareness);
+      const role = o.role === undefined || o.role === null || ROUTINE_ROLES.some((r) => r === o.role);
+      const skips = o.skips === undefined || o.skips === null || SKIP_LIVES.some((s) => s === o.skips);
+      if (!str(o.entity) || !mode || !awareness || !role || !skips || (o.mode === undefined && o.awareness === undefined && o.role === undefined && o.skips === undefined)) return null;
+      return { op: "routine_follow", entity: o.entity, ...(o.mode !== undefined ? { mode: ROUTINE_MODES.find((m) => m === o.mode) ?? null } : {}), ...(o.awareness !== undefined ? { awareness: ROUTINE_AWARENESS.find((a) => a === o.awareness) ?? null } : {}), ...(o.role !== undefined ? { role: ROUTINE_ROLES.find((r) => r === o.role) ?? null } : {}), ...(o.skips !== undefined ? { skips: SKIP_LIVES.find((s) => s === o.skips) ?? null } : {}) };
+    }
+    case "routine_block":
+      // The block's shape is checked when it resolves, against the chat's own sources.
+      if (!str(o.entity) || !str(o.block) || !(o.value === null || isRecord(o.value))) return null;
+      return { op: "routine_block", entity: o.entity, block: o.block, value: o.value as RoutineEntry | null };
+    case "schedule_override":
+      if (!str(o.entity) || !str(o.schedule) || !(o.value === null || isRecord(o.value))) return null;
+      return { op: "schedule_override", entity: o.entity, schedule: o.schedule, value: o.value as ChatScheduleChange | null };
+    case "effect":
+      return str(o.effect) && isRecord(o.args) ? { op: "effect", effect: o.effect, args: o.args as JsonObject } : null;
+    case "feed": {
+      if (!str(o.section) || o.section.trim() === "") return null;
+      if (o.to === null) return { op: "feed", section: o.section, to: null };
+      const to = readSectionFeed(o.to);
+      return to ? { op: "feed", section: o.section, to } : null;
+    }
+    case "item": {
+      const change = parseItemOp(o.change);
+      return change ? { op: "item", change } : null;
+    }
+    case "place": {
+      const change = parsePlaceOp(o.change);
+      return change ? { op: "place", change } : null;
+    }
+    case "org": {
+      const change = parseOrgOp(o.change);
+      return change ? { op: "org", change } : null;
+    }
+    default:
+      return null;
+  }
+}

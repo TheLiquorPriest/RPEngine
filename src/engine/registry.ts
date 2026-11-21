@@ -1,0 +1,460 @@
+// The core registry contract for packs (DESIGN §3 Modules, §9.2 level contracts; ARCHITECTURE §7).
+//
+// A pack is a pure `core` plus a `ui`. Its core default-exports a PackDef whose `register`
+// receives a CoreRegistry and declares everything the pack contributes. Packs never import
+// another pack's internals: cross-pack behavior goes through services and queries, typed by
+// declaration merging on ServiceMap and QueryMap:
+//
+//   declare module "../../../engine/registry" {
+//     interface ServiceMap { "economy.charge": ChargeService }
+//   }
+//
+// All functions here are pure: same inputs, same outputs; randomness only from the Rng passed in.
+
+import type { JsonObject, JsonValue } from "../shared/json";
+import type { DomainId, EntityId, FieldId, KindId, Level, PackId, PanelId, RelationTypeId, SlotId, TableId } from "../shared/ids";
+import type { LedgerEvent } from "../shared/ledger";
+import type { OrgMember, OrgPower } from "../shared/org";
+import type { LintIssue } from "../shared/lint";
+import type { ColumnDef, DataTable, ShippedRevision } from "../shared/tables";
+import type { ActionDef, EffectSpec, FeedScope, FieldType, KindDef, MapDisplay, RelationTypeDef, RuleDef, ScheduleDef, WorldDoc } from "../shared/world";
+import type { MapConfig } from "../shared/map-config";
+import type { Value } from "./expr";
+import type { Registry } from "./registry-impl";
+import type { Rng } from "./rng";
+import type { WorldState } from "./state";
+
+/** An action as a pack declares it: the words of it (its label, its description, its params' labels) are the lines' (`engine/action-lines.ts`). */
+export type PackAction = Omit<ActionDef, "label" | "description"> & {
+  /** What its lines are filled with, where they name something the code knows (a level, a list of ids). */
+  words?: { readonly [name: string]: JsonValue | undefined };
+};
+
+/** Cross-pack services, merged by packs. Behavior is defined at every level (DESIGN §9.2). */
+export interface ServiceMap {}
+
+/** Level-independent query functions, merged by packs; also callable from formulas. */
+export interface QueryMap {}
+
+export interface Rejection {
+  code: string;
+  /** Why, as the player may read it: a refusal that would name someone the POV can't see words them as "someone" (DESIGN §7). */
+  reason: string;
+  /** The raw reason, naming everyone, when `reason` leaves someone out: for the GM view only. */
+  gm?: string;
+  /**
+   * A refusal the player mustn't learn of, since no living person would get one (a body the POV
+   * doesn't know is one, DESIGN §8): the change comes back as one that changed nothing, and only the
+   * log says why (`gm`).
+   */
+  unseen?: true;
+  /**
+   * For a refusal of a value outside a list fixed in code, or of an id that names nothing: the list it is
+   * one of, which is also the candidates the near matches are drawn from. Data, so an answer gives it whole.
+   */
+  choices?: readonly string[];
+  /** The words the call gave for what was refused (a name, a value): the near matches are the choices nearest to them. */
+  said?: string;
+}
+
+/**
+ * What an event applies with all the same, and says did not add up (plan §6.7: validators "become advisers
+ * that return reports"): a code and its values. It reaches the answer of the call that recorded the event, as a
+ * report, and is kept with the change.
+ */
+export interface Advice {
+  code: string;
+  values?: Record<string, JsonValue>;
+}
+
+/** Read access to the pinned tables of the world revision in force. */
+export interface TableReader {
+  get(id: TableId): DataTable | undefined;
+}
+
+/** Everything a pure engine function may read. */
+export interface ReadContext {
+  /** The frozen registry (formulas, kinds, schedules, nested effects). */
+  readonly registry: Registry;
+  world: WorldDoc;
+  state: Readonly<WorldState>;
+  tables: TableReader;
+  /** Effective level: the per-entity override, else min(domain level, the cap of the band its tier maps to); the POV is never capped (DESIGN §9.1). */
+  levelOf(entity: EntityId, domain: DomainId): Level;
+  service<K extends keyof ServiceMap>(name: K): ServiceMap[K];
+  query<K extends keyof QueryMap>(name: K): QueryMap[K];
+}
+
+/**
+ * Part of an entity's definition an applied event writes (DESIGN §4.3, the touched record): one of
+ * its fields, one relation (by type and target), its tier, agent flag, level overrides, classes
+ * and tags or life state, the entity itself when play created it, or an account's balance. Names
+ * only, never values.
+ */
+export type Touch =
+  | { entity: EntityId; field: FieldId }
+  | { entity: EntityId; rel: RelationTypeId; to: string }
+  | { entity: EntityId; aspect: TouchAspect };
+
+export type TouchAspect = "tier" | "agent" | "levels" | "class" | "life" | "spawned" | "posted" | "name";
+
+/** A registered event type: validation against the state before it, and its reducer. */
+export interface EventTypeDef<E extends LedgerEvent = LedgerEvent> {
+  type: E["type"];
+  /** Null when the event may apply to this state; a rejection otherwise (re-validation drops it). */
+  validate(event: E, ctx: ReadContext): Rejection | null;
+  /** Applies the event to the working state. Must be total for any event `validate` accepted. */
+  apply(event: E, state: WorldState, ctx: ReadContext): void;
+  /**
+   * Advice on an event that validated and will apply: what did not add up, as a code with values, or null.
+   * It never refuses and never changes state. Asked on the state the event will see, by the working copy that
+   * records the event (`Working.advice`); the fold applies the event the same whether it advises or not.
+   */
+  advise?(event: E, ctx: ReadContext): Advice | null;
+  /**
+   * One-line description, filtered by visibility by the caller. `viewer` is the POV a player's line
+   * is worded for, so a describer can leave out what it can't see; it is absent for the GM's and
+   * the author's lines, which name everything.
+   */
+  describe(event: E, ctx: ReadContext, viewer?: EntityId): string;
+  /**
+   * Record coarsening (DESIGN §4.3, L21): events of this type with the same non-null key, in one
+   * timelapse or catch-up record, merge into one concrete event at the last one's position.
+   * `merge` must keep the fold exact.
+   */
+  coarsen?: { key(event: E): string | null; merge(earlier: E, later: E): E };
+  /**
+   * What the event writes of entities' definitions, when its reducer writes any directly (fields,
+   * relations, tier, agent, levels, a new entity, a balance). The registry records it after every
+   * apply in the touched record, so an Upgrade never takes a revision's value over one play wrote.
+   */
+  touches?(event: E): Touch[];
+  /**
+   * What takes the event back, for the Undo of a change that wrote it: the events to record after it, read against the world just
+   * before the change's unit and the world now. `"changed_since"` when a later change has written what it wrote, so it is not
+   * this one's to take back; `"not_reversible"` (and an event type with no `reverse`) when it has no reverse, which the Undo
+   * says by name and leaves as it is. An event with nothing to take back gives none (`[]`).
+   */
+  reverse?(event: E, before: Readonly<WorldState>, now: Readonly<WorldState>): readonly JsonObject[] | "changed_since" | "not_reversible";
+  /**
+   * Set only for an event that cannot be taken back by its nature, not for want of code: something that left the world (a message
+   * sent into the chat) or that the player has seen (a roll). A code that the answers' file words ("you have seen how the roll fell").
+   * The Undo leaves such an event as it is and says why, beside the rest it takes back.
+   */
+  irreversible?: string;
+  /** A record of what an action worked out (its rolls, its numbers and where they came from): said in the answer of the call that records it. */
+  told?: true;
+}
+
+/** An extra validation on an event type (`CoreRegistry.guard`). */
+export interface EventGuardDef<E extends LedgerEvent = LedgerEvent> {
+  type: E["type"];
+  /** Null when the event may apply as far as this pack is concerned. Never changes state. */
+  validate(event: E, ctx: ReadContext): Rejection | null;
+  /** Advice on an event that validated and will apply, as `EventTypeDef.advise`: the first that advises is the one kept. */
+  advise?(event: E, ctx: ReadContext): Advice | null;
+}
+
+export interface EffectContext extends ReadContext {
+  rng: Rng;
+  /** Evaluated action parameters. */
+  params: Record<string, Value>;
+  /**
+   * The effect being resolved, with its arguments as evaluated (`resolveEffect` sets it): what a
+   * decision put to a vote, or an act put up for approval, holds to carry out later (ORG-SPEC Phase 5).
+   */
+  effect?: { type: string; args: Record<string, JsonValue> };
+  /**
+   * Set only when the orgs pack carries out a held act: the motion of `org` that passed, or its
+   * request that `by` approved. The decision's votes, or the act's limit, are answered by it.
+   */
+  carried?: { org: EntityId; motion?: string; approval?: string; by?: EntityId; cents?: number };
+  /**
+   * Set while an action is carried out as ruled (`ResolveOptions.advise`: the GM's `act`, a press that plays at once): what its doer
+   * may do is told by the action's own requirements and is not enforced again by its effects (`mayAct`), plan §6.5.
+   */
+  ruled?: true;
+}
+
+/** Turns a validated effect proposal into concrete events. */
+export interface EffectDef {
+  type: string;
+  /** The arguments it reads, by name, `?` marking one it can do without (the authors' reference lists them). */
+  args: readonly string[];
+  /**
+   * A GM edit may run it (`lre.edit` op `effect`), with literal arguments: a GM control that changes
+   * something no entity field holds, such as an asset's price. Effects without it are never offered there.
+   */
+  gm?: true;
+  resolve(args: Record<string, JsonValue>, ctx: EffectContext): LedgerEvent[] | Rejection;
+}
+
+/**
+ * One fact of a section as a scope beyond the player's gives it (DESIGN §6.11). `known`: who knows
+ * it, `pov` (the player character: a plain line), `scene` (only people with him: `who` names them
+ * as the narrator may know them) or `gm` (no one there). `group`: the fact the line tells part of,
+ * when it is told in several lines (Who knows what's: who holds it and who doesn't know it); a
+ * section keeps such lines together and keeps or leaves them out whole.
+ */
+export interface FeedLine {
+  text: string;
+  known: "pov" | "scene" | "gm";
+  who?: string;
+  /**
+   * A secret kept from the player character (DESIGN §24.11): who knows it and whom it is kept from.
+   * The narrator gets it marked so, in the secret mark's wording, or not at all, as its knowledge
+   * says (`secretLineText`); never in the player scope.
+   */
+  secret?: { keptFrom: EntityId[] | "everyone"; known?: EntityId[] };
+  group?: string;
+}
+
+export interface SectionRenderer {
+  slot: SlotId;
+  /**
+   * The name a section's `include` picks it by (DESIGN §6.11); absent, its slot. A section without
+   * `include` takes every renderer of its own slot, whatever their sources.
+   */
+  source?: string;
+  /** What it tells, in the GM's plain words ("What people here wear and carry"): its name where a section's sources are picked. */
+  label?: string;
+  /**
+   * Its lines are hints that follow what the POV doesn't know (Stance's cues, DESIGN §6.6): they ride
+   * once every section has its place on the section budget, in what is left, and no size, clip or
+   * total the player sees counts them, so an off-screen change never shows there.
+   */
+  hint?: true;
+  /** Compact lines, at most one per fact; dynamic values never contain `{{` or `}}` (DESIGN §6.3). The player scope's, and every player surface's. */
+  render(ctx: ReadContext): string[];
+  /**
+   * Its lines for a section's scope (DESIGN §6.11), for the narrator only: the player scope's facts
+   * as `pov` lines, and in `scene` and `gm` the ones beyond them, each marked with who knows it.
+   * Absent, `render` speaks for every scope.
+   */
+  feed?(ctx: ReadContext, scope: FeedScope): FeedLine[];
+}
+
+export interface MaterializerDef {
+  domain: DomainId;
+  /** The generator a new world pins. */
+  version: number;
+  /** Every generator version this build still carries (DESIGN §9.2 pinned versions); just `version` when absent. */
+  versions?: readonly number[];
+  /** Samples detail within the entity's current representation (DESIGN §9.2), as the world's pinned generator does. */
+  materialize(entity: EntityId, ctx: ReadContext, rng: Rng, version: number): LedgerEvent[];
+}
+
+export interface SlotInfo {
+  /** Slot start, minutes since epoch. */
+  start: number;
+  end: number;
+  index: number;
+  /**
+   * False while the story holds the POV in this step (DESIGN §8, §9.2): an ordinary turn and its
+   * catch-up, a span the player's words spend doing something, or a narrated time skip. The POV's own
+   * routine doesn't move it then, and a scene with it holds whoever is in it. Absent: time runs on its
+   * own (a timelapse): the POV follows its routine and no scene holds anyone.
+   */
+  povRoutine?: boolean;
+  /**
+   * True in a Timelapse (time skipped, not played): an off-screen Background agent lives their day at
+   * slot steps only, as net state, and the cast the story is about is held only while with the POV
+   * (DESIGN §8, §24.1).
+   */
+  timelapse?: boolean;
+  /**
+   * The span the run stepping this slot passes: where `advance` started and the minute it runs to.
+   * A slot it catches someone up through, or the part of one before it started, was played in
+   * ordinary turns, so only the story knows what they did then (the POV's lived needs read only
+   * inside it, DESIGN §8). Absent: the whole slot.
+   */
+  run?: { from: number; to: number };
+}
+
+/** A moment inside a slot at which an agent process acts between its slot steps (`ProcessDef.instants`). */
+export interface AgentInstant {
+  at: number;
+  /** What the process does then, as it reads it back in `atInstant`. */
+  key: string;
+  /**
+   * A moment at the run's own start, which no earlier run could reach: it happens when a run starts
+   * exactly there, before anything else in it, even on a slot's first minute (where moments otherwise
+   * fall to the slot step before). A run starting anywhere else passes it over.
+   */
+  opens?: true;
+}
+
+/**
+ * A recurring process stepped per schedule slot with a process seed (DESIGN §4.3 seeds). A `world`
+ * process (the default) steps once per slot; an `agent` process steps once per LOD1 agent under the
+ * engine's catch-up queue, with that agent as `agent`.
+ */
+export interface ProcessDef {
+  id: string;
+  domain: DomainId;
+  /** Lowest effective level at which the process runs for an entity. */
+  minLevel: Level;
+  scope?: "world" | "agent";
+  /**
+   * A world process that carries out what a record of the world arranges: a payroll, a bill, a standing payment, an invoice, a
+   * plan to pay. When the clock moves in play, the engine runs these over the span (`standingRun`) and records what they did,
+   * where no one decides it: what they leave to a person, where people went, what they did, the weather, a price's drift, is
+   * listed as due for the Author to decide.
+   */
+  standing?: true;
+  step(slot: SlotInfo, ctx: ReadContext, rng: (entity: EntityId) => Rng, agent?: EntityId): LedgerEvent[];
+  /**
+   * An agent process's moments strictly inside a slot (DESIGN §8): the blocks of a character's day
+   * starting between slot steps, their own plans' starts and ends among them (§24.8). They apply at
+   * their time among the schedule edges, in a turn and in a timelapse, to an agent stepped through
+   * the slot before; catch-up has none. `slot.povRoutine` says whether the POV's routine runs. Read
+   * from a state the slot's other moments may have changed already, so they must not depend on the
+   * clock or on what moments change: a segment that starts mid-slot then gets the same ones.
+   */
+  instants?(ctx: ReadContext, agent: EntityId, slot: SlotInfo): AgentInstant[];
+  /** What the process does at one of its instants, at that instant's clock, in the slot it falls in (`slot.povRoutine`: whether the story holds the POV). */
+  atInstant?(ctx: ReadContext, agent: EntityId, instant: AgentInstant, slot: SlotInfo): LedgerEvent[];
+  /**
+   * What the POV lived through the ordinary time of a turn (`span`, a turn-mode advance; DESIGN §8),
+   * read as that time ends: what the time itself gave, not what an action did. No slot step reads it:
+   * a turn steps no one but the agents it catches up, never the POV, and a later skip passes over it
+   * (`SlotInfo.run`), so this is the only reading.
+   */
+  lived?(ctx: ReadContext, agent: EntityId, span: { from: number; to: number }): LedgerEvent[];
+  /**
+   * What an activity met as its span ended within a turn's time (`activity`, ending at `until`;
+   * DESIGN §9.2), read for the player character at that end: the span an action of the turn gave it,
+   * as part of that action, so an Undo of it takes this too; or one an earlier turn began that they
+   * are still doing, where they began it, as this turn's time saw it out.
+   */
+  ended?(ctx: ReadContext, agent: EntityId, activity: { type: string; until: number }): LedgerEvent[];
+}
+
+/** A pack's default table and its column contract (ARCHITECTURE §6), with every revision it has shipped as. */
+export interface TableDef {
+  id: TableId;
+  schema: string;
+  columns: Record<string, ColumnDef>;
+  defaults: DataTable | null;
+  /** The revisions `defaults` has shipped as, oldest first, the last being `defaults` itself (the table build's record); none for a table without defaults. */
+  shipped?: readonly ShippedRevision[];
+}
+
+/**
+ * A model-proposal channel (DESIGN §9.4). A type's mode resolves per `ExtractionLearning` in
+ * shared/settings: the player's pin, then the mode learned on the turn's connection, then the D4
+ * cold-start default (`EXTRACTION_DEFAULTS`), then the bound.
+ */
+export interface ProposalChannelDef {
+  /** Proposal type, e.g. `purchase`, `regard`, `time_advance`. */
+  type: string;
+  /** The field type whose bound applies (`knowledge`: none, the knowledge step's own types). */
+  boundField: FieldType | "spawn" | "knows" | "life" | "routine" | "knowledge";
+  validate(proposal: JsonObject, ctx: ReadContext): Rejection | null;
+  toEffects(proposal: JsonObject, ctx: ReadContext): EffectSpec[];
+  /**
+   * The entity and field the proposal changes, when that isn't its own `entity` and `field` (a
+   * thing's count, its condition): their bound in Build and their range apply to it (DESIGN §11).
+   * Null when the proposal names nothing that is there.
+   */
+  boundTarget?(proposal: JsonObject, ctx: ReadContext): { entity: EntityId; field: FieldId } | null;
+}
+
+export interface LintRule {
+  code: string;
+  /** `registry` is the frozen registry the world lints against (absent where a caller runs one rule on its own). */
+  check(world: WorldDoc, registry?: Registry): LintIssue[];
+}
+
+/** How the player chose to see a chat (kept beside it, never in its ledger): what a panel is drawn for. */
+export interface ViewPrefs {
+  /** The map's display the player picked for this chat; null follows the world's `mapSettings.display`. */
+  mapDisplay: MapDisplay | null;
+  /** The chat's map settings (`map:` in its config), for the scale and time step a grid is drawn with; absent, their defaults. */
+  mapConfig?: MapConfig;
+}
+
+/** Builds a pack panel's view model (pure; the frontend renders it). */
+export interface PanelViewDef {
+  panel: PanelId;
+  build(ctx: ReadContext, prefs: ViewPrefs): JsonValue;
+  /**
+   * A panel that is a record of many items alike (the organisations' summaries or pages, by id), built one item at a time where the
+   * builder lets the thread go between them: the items' ids, and one item's value (null: left out), so that the record they make is what
+   * `build` makes.
+   */
+  items?: { ids(ctx: ReadContext): readonly string[]; build(ctx: ReadContext, prefs: ViewPrefs, id: string): JsonValue | null };
+  /**
+   * No part of the state view: a page reads one of its items (`items.build`) when it opens it, and the view carries what the page
+   * draws without it in a panel of its own (the organisations' pages, and their summaries). `build` is every item, as it stands.
+   */
+  apart?: true;
+}
+
+/**
+ * The ways a kind's organizations have members beyond what an ancestor's provider gives (ORG-SPEC
+ * §3.2): a business's owners and staff, a party's travellers. An organization's members are the rows
+ * of every provider up its kind's chain; the `group` provider's are its `member_of` links, which the
+ * engine also walks upward itself. Only rows of a member group nest: its members count through it.
+ */
+export type MembershipProvider = (ctx: Pick<ReadContext, "registry" | "world" | "state">, org: EntityId) => OrgMember[];
+
+/**
+ * A pack's section of an organization's page (`orgs.org`, ORG-SPEC §4.4): its money, payroll,
+ * ownership or taxes. It shows to a reader who holds `power` there (anyone who may see the
+ * organization, without one); `build` returns null when the organization has none of it.
+ */
+export interface OrgSectionDef {
+  id: string;
+  label: string;
+  power?: OrgPower;
+  /** `viewer` is the player character, or null for the GM, who sees every name. */
+  build(ctx: ReadContext, org: EntityId, viewer: EntityId | null): JsonValue | null;
+  /**
+   * Whether `build` gives anything for the organization, told without building it (the state view's summary of an organization asks
+   * it of a section it does not carry); where it is not given, `build` is asked.
+   */
+  shown?(ctx: ReadContext, org: EntityId, viewer: EntityId | null): boolean;
+}
+
+export interface CoreRegistry {
+  kind(def: KindDef): void;
+  relation(def: RelationTypeDef): void;
+  event<E extends LedgerEvent>(def: EventTypeDef<E>): void;
+  /**
+   * A state-dependent check a pack adds to any event type, core ones included (funds on a `post`):
+   * the event validates only when its own check and every guard pass, so a rebased view
+   * re-validates against the pack's rules too (DESIGN §4.3).
+   */
+  guard<E extends LedgerEvent>(def: EventGuardDef<E>): void;
+  effect(def: EffectDef): void;
+  service<K extends keyof ServiceMap>(name: K, impl: ServiceMap[K]): void;
+  query<K extends keyof QueryMap>(name: K, impl: QueryMap[K]): void;
+  /** Exposes a query to formulas under `name`. */
+  formula(name: string, fn: (ctx: ReadContext, ...args: Value[]) => Value): void;
+  renderer(def: SectionRenderer): void;
+  /** A pack's action: its label, its description and its params' labels are said by the lines (`action_<id>_label`, `action_<id>_description`, `action_<id>_param_<name>`), never given here. */
+  action(def: PackAction): void;
+  rule(def: RuleDef): void;
+  schedule(def: ScheduleDef): void;
+  table(def: TableDef): void;
+  materializer(def: MaterializerDef): void;
+  process(def: ProcessDef): void;
+  proposal(def: ProposalChannelDef): void;
+  lint(rule: LintRule): void;
+  view(def: PanelViewDef): void;
+  /** Adds `provider`'s members to every organization of `kind` and the kinds extending it; several packs may add to one kind (a group's member links, its staff). */
+  membership(kind: KindId, provider: MembershipProvider): void;
+  orgSection(def: OrgSectionDef): void;
+}
+
+export interface PackDef {
+  id: PackId;
+  label: string;
+  /** Pack format version; worlds record the version they were authored against. */
+  version: number;
+  /** The realism domain the pack implements, or null (Story, Sheets core). */
+  domain: DomainId | null;
+  requires: PackId[];
+  register(registry: CoreRegistry): void;
+}

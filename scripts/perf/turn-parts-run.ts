@@ -1,0 +1,519 @@
+// The turn probe itself (`turn-parts.ts` is its entry, which a worker thread runs too and serves its tasks from): a turn's parts, timed
+// one at a time on copies of a user's RPE data, with the longest each held RPE's thread in one piece: the reads a turn's intake makes
+// until the model's first call (where the probe stops it), the turn's commit from invented changes, the reads a page makes after it,
+// the same after a swipe of that turn and after an Undo, and a second turn's intake, after a reply and his next message as play leaves
+// them. RPE's own composition is opened over the copies, with a copy of Lumiverse's database (made beside the copies where the one
+// given lies elsewhere, and read by the door's own reader); the second turn writes its two messages into that copy. It has no network:
+// every road out (an HTTP call, a web socket, a model) is a part that throws by name, and the run stops there, saying which. It writes
+// only to the copies and to the folder the copy of the database is in. Nothing of his text is printed: one line of JSON a part (its
+// name, ms, kb, the longest hold), a total, what it could not make, and an error by its kind and the part it stopped (with
+// `RPE_PROBE_DEBUG` set, an error's stack goes to standard error too, for a trial on invented data).
+//
+// The copy of the database's folder is RPE's data folder for the run: it takes a first config.json there (no secrets.json is read or
+// made), and a backup of the database there if this build migrates it. The build id is RPE's version alone: the folds read the snapshots
+// stored under the store's own identity (`storeIdentity`), whichever build stored them.
+
+import { Database, type SQLQueryBindings } from "bun:sqlite";
+import { rmSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import type { TaggedTurn } from "../../src/adapter/lumiverse/provider";
+import type { ReplyStream } from "../../src/adapter/lumiverse/stream";
+import { textHash } from "../../src/adapter/lumiverse/wire";
+import { dataPaths, openApp, readQuery } from "../../src/app";
+import { compose } from "../../src/app/compose";
+import { configOf } from "../../src/app/config";
+import { loadGuidance } from "../../src/app/guidance";
+import { CAST_VIEWS, castPresentViews, castViews, type CastViewName, MemorySearch } from "../../src/cast";
+import { charactersOf } from "../../src/cast/record";
+import { ROW_PARTS } from "../../src/cast/fold";
+import { mapView, mapWording } from "../../src/iface";
+import { scanMark } from "../../src/lore";
+import { placeLinesAt } from "../../src/places";
+import { tidyHolds } from "../../src/play/path-events";
+import type { JsonObject, JsonValue } from "../../src/shared/json";
+import { trailsOf } from "../../src/quests/trail";
+import { type ChangeInput, openStore, timeDue, WORLD_STATE_SECTIONS, worldState, worldStateFolds } from "../../src/store";
+import { storyBrief } from "../../src/story";
+import { maskWorldInfoScanExclusions, SCAN_SETTING, scannedSteps, scanSettingsOf } from "../../src/turn/scan";
+import { turnSettings } from "../../src/turn/settings";
+import { stageAt, stageCues } from "../../src/turn/stage";
+import { guidanceTexts } from "../../src/turn/texts";
+import { castLayouts, NO_SESSION, ON_STAGE_VIEWS, PARTS, tokenCount } from "../../src/turn/turns";
+import { STORE_AREAS } from "../../src/turn/store-areas";
+
+const [rpeDb, filesDir, indexFile, lumiverseDb, chat, build] = process.argv.slice(2);
+if (rpeDb === undefined || filesDir === undefined || indexFile === undefined || lumiverseDb === undefined || chat === undefined || build === undefined) {
+  console.log(JSON.stringify({ stopped: "arguments", wants: "<copy of rpe.db> <copy of files/> <copy of the index file> <Lumiverse's database> <chat id> <build id>" }));
+  process.exit(2);
+}
+
+// ---------------------------------------------------------------- no network
+
+/** A road out the probe refused, by what asked; the run stops at the first. */
+const refused: string[] = [];
+class NoNetwork extends Error {
+  constructor(readonly what: string) {
+    super(`the probe has no network: ${what}`);
+    this.name = "NoNetwork";
+  }
+}
+const refuse =
+  (what: string) =>
+  (..._: unknown[]): never => {
+    refused.push(what);
+    throw new NoNetwork(what);
+  };
+// Every fetch and web socket of this process, whoever makes one: RPE's and RPH's code reach out by nothing else but a server
+// (`Bun.serve`), which only `App.start` makes, and the probe never starts one. Bun's own properties cannot be replaced.
+globalThis.fetch = Object.assign(refuse("an HTTP call (fetch)"), { preconnect: refuse("an HTTP call (preconnect)") }) as unknown as typeof fetch;
+(globalThis as { WebSocket: unknown }).WebSocket = class {
+  constructor() {
+    refuse("a web socket")();
+  }
+};
+
+/** One line of output. */
+const say = (line: Record<string, JsonValue>): void => console.log(JSON.stringify(line));
+
+/** An error as the output tells it: its kind alone, never its words. */
+const kindOf = (error: unknown): string => (error instanceof NoNetwork ? "NoNetwork" : error instanceof Error ? error.name || "Error" : typeof error);
+
+/** Stops the run where a road out was asked for, naming it and the part it stopped. */
+function stopIfRefused(part: string): void {
+  if (refused.length === 0) return;
+  say({ stopped: "network", by: refused[0] ?? "", part });
+  process.exit(3);
+}
+
+// ---------------------------------------------------------------- the thread's holds
+
+// A timer that ticks every millisecond: a wait between its ticks longer than that is RPE's thread held in one piece.
+const gaps: { from: number; to: number }[] = [];
+let lastTick = performance.now();
+const ticker = setInterval(() => {
+  const now = performance.now();
+  if (now - lastTick > 2) gaps.push({ from: lastTick, to: now });
+  lastTick = now;
+}, 1);
+/** The longest the thread was held in one piece between `from` and `to` (performance time). */
+const heldBetween = (from: number, to: number): number => Math.round(Math.max(0, ...gaps.map((g) => Math.min(g.to, to) - Math.max(g.from, from))));
+/** The machine clock's time as performance time. */
+const offset = Date.now() - performance.now();
+
+const rows: { part: string; ms: number; kb: number; held: number }[] = [];
+const notMade: string[] = [
+  "the lore's projection book, refreshed after a run (it writes to Lumiverse)",
+  "the reply's tie by Lumiverse's end of the generation (the turn is tied by the store's own call, to an invented message)",
+  "the server's own steps before a route (a route is called by its handler)",
+  "the swipe's and the Undo's intake (each is made by the store's own calls)",
+];
+
+async function timed<T>(part: string, work: () => T | Promise<T>, size: (out: T) => number = () => 0): Promise<T | undefined> {
+  const from = performance.now();
+  let out: T | undefined;
+  try {
+    out = await work();
+  } catch (error) {
+    stopIfRefused(part);
+    say({ part, error: kindOf(error) });
+    if (process.env.RPE_PROBE_DEBUG !== undefined) console.error(error instanceof Error ? error.stack : String(error));
+    return undefined;
+  }
+  const to = performance.now();
+  // The tick that ends a hold comes after the work: let it come.
+  await Bun.sleep(5);
+  stopIfRefused(part);
+  let kb = 0;
+  try {
+    kb = out === undefined ? 0 : Math.round(size(out) / 1024);
+  } catch {
+    kb = -1;
+  }
+  const row = { part, ms: Math.round(to - from), kb, held: heldBetween(from, to) };
+  rows.push(row);
+  say(row);
+  return out;
+}
+
+// ---------------------------------------------------------------- RPE over the copies
+
+const found = (() => {
+  const db = new Database(rpeDb, { readonly: true });
+  try {
+    return db.query<{ user: string }, [string]>("SELECT user FROM chat WHERE id = ?").get(chat)?.user ?? null;
+  } finally {
+    db.close();
+  }
+})();
+if (found === null) {
+  say({ stopped: "the copy of the database holds no such chat" });
+  process.exit(2);
+}
+const owner: string = found;
+const root = dirname(resolve(rpeDb));
+const fromFiles = dataPaths(dirname(resolve(filesDir)));
+if (fromFiles.files !== resolve(filesDir)) {
+  say({ stopped: "the copy of the files folder is not named files" });
+  process.exit(2);
+}
+const paths = { ...dataPaths(root), database: resolve(rpeDb), index: resolve(indexFile), files: fromFiles.files, globalConfig: fromFiles.globalConfig, shippedConfig: fromFiles.shippedConfig };
+// Lumiverse's database as the probe reads it: a copy beside the copies, made where the one given lies elsewhere, held open in WAL as a
+// running Lumiverse holds its file (the door reads it through the `-wal` and `-shm` beside it). The second turn writes its messages here.
+const lumiverseCopy = dirname(resolve(lumiverseDb)) === root ? resolve(lumiverseDb) : join(root, "probe-lumiverse.db");
+if (lumiverseCopy !== resolve(lumiverseDb)) {
+  for (const side of ["", "-wal", "-shm", "-journal"]) rmSync(lumiverseCopy + side, { force: true });
+  const from = new Database(resolve(lumiverseDb), { readonly: true });
+  from.run(`VACUUM INTO '${lumiverseCopy.replaceAll("'", "''")}'`);
+  from.close();
+}
+const lumiverseWrites = new Database(lumiverseCopy);
+lumiverseWrites.run("PRAGMA journal_mode = WAL");
+// Config.json's values the composition needs, invented: Lumiverse at an address nothing answers at (every call to it is refused before it
+// leaves), his user (the chat's, read from the copy), and the copy of Lumiverse's database, which the door's reader opens read-only.
+const config = configOf({ v: 1, port: 0, lumiverse: { url: "http://lumiverse.probe.invalid", user: owner, database: lumiverseCopy } }, {}, "the probe's config");
+const logged = { debug: 0, info: 0, warn: 0, error: 0 };
+// What RPE logs is counted by level and never printed; a trial on invented data (`RPE_PROBE_DEBUG`) has each line's words on standard error.
+const debug = process.env.RPE_PROBE_DEBUG !== undefined;
+const logLine = (level: keyof typeof logged) => (message: string, fields?: Record<string, JsonValue>) => {
+  logged[level]++;
+  if (debug) console.error(`${level} ${message}${fields === undefined ? "" : ` ${JSON.stringify(fields)}`}`);
+};
+const log = { debug: logLine("debug"), info: logLine("info"), warn: logLine("warn"), error: logLine("error") };
+const composition = compose({
+  fetch: refuse("an HTTP call to Lumiverse"),
+  open: refuse("a socket to Lumiverse"),
+  // The model layer: no agent is given a model. The intake stops before the first call (below); reaching one stops the run.
+  harness: { models: { agentModel: refuse("a model") } },
+});
+const app = await timed("RPE opened over the copies", () => openApp({ paths, config, version: build, areas: composition.areas, ui: null, log }));
+if (app === undefined) process.exit(1);
+const mounted = composition.turns();
+if (mounted === null) {
+  say({ stopped: "the turn lane did not mount" });
+  process.exit(1);
+}
+const turns = mounted;
+const s = turns.store.user(owner);
+const scope = { user: owner, chat, session: NO_SESSION };
+const settings = await turnSettings(turns.files, scope, turns.env.log);
+const table = app.routes.fix();
+/** A route of RPE's, called by its handler as the server calls it for his page. */
+async function route(path: string, params: Record<string, string>, query: Record<string, string> = {}): Promise<unknown> {
+  const placed = table.get(path)?.get("GET");
+  if (placed === undefined || "raw" in placed.route) throw new Error(`no route GET ${path}`);
+  const read = readQuery(placed.route.query ?? {}, new URLSearchParams(Object.entries(query)), path);
+  if (!read.ok) throw new Error(`the probe's query for ${path} does not read`);
+  const handle = placed.route.handle as (call: unknown) => Promise<unknown>;
+  return await handle({ params, query: read.value, body: undefined, user: owner, auth: { user: owner, access: placed.route.access, listener: "tcp", credential: null }, signal: new AbortController().signal });
+}
+const size = (out: unknown): number => JSON.stringify(out ?? null).length;
+
+await timed("before the turn: the head's state", () => s.headState(chat));
+
+// ---------------------------------------------------------------- what a briefing is built from, each on its own
+
+// Read as the newest turn's own briefing read them, at its start, before the turn the probe plays: each cold, as the intake's
+// briefing finds them for its turn (that step's row below is all of them together, and the rest of the briefing).
+const newestTurn = s.path(chat).findLast((e) => e.turn !== null && !e.user)?.turn ?? null;
+if (newestTurn === null) notMade.push("the briefing's parts (the chat has no turn yet)");
+else {
+  const point = { user: owner, chat, session: NO_SESSION, turn: newestTurn };
+  const guidance = loadGuidance(turns.files, point);
+  const statePart = await guidance.part(PARTS.worldState);
+  const layout = statePart === undefined ? null : await turns.files.read(point, statePart.source.path);
+  const maps = mapView(await mapWording(guidanceTexts(turns.files, point, turns.env.log)), settings.map);
+  if (layout?.status === "read") {
+    const text = layout.text;
+    const inputAt = (turn: string, layoutText: string) => ({ chat, turn, layout: layoutText, map: maps, drawnGiven: {}, placeLines: placeLinesAt(s, turns.store.env, chat, turn, settings.places, settings.map), holds: tidyHolds(turns.store, owner, turn, settings.taps.tidy), due: timeDue(turns.store), settings: settings.worldState, charsPerToken: settings.charsPerToken });
+    // The states it reads, folded first as the briefing folds them (a long fold on a worker thread), then the world state over them.
+    await timed("a briefing's world state's states, folded as the briefing folds them", () => turns.store.afar(() => worldStateFolds(s, newestTurn)));
+    await timed("a briefing's world state", () => worldState(s, inputAt(newestTurn, text)), (o) => o.text.length);
+    // Its parts, read at the start of the turn before the newest (another state, as cold): the tree over the state, then each section of
+    // the layout alone (the layout's own lines, a body of that section only), each on the tree the ones before it read.
+    const earlier = s.turn(newestTurn)?.parent ?? null;
+    const closing = text.startsWith("---\n") ? text.indexOf("\n---", 4) : -1;
+    if (earlier !== null && s.turn(earlier)?.chat === chat && closing >= 0) {
+      const head = text.slice(0, text.indexOf("\n", closing + 1) + 1);
+      await timed("a world state's states, folded as the briefing folds them (the turn before)", () => turns.store.afar(() => worldStateFolds(s, earlier)));
+      await timed("a world state's tree over the state (the turn before)", () => s.viewAt(earlier));
+      await timed("a world state's holds that cannot be (the turn before)", () => tidyHolds(turns.store, owner, earlier, settings.taps.tidy), size);
+      await timed("a world state's place lines, made (the turn before)", () => placeLinesAt(s, turns.store.env, chat, earlier, settings.places, settings.map));
+      for (const section of WORLD_STATE_SECTIONS) await timed(`a world state's section ${section} alone (the turn before)`, () => worldState(s, inputAt(earlier, `${head}{{${section}}}\n`)), (o) => o.text.length);
+      await timed("a world state whole, after its sections (the turn before)", () => worldState(s, inputAt(earlier, text)), (o) => o.text.length);
+    } else notMade.push("a world state's parts (no turn before the newest, or a layout with no header)");
+  } else notMade.push("a briefing's world state (its layout part is not in force for the chat)");
+  const said = (await guidance.part(PARTS.briefing))?.header[ON_STAGE_VIEWS];
+  const named = Array.isArray(said) ? said.flatMap((n) => (typeof n === "string" && n.trim() !== "" ? [n.trim()] : [])) : [];
+  const stage = stageAt(turns.store, owner, chat, newestTurn);
+  const search = new MemorySearch(app.index);
+  const tokens = tokenCount(settings.charsPerToken);
+  if (stage !== null && stage.who.length > 0) {
+    const present = stage.who;
+    const cues = stageCues(stage);
+    if (named.length > 0) {
+      await timed("a briefing's views of those on stage", async () => castPresentViews(named, { store: turns.store, user: owner, chat, turn: newestTurn, present, sources: turns.sources, search, layouts: await castLayouts(guidance, named), tokens, settings: settings.cast, cues }), size);
+    } else notMade.push("a briefing's views of those on stage (the briefing names none)");
+    // The turn's folder's cast views: every view of each character on stage, as the lane writes them alongside the first model call.
+    const all = Object.keys(CAST_VIEWS) as CastViewName[];
+    await timed(
+      "the cast's folder: every view of each on stage",
+      async () => {
+        const layouts = await castLayouts(guidance, all);
+        const out = [];
+        for (const character of new Set(present)) out.push(await castViews(all, { store: turns.store, user: owner, chat, turn: newestTurn, character, present, sources: turns.sources, search, layouts, tokens, settings: settings.cast, cues }));
+        return out;
+      },
+      size,
+    );
+  } else notMade.push("the cast's views (nobody is on stage at the newest turn)");
+  const reads = composition.door.lumiverse()?.reads;
+  if (reads !== undefined) {
+    // The lore map by its parts, each read cold as a turn's start after a start finds it, then the map whole at the same turn, which
+    // finds them held: the chat's path (the intake reads it before its briefing); what activated and the world's entries over no
+    // messages; over the messages Lumiverse scans for lore, read by id and each looked through for the world's keys, then again with
+    // each message's keys kept; the lore's catalogue (its books read from Lumiverse, each entry numbered and worked out) cold and again;
+    // and every entry with its index lines and bindings.
+    const at = { user: owner, chat, turn: newestTurn };
+    const path = await timed("a briefing's lore map, cold: the scan's setting and the chat's path", async () => ({ scan: scanSettingsOf((await reads.setting(SCAN_SETTING))?.value), steps: (await reads.path(chat)) ?? [] }));
+    if (path !== undefined) {
+      const { scan, steps } = path;
+      // The messages it scans, as the briefing gives them: each by its marks, its text read by id only where its keys are not kept.
+      const ask = {
+        ...at,
+        messages: scannedSteps(steps, new Set(), scan.depth).map((m) => ({ id: m.id, mark: scanMark(m) })),
+        texts: async (ids: readonly string[]) => new Map((await reads.messagesById(chat, ids)).map((m) => [m.id, maskWorldInfoScanExclusions(m.text)] as const)),
+        matching: scan.matching,
+      };
+      await timed("a briefing's lore map, cold: its first form over no messages (what activated, the world's entries)", () => turns.lore.loreMap({ ...ask, messages: [] }), size);
+      await timed("a briefing's lore map, cold: its first form (the messages it scans read, each looked through for the world's keys)", () => turns.lore.loreMap(ask), size);
+      await timed("a briefing's lore map: its first form again (each message's keys kept)", () => turns.lore.loreMap(ask), size);
+      await timed("a briefing's lore map, cold: the lore's catalogue (its books read from Lumiverse, numbered, worked out)", () => turns.lore.catalog(at), size);
+      await timed("a briefing's lore map: the lore's catalogue again (its books held as read)", () => turns.lore.catalog(at), size);
+      await timed("a briefing's lore map: every entry with its index lines and bindings", () => turns.loreIndex.entries(at), size);
+      await timed("a briefing's lore map whole, at the same turn after its parts", () => turns.loreIndex.loreMap(ask), size);
+    }
+  }
+  const briefPart = await guidance.part(PARTS.storyBrief);
+  if (briefPart?.format === "template") await timed("a briefing's story brief", () => storyBrief({ store: turns.store, user: owner, chat, turn: newestTurn, ...(stage !== null ? { stage: stage.who } : {}), layout: briefPart }), (o) => o.text.length);
+  await timed("the window, as the next briefing works it out", () => turns.lane.windowOf(owner, chat), size);
+}
+notMade.push("the lore's search and the session files (an agent's run reads and writes them, after the model's first call)");
+
+// What a page reads before the turn, so that what is read after it is what a turn changes.
+const newestReplies = (): string[] =>
+  s
+    .path(chat)
+    .filter((e) => !e.user && e.turn !== null)
+    .slice(-20)
+    .map((e) => e.message);
+await timed("before the turn: /state", () => route("/api/v1/chats/:chat/state", { chat }), size);
+// The Journal's notes, no part of the state: read apart as the Journal reads them when it opens, then again, as it finds them kept.
+await timed("before the turn: the Journal's notes read apart, the first read", () => route("/api/v1/chats/:chat/state/journal", { chat }), size);
+await timed("before the turn: the Journal's notes read apart, again", () => route("/api/v1/chats/:chat/state/journal", { chat }), size);
+await timed("before the turn: the reply lines of the newest 20 replies", () => route("/api/v1/chats/:chat/replies", { chat }, { ids: newestReplies().join(",") }), size);
+
+// ---------------------------------------------------------------- the intake, to the model's first call
+
+const generation = `probe-${crypto.randomUUID()}`;
+const reply = `probe-reply-${crypto.randomUUID()}`;
+const INVENTED = "An invented message, the probe's.";
+// The lore Lumiverse said activated, as the newest turn's request carried it (each entry with its text): a turn's tag carries as much,
+// which the lore map names and reads first.
+const activated = JSON.parse(app.db.query<{ lore: string }, [string, string, string]>("SELECT lore FROM turn_prompt WHERE user = ? AND chat = ? AND turn = ?").get(owner, chat, newestTurn ?? "")?.lore ?? "[]") as TaggedTurn["lore"];
+const tagged: TaggedTurn = {
+  tag: { v: 1, user: owner, chat, generation, kind: "new", target: { message: reply, swipe: 0 }, speaker: { id: null, name: null }, connection: "probe", preset: null, persona: null, cut: { answered: false }, secrecy: { by: "rpe" }, question: null, messages: [] },
+  prompt: [{ role: "user", content: INVENTED }],
+  layout: { messages: [], complete: true, blocks: [], blocksFrom: null, preset: null },
+  cut: { keep: null, byExtension: null, byRpe: 0, joining: { post: "none", collapse: false, from: "settings" }, told: true, clipped: null, notices: [], secrecy: { by: "rpe" }, question: null, trimmed: null, lore: null },
+  model: null,
+  lore: activated,
+  parameters: {},
+};
+const out: ReplyStream = { reasoning: () => undefined, content: () => undefined, progress: () => undefined, toolCalls: () => undefined, finish: () => undefined, error: () => undefined };
+// The intake ends where the harness is asked to answer: the model's first call comes after. The probe stops the turn there.
+const stop: { at: number | null } = { at: null };
+class ProbeStop extends Error {
+  constructor() {
+    super("the probe stops the turn before its model's first call");
+    this.name = "ProbeStop";
+  }
+}
+turns.harness.answer = async () => {
+  stop.at = performance.now();
+  throw new ProbeStop();
+};
+/**
+ * A turn's intake played to the model's first call (its row is `whole`), then each step of it as the lane timed it (`RunRecord.intake`,
+ * each row `steps` and the step's name) with the longest hold inside it, and what is left of it to the model's first call. The run kept.
+ */
+async function intake(whole: string, steps: string, turn: TaggedTurn): Promise<{ turn: string; intake: string | null } | null> {
+  stop.at = null;
+  const began = performance.now();
+  await timed(whole, async () => {
+    try {
+      await turns.lane.play(turn, out, new AbortController().signal);
+    } catch (error) {
+      if (stop.at === null) throw error;
+    }
+    if (stop.at === null) throw new Error("the intake ended before the model's first call");
+  });
+  const kept = app?.db.query<{ turn: string; intake: string | null }, [string, string]>("SELECT turn, intake FROM turn_run WHERE user = ? AND generation = ?").get(owner, turn.tag.generation) ?? null;
+  let stepped = 0;
+  for (const step of JSON.parse(kept?.intake ?? "[]") as { step: string; from: number; to: number }[]) {
+    const row = { part: `${steps}${step.step}`, ms: Math.round(step.to - step.from), kb: 0, held: heldBetween(step.from - offset, step.to - offset) };
+    stepped += row.ms;
+    rows.push(row);
+    say(row);
+  }
+  const reached = stop.at as number | null;
+  if (reached !== null) say({ part: `${steps}the briefing kept, to the model's first call`, ms: Math.round(reached - began - stepped), kb: 0, held: 0 });
+  // An intake that stopped before it kept a run (its row says how) leaves the turn to the store's own call: the rest is measured as after one.
+  if (kept === null) notMade.push(`${whole}: its steps (it stopped before it kept its run: its row names the error's kind)`);
+  await turns.lane.settled();
+  return kept;
+}
+const run = await intake("the intake, to the model's first call", "intake: ", tagged);
+
+// ---------------------------------------------------------------- the commit, of invented changes of the kinds his turns hold most
+
+const head = s.headState(chat).state.world;
+const pov = turns.store.env.worlds(head.revision)?.pov ?? null;
+const someone = Object.keys(head.entities).find((id) => id !== pov && head.entities[id]?.kind === "person") ?? Object.keys(head.entities)[0] ?? "";
+const character = charactersOf(app.db, owner, [chat])[0]?.id ?? "probe-character";
+const invented = (n: number): ChangeInput[] => [
+  { lane: "engine", op: "clock", value: { type: "clock", minutes: 7, cause: "tick" }, by: "gm", source: "gm" },
+  { lane: "engine", op: "set", value: { type: "set", entity: someone, field: "probe_mark", value: n }, by: "gm", source: "gm" },
+  { lane: "engine", op: "minds.mind", value: { type: "minds.mind", data: { entity: someone, at: head.clock, place: null, level: "live", moment: "turn", reason: "live", monologue: "An invented thought.", depiction: "An invented look.", intent: "An invented aim.", reactions: [], plans: [], mood: null, interrupt: null, withheld: false } } as unknown as JsonObject, by: "gm", source: "gm" },
+  { lane: "story", op: "story.write", value: { part: "thread", item: `probe-thread-${n}`, value: { text: `An invented thread, the probe's ${n}.`, hot: true } }, by: "author" },
+  { lane: "story", op: "cast.write", value: { character, part: ROW_PARTS[2], item: `probe-item-${n}`, value: { text: "An invented note, the probe's." } }, by: "author" },
+];
+let turn = run?.turn ?? "";
+if (s.turn(turn)?.status !== "open") turn = (await app.writes.run(() => s.beginTurn({ chat, kind: "normal" }), "the probe's turn")).id;
+await timed("the commit: the turn's changes recorded", () => app.writes.run(() => s.addChanges(turn, invented(1)), "the probe's changes"));
+await timed("the commit: the turn tied to its reply", () => app.writes.run(() => s.tieTurn(turn, { message: reply, hash: textHash("An invented reply, the probe's."), date: Date.now() }), "the probe's tie"));
+
+// The chat's head state as the turn's end leaves it, stored once the chat's writes settle and no run of it goes on (`storeHead`): from
+// the tie until its row is there, the settling included, with the longest hold meanwhile (the head's rows worked out, their write, and
+// the notes and lines the same settling stores).
+const tiedNode = s.turn(turn)?.node ?? "";
+await timed("the commit: the head's state stored after the turn's end (from the tie, the settling included)", async () => {
+  const began = performance.now();
+  while ((turns.store.db.query<{ n: number }, [string, string]>("SELECT count(*) AS n FROM snapshot WHERE user = ? AND node = ?").get(owner, tiedNode)?.n ?? 0) === 0) {
+    if (performance.now() - began > 10_000) throw new Error("the head's state was not stored within ten seconds of the turn's end");
+    await Bun.sleep(5);
+  }
+});
+// After a restart: a store opened afresh over the same database, holding nothing, reads the head; and the changes that read folded, as
+// a fold over a bar of 0 says each (none where the head's state is read whole from the one stored).
+let foldedAfresh = 0;
+const afresh = openStore({
+  db: turns.store.db,
+  registry: turns.store.env.registry,
+  worlds: turns.store.env.worlds,
+  areas: STORE_AREAS,
+  fingerprint: turns.store.fingerprint,
+  workerFoldAt: 0,
+  log: (message, data) => {
+    if (message.startsWith("A fold over the bar")) foldedAfresh += typeof data.changes === "number" ? data.changes : 0;
+  },
+});
+await timed("after a restart: the head's state, read by a store opened afresh", () => afresh.user(owner).headState(chat));
+say({ part: "after a restart: the changes the head's read folded", changes: foldedAfresh });
+
+// ---------------------------------------------------------------- what a page reads after it
+
+/**
+ * Waits until `turn`'s node holds its notes and its line, which a turn's end stores once the chat's writes have settled and no run of it
+ * goes on (`afterTurns`, the settling `SETTLED_MS` included), whether or not a page reads them; ten seconds at most.
+ */
+async function endStored(turn: string): Promise<void> {
+  const began = performance.now();
+  const node = s.turn(turn)?.node ?? "";
+  while ((turns.store.db.query<{ n: number }, [string, string]>("SELECT count(*) AS n FROM turn_read WHERE user = ? AND node = ?").get(owner, node)?.n ?? 0) < 2) {
+    if (performance.now() - began > 10_000) throw new Error("a turn's end stored no notes and line within ten seconds");
+    await Bun.sleep(5);
+  }
+}
+
+async function afterReads(after: string, ended: string): Promise<void> {
+  // What the turn's end stores of its turn with no page asking: its notes and its line, in the background once the writes settle.
+  await timed(`${after}: its turn's notes and line stored by the turn's end, no page asking (from the last write, the settling included)`, () => endStored(ended));
+  // The chat's own reading of its head alone (`headState`: the head turn's state with his changes that stand after it), as the first
+  // read after a write folds it: the rows after it find it held.
+  await timed(`${after}: the head's reading, alone`, () => s.headState(chat));
+  // The quests' trails alone, as the view reads them at the head: one walk of the path, asking what stands placed before each turn
+  // where his own change or an ended job's is anywhere (`valueHistories`).
+  await timed(
+    `${after}: the quests' trails, alone`,
+    () => {
+      const { world } = s.headState(chat).state;
+      return trailsOf(s, turns.store.env, chat, null, turns.store.env.worlds(world.revision)?.tracks ?? {}, world.tracks);
+    },
+    size,
+  );
+  // The state as the page asks for it first, then the Journal's notes as the open Journal reads them again on the new state: only the
+  // turns whose state the write changed are worked out again.
+  await timed(`${after}: /state, the first ask`, () => route("/api/v1/chats/:chat/state", { chat }), size);
+  await timed(`${after}: the Journal's notes read apart`, () => route("/api/v1/chats/:chat/state/journal", { chat }), size);
+  await timed(`${after}: the reply lines of the newest 20 replies`, () => route("/api/v1/chats/:chat/replies", { chat }, { ids: newestReplies().join(",") }), size);
+  await timed(`${after}: the head's state`, () => s.headState(chat));
+  await timed(`${after}: /state, a second ask`, () => route("/api/v1/chats/:chat/state", { chat }), size);
+}
+await afterReads("after the turn", turn);
+
+// A swipe of that turn: another attempt at its reply, begun, recorded and tied as the lane does.
+const swipe = await timed("a swipe: begun", () => app.writes.run(() => s.beginTurn({ chat, kind: "swipe", target: reply }), "the probe's swipe"));
+if (swipe !== undefined) {
+  await timed("a swipe: its changes recorded", () => app.writes.run(() => s.addChanges(swipe.id, invented(2)), "the probe's swipe's changes"));
+  await timed("a swipe: tied to its reply", () => app.writes.run(() => s.tieTurn(swipe.id, { message: reply, hash: textHash("Another invented reply, the probe's."), date: Date.now() }), "the probe's swipe's tie"));
+  await afterReads("after a swipe", swipe.id);
+  // A job of the swipe's turn, with one invented change, ended as a job ends when it settles: what it changed takes effect at once.
+  await timed("a job of the swipe: its change recorded", () => app.writes.run(() => s.addChanges(swipe.id, invented(3).slice(1, 2).map((c) => ({ ...c, job: "probe-job" }))), "the probe's job's change"));
+  await timed("a job of the swipe: ended", () => app.writes.run(() => s.endJob("probe-job"), "the probe's job's end"));
+  await afterReads("after a job's end", swipe.id);
+}
+
+// An edit of his own (invented, as the page writes one), then its Undo, with the same reads after each.
+const edit = await timed("an edit of his own", () => app.writes.run(() => s.addOwnerChanges(chat, [{ lane: "engine", op: "set", value: { type: "set", entity: someone, field: "probe_mark", value: 99 }, by: "player", source: "player" }]), "the probe's edit"));
+if (edit !== undefined) {
+  await afterReads("after an edit of his own", swipe?.id ?? turn);
+  const undone = edit.changes[0]?.id;
+  if (undone !== undefined) {
+    await timed("an Undo of his edit", () => app.writes.run(() => s.undo(undone), "the probe's undo"));
+    await afterReads("after an Undo of his edit", swipe?.id ?? turn);
+  }
+}
+
+// ---------------------------------------------------------------- a second turn, as play makes the turn after one
+
+// The probe's reply as Lumiverse saved it (the swipe's text showing, as the swipe was tied to it) and his next message after it, written
+// into the copy of Lumiverse's database, each a copy of the newest message of its kind in the chat with its own id, place and text and
+// nothing hidden; then the next turn's tag, played as the first was, to the model's first call. Its rows are what a turn's start pays
+// with a message new on the path and the turn before it played, and not only the first turn after a start.
+const REPLIED = ["An invented reply, the probe's.", ...(swipe !== undefined ? ["Another invented reply, the probe's."] : [])];
+const NEXT = "His next invented message, the probe's.";
+const place = (lumiverseWrites.query<{ n: number | null }, [string]>("SELECT max(index_in_chat) AS n FROM messages WHERE chat_id = ?").get(chat)?.n ?? -1) + 1;
+const written = [
+  { user: 0, id: reply, saves: REPLIED },
+  { user: 1, id: `probe-message-${crypto.randomUUID()}`, saves: [NEXT] },
+].every((m, i) => {
+  const like = lumiverseWrites.query<Record<string, SQLQueryBindings>, [string, number]>("SELECT * FROM messages WHERE chat_id = ? AND is_user = ? ORDER BY index_in_chat DESC LIMIT 1").get(chat, m.user);
+  if (like === null) return false;
+  const row: Record<string, SQLQueryBindings> = { ...like, id: m.id, index_in_chat: place + i, content: m.saves.at(-1) ?? "", swipes: JSON.stringify(m.saves), swipe_id: m.saves.length - 1, swipe_dates: JSON.stringify(m.saves.map(() => like.send_date ?? null)), extra: "{}" };
+  const columns = Object.keys(row);
+  lumiverseWrites.run(`INSERT INTO messages (${columns.map((c) => `"${c}"`).join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`, columns.map((c) => row[c] ?? null));
+  return true;
+});
+if (!written) notMade.push("a second turn (the chat holds no reply or no message of his to write the probe's after)");
+else {
+  const second: TaggedTurn = { ...tagged, tag: { ...tagged.tag, generation: `probe-${crypto.randomUUID()}`, target: { message: `probe-reply-${crypto.randomUUID()}`, swipe: 0 } }, prompt: [{ role: "user", content: NEXT }] };
+  await intake("a second turn's intake, to the model's first call", "a second turn's intake: ", second);
+}
+
+clearInterval(ticker);
+// The intakes' steps are parts of their intakes, counted in each one's own row once.
+const counted = rows.filter((r) => !r.part.startsWith("intake: ") && !r.part.startsWith("a second turn's intake: "));
+say({ total: { ms: counted.reduce((n, r) => n + r.ms, 0), held: Math.max(0, ...rows.map((r) => r.held)) }, logged });
+say({ "not made": notMade });
+await app.close();
+process.exit(0);

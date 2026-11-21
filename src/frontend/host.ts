@@ -1,0 +1,128 @@
+// The host capabilities the UI uses, over `SpindleFrontendContext` with the runtime `ctx.ui`
+// shape from `spindle-augment` (DESIGN §18.6). Optional host APIs are feature-detected. The kept
+// views take Spindle's context only here and in the extension shell's mount: what they are given is
+// `HostBridge` (app.ts), whose controls are the four named there.
+
+import { PAGE_SETTING_DEFS } from "../shared/page-settings";
+import { isRecord } from "../shared/json";
+import type { SpindleFrontendContext } from "lumiverse-spindle-types";
+import type { HostUi } from "../spindle-augment";
+import type { DrawerState, HostBridge } from "./app";
+import { isMobile, type Viewport } from "./layout";
+import { createStore } from "../ui/store";
+
+/** Lumiverse's frontend context, which the extension shell hands the loader's mount and makes the bridge from. */
+export type LumiverseContext = SpindleFrontendContext;
+
+export interface Host extends HostBridge {
+  ui: HostUi;
+  dispose(): void;
+}
+
+export interface HostOptions {
+  /** How long a download's link is kept before the browser lets it go (ms), read at each download: the page's `pages.downloadRevokeMs`. */
+  revokeMs: () => number;
+  /** Asks for Lumiverse's drawer to be closed (the one call the host has for it is the backend's, reached through the extension's pipe); without it the bridge says the drawer could not be closed. */
+  closeDrawer?: () => Promise<boolean>;
+}
+
+function readViewport(ui: HostUi): Viewport {
+  const size = ui.geometry ? ui.geometry.layoutViewportSize() : { width: window.innerWidth, height: window.innerHeight };
+  return { width: Math.round(size.width), height: Math.round(size.height), coarse: window.matchMedia?.("(pointer: coarse)").matches === true };
+}
+
+export function createHost(ctx: SpindleFrontendContext, options: HostOptions = { revokeMs: () => PAGE_SETTING_DEFS.downloadRevokeMs.default }): Host {
+  const ui = ctx.ui as unknown as HostUi;
+  const viewport = createStore<Viewport>(readViewport(ui));
+  const drawer = createStore<DrawerState>({ open: ui.events.getDrawerState().open });
+  const syncViewport = () => {
+    const next = readViewport(ui);
+    const current = viewport.get();
+    if (next.width !== current.width || next.height !== current.height || next.coarse !== current.coarse) viewport.set(next);
+  };
+  window.addEventListener("resize", syncViewport);
+  const coarse = window.matchMedia?.("(pointer: coarse)");
+  coarse?.addEventListener("change", syncViewport);
+  const offDrawer = ui.events.onDrawerChange((state) => {
+    if (state.open !== drawer.get().open) drawer.set({ open: state.open });
+  });
+  const closeDrawer = async (): Promise<boolean> => {
+    if (options.closeDrawer === undefined) return false;
+    try {
+      return await options.closeDrawer();
+    } catch (error) {
+      console.warn("[LumiRPEngine] closing the drawer failed", error);
+      return false;
+    }
+  };
+  return {
+    ui,
+    viewport,
+    drawer,
+    components: ctx.components,
+    async confirm(title, message, variant, confirmLabel) {
+      const result = await ui.showConfirm({ title, message, variant, confirmLabel });
+      return result.confirmed;
+    },
+    async worldBooks() {
+      if (!ctx.worldBooks) return [];
+      // The typed shape is `{data, total}`; the running host returns a bare array. Accept both.
+      const result: unknown = await ctx.worldBooks.list({ limit: 500 });
+      const books: unknown[] = Array.isArray(result) ? result : isRecord(result) && Array.isArray(result.data) ? result.data : [];
+      return books.flatMap((book) => (isRecord(book) && typeof book.id === "string" ? [{ id: book.id, name: typeof book.name === "string" ? book.name : book.id }] : []));
+    },
+    async connections() {
+      if (!ctx.connections) return [];
+      const profiles = await ctx.connections.list();
+      return profiles.map((profile) => ({ id: profile.id, name: profile.name, model: profile.model || null }));
+    },
+    download(fileName, text) {
+      const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = fileName;
+      anchor.style.display = "none";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), options.revokeMs());
+    },
+    activeChat: () => ctx.getActiveChat().chatId,
+    async generate(as) {
+      const surfaces = ctx.host.surfaces;
+      if (!surfaces) return false;
+      try {
+        await surfaces.invoke({ kind: "command", id: as === "continue" ? "action-continue" : "action-regenerate" });
+        return true;
+      } catch (error) {
+        console.warn(`[LumiRPEngine] ${as} failed`, error);
+        return false;
+      }
+    },
+    closeDrawer,
+    async revealMessage(messageId) {
+      const element = ctx.dom.findMessageElement(messageId);
+      if (!element) return false;
+      // On a phone the open drawer covers the chat: it closes first, and the reply is scrolled to once the chat shows (a drawer that would not close leaves the reply scrolled to behind it).
+      if (isMobile(viewport.get()) && drawer.get().open) await closeDrawer();
+      // Nothing moves under reduced motion: the jump is instant there.
+      const still = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+      element.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "center" });
+      return true;
+    },
+    dispose() {
+      window.removeEventListener("resize", syncViewport);
+      coarse?.removeEventListener("change", syncViewport);
+      offDrawer();
+    },
+  };
+}
+
+/** The bridge in Lumiverse's drawer: Lumiverse's own context made into the bridge, and its own way to add a stylesheet. */
+export interface LumiverseHost extends Host {
+  addStyle(css: string): () => void;
+}
+
+export function lumiverseHost(ctx: LumiverseContext, options: HostOptions): LumiverseHost {
+  return { ...createHost(ctx, options), addStyle: (css) => ctx.dom.addStyle(css) };
+}

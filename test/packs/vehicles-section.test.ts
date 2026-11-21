@@ -1,0 +1,122 @@
+// The Vehicles section (DESIGN §6, §9.3): everything the player character may use, his own, his
+// family's, and what is assigned or lent to him, each with whose it is, as he may know them, and
+// everything the world keeps of it; the ones away from his site each named with where they are; a
+// vehicle with no tank shows no fuel.
+
+import { describe, expect, test } from "bun:test";
+import type { Level } from "../../src/shared/ids";
+import type { EntityDef, WorldDoc } from "../../src/shared/world";
+import { createRegistry } from "../../src/engine/registry-impl";
+import { Working } from "../../src/engine/working";
+import { ALL_PACKS } from "../../src/packs/index";
+import { modernUsWorld } from "./riverton";
+import { startState } from "./support";
+
+const reg = createRegistry(ALL_PACKS);
+
+function vehicle(id: string, name: string, fields: EntityDef["fields"]): EntityDef {
+  return { id, kind: "vehicle", name, tier: "background", fields: { class: "pickup_midsize", status: "ok", fuel_pct: 50, ...fields }, relations: [] };
+}
+
+function lines(patch: (w: WorldDoc) => void, level: Level = 3): string[] {
+  const world = modernUsWorld("w", "R");
+  world.realism.levels.vehicles = level;
+  patch(world);
+  const w = new Working(reg, world, startState(world, reg));
+  return reg.renderers.filter((r) => r.slot === "vehicles").flatMap((r) => r.render(w.ctx));
+}
+
+describe("the Vehicles section", () => {
+  test("his family's and a lent vehicle are listed with whose they are; a hidden owner is someone", () => {
+    const out = lines((w) => {
+      w.entities.riveras = { id: "riveras", kind: "household", name: "The Riveras", tier: "background", fields: {}, relations: [] };
+      w.entities.you?.relations.push({ type: "member_of", to: "riveras" }, { type: "uses", to: "van", until: 5000 }, { type: "uses", to: "sedan" });
+      w.entities.family_car = vehicle("family_car", "Family wagon", { owner: "riveras", place: "garage" });
+      w.entities.van = vehicle("van", "Shop van", { owner: "rosa", place: "garage" });
+      w.entities.ghost = { id: "ghost", kind: "person", name: "Victor Kane", tier: "background", fields: {}, relations: [], visibility: "secret" };
+      w.entities.sedan = vehicle("sedan", "Black sedan", { owner: "ghost", place: "garage" });
+      w.entities.stranger = vehicle("stranger", "Someone's hatchback", { owner: "jordan", place: "garage" });
+    });
+    const of = (name: string): string | undefined => out.find((l) => l.startsWith(`${name}:`));
+    expect(of("Pickup truck")).toContain("yours");
+    expect(of("Family wagon")).toContain("The Riveras");
+    expect(of("Shop van")).toContain("Rosa Delgado");
+    expect(of("Black sedan")).toBeDefined();
+    expect(out.join("\n")).not.toContain("Victor");
+    // Someone else's at his site is told as theirs, never as one he may use.
+    expect(of("Someone's hatchback")).toContain("Jordan Price");
+    expect(of("Someone's hatchback")).not.toMatch(/yours|to you/);
+  });
+
+  test("his family's at level 2 but not what is lent; at level 1 only his own in the short form", () => {
+    const patch = (w: WorldDoc): void => {
+      w.entities.riveras = { id: "riveras", kind: "household", name: "The Riveras", tier: "background", fields: {}, relations: [] };
+      w.entities.you?.relations.push({ type: "member_of", to: "riveras" }, { type: "uses", to: "van" });
+      w.entities.family_car = vehicle("family_car", "Family wagon", { owner: "riveras", place: "garage" });
+      w.entities.van = vehicle("van", "Shop van", { owner: "rosa", place: "garage" });
+    };
+    const two = lines(patch, 2);
+    expect(two.find((l) => l.startsWith("Family wagon:"))).toMatch(/The Riveras.*fuel/);
+    expect(two.find((l) => l.startsWith("Shop van:"))).not.toMatch(/to you/);
+    const one = lines(patch, 1);
+    expect(one.find((l) => l.startsWith("Pickup truck:"))).toContain("runs fine");
+    expect(one.join("\n")).not.toMatch(/to you|fuel/);
+  });
+
+  test("each one away from his site is named with where it is, after the ones here", () => {
+    const out = lines((w) => {
+      w.places.ranch = { id: "ranch", name: "Willow Ranch", fields: {} };
+      w.places.boathouse = { id: "boathouse", name: "the boathouse", parent: "ranch", fields: {} };
+      for (let i = 0; i < 3; i++) w.entities[`atv${i}`] = vehicle(`atv${i}`, `ATV ${i}`, { owner: "you", place: "ranch" });
+      w.entities.skiff = vehicle("skiff", "Skiff", { owner: "you", place: "boathouse" });
+    });
+    for (let i = 0; i < 3; i++) expect(out.find((l) => l.startsWith(`ATV ${i}:`))).toMatch(/^ATV \d: at Willow Ranch, yours, away from here;/);
+    expect(out.find((l) => l.startsWith("Skiff:"))).toMatch(/^Skiff: at the boathouse, yours, away from here;/);
+    expect(out.findIndex((l) => l.startsWith("Pickup truck:"))).toBe(0);
+  });
+
+  test("a vehicle he may use is told with every field its kind keeps, by its labels, and its cargo by name", () => {
+    const out = lines((w) => {
+      w.entities.truck = vehicle("truck", "Pickup truck", { owner: "you", place: "garage", home: "garage", make: "Halvorsen", model: "Trailhand", year: 2014, colour: "moss green", plate: "7KDX219", odometer_mi: 120500, condition: 40, last_service: 115000, description: "A dented work truck." });
+      w.entities.toolbag = { id: "toolbag", kind: "container", name: "Canvas toolbag", tier: "background", fields: { owner: "you" }, relations: [{ type: "in", to: "truck" }] };
+      w.entities.wrench = { id: "wrench", kind: "item", name: "Torque wrench", tier: "background", fields: { owner: "you" }, relations: [{ type: "in", to: "toolbag" }] };
+    }, 4);
+    const truck = out.find((l) => l.startsWith("Pickup truck:")) ?? "";
+    for (const part of ["make Halvorsen", "model Trailhand", "year 2014", "colour moss green", "plate 7KDX219", "odometer 120,500 mi", "condition worn", "home base", "fuel 50%", "Cargo: Canvas toolbag (holding Torque wrench).", "A dented work truck."]) expect(truck).toContain(part);
+    expect(truck).toMatch(/service (overdue|due at)/);
+  });
+
+  test("in a car lent to him, another's bag is named but what is in it isn't", () => {
+    const out = lines((w) => {
+      w.entities.you?.relations.push({ type: "uses", to: "hatch" });
+      w.entities.hatch = vehicle("hatch", "Maya's hatchback", { owner: "maya", place: "garage" });
+      w.entities.backpack = { id: "backpack", kind: "container", name: "Maya's backpack", tier: "background", fields: { owner: "maya" }, relations: [{ type: "in", to: "hatch" }] };
+      w.entities.diary = { id: "diary", kind: "item", name: "Maya's diary", tier: "background", fields: { owner: "maya" }, relations: [{ type: "in", to: "backpack" }] };
+    });
+    const hatch = out.find((l) => l.startsWith("Maya's hatchback:")) ?? "";
+    expect(hatch).toContain("Cargo: Maya's backpack.");
+    expect(out.join("\n")).not.toContain("diary");
+  });
+
+  test("one away from his site says nothing of who or what is in it", () => {
+    const out = lines((w) => {
+      w.places.ranch = { id: "ranch", name: "Willow Ranch", fields: {} };
+      w.entities.truck = vehicle("truck", "Pickup truck", { owner: "you", place: "ranch" });
+      w.entities.jordan?.relations.push({ type: "in", to: "truck" });
+      w.entities.spare = { id: "spare", kind: "item", name: "Spare tire", tier: "background", fields: { owner: "you" }, relations: [{ type: "in", to: "truck" }] };
+    });
+    const truck = out.find((l) => l.startsWith("Pickup truck:")) ?? "";
+    expect(truck).toContain("away from here");
+    expect(truck).not.toMatch(/Aboard|Cargo|Jordan|Spare tire/);
+  });
+
+  test("a trailer has no tank: no fuel or range", () => {
+    const out = lines((w) => {
+      w.entities.trailer = vehicle("trailer", "Boat trailer", { owner: "you", place: "garage", class: "utility_trailer" });
+    });
+    const trailer = out.find((l) => l.startsWith("Boat trailer:"));
+    expect(trailer).toBeDefined();
+    expect(trailer).not.toMatch(/fuel|~\d/);
+    expect(out.find((l) => l.startsWith("Pickup truck:"))).toMatch(/fuel \d+%/);
+  });
+});

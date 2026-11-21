@@ -1,0 +1,2003 @@
+// Cast life pack (DESIGN §8, §9.3, §24.8): commitments (jobs, school terms and timetables,
+// appointments, trips and vacations, and each character's own plans), routines, chores, needs and
+// drives, agendas, the day planner, off-screen LOD1 execution, NPC↔NPC encounters and invitations,
+// and the narrator's Stance section (§6.6): how the people with the POV stand toward it, what they
+// are about, and the cues for their secrets.
+//
+// Commitments are what the planner treats as fixed blocks (`commitments.ts`): activity schedules
+// (shifts, school timetables; terms are recurrence `from`/`until`), the person fields `appointments`
+// [{at, minutes, place, label}] and `trips` [{from, until, place, label}], and the open plans a
+// character's memory or the GM recorded (`minds.plans`), laid into their windows. Around them a
+// person's routine (`routines.ts`: the world's routines, the chat's own changes, the basic needs)
+// fills the day, with their chores [{label, minutes, place?, utility?}], agendas and overdue loans.
+// Nothing else does: no outing, gathering or invitation that nothing in the world or the story
+// grounds. Needs live in `needs` {name: {v, t}} for the POV; an NPC's are read from their day's plan.
+// What the story established always wins over a routine (`routineYields`).
+//
+// Level contract (domain `castlife`, read at each person):
+//   0  off
+//   1  day-part routines (schedules) and agendas as tracks; trips hold people away
+//   2  commitments set the day
+//   3  the day planner lays whole days for LOD1 agents from their routines (seeded tie-breaks,
+//      recorded ties), with their own plans at their times
+//   4  needs and drives, invitations, NPC↔NPC encounters (regard through relationship.appraise)
+
+import { isRecord, type JsonObject, type JsonValue } from "../../../shared/json";
+import type { EntityId, PlaceId, TierId } from "../../../shared/ids";
+import { facetsInOrder, facetTree } from "../../../shared/classes";
+import { activityPhrase } from "../../../shared/activity";
+import { MINDS_EVENTS } from "../../../shared/minds";
+import { tierLabel, tierOf, tiersInOrder } from "../../../shared/tiers";
+import { activitySpanEnd, type FacetId, type FacetValueId, type FeedScope, type ScheduleDef, type WorldDoc } from "../../../shared/world";
+import type { LintIssue } from "../../../shared/lint";
+import { initialState, minutesBetween } from "../../../engine/world-state";
+import type { LedgerEvent, PackEvent } from "../../../shared/ledger";
+import { calendarOf, clockAt, dateAt, formatClock, formatHHMM, formatTimeOfDay, MINUTES_PER_DAY, parseHHMM, placeOffset } from "../../../engine/calendar";
+import { ENGINE_EVENTS } from "../../../engine/engine-pack";
+import { labelOf, mutableSlice, numOf, objOf, optionalQuery, optionalService, sliceOf, sliceRecord, strOf, own } from "../../../engine/pack-kit";
+import { planDay, tieKey, type FixedBlock, type PlanBlock, type PlanOption } from "../../../engine/plan-day";
+import { clockPaused, fightHoldsClock, speedThrough } from "../../../engine/time";
+import type { AgentInstant, EventTypeDef, FeedLine, PackDef, ReadContext, Rejection, SlotInfo } from "../../../engine/registry";
+import type { PlayerBlock, RoutineAwareness, RoutineEditOp, RoutineMode, RoutineRole, RoutineSociability, SkipBlock, SkipLife } from "../../../shared/routines";
+import { BASIC_BLOCKS, blockShapeProblems, isOff, ROUTINE_AWARENESS, ROUTINE_EVENTS, ROUTINE_MODES, ROUTINE_ROLES, routineSettingsOf, SKIP_LIVES } from "../../../shared/routines";
+import { partyTierIn } from "../../../shared/party";
+import type { NeedId, NeedTuning } from "../../../shared/needs";
+import { CONVERSATION, isNeedId, NEED_DEFAULTS, NEED_IDS, needsOn, needsSettingsOf, needsSettingsProblems, STATED_MINUTES } from "../../../shared/needs";
+import { createRng, type Rng } from "../../../engine/rng";
+import { hashParts } from "../../../shared/hash";
+import { allSchedules, routineStays, scheduleInstants, scheduleOwners } from "../../../engine/schedules";
+import { fieldDef, isGone, kindDef, kindIs, placeOfEntity } from "../../../engine/scope";
+import { povLead, together } from "../../../engine/presence";
+import { listOf, say, wordOf } from "../../../shared/lines";
+import { noteOf, signalOf } from "../../../engine/notices";
+import { relocate } from "../../../engine/relocate";
+import { acts as lifeActs, povLife } from "../../../engine/life";
+import { classValues, isGroup, isMemberOf, MEMBER_OF, selectEntities, TRUST_KIND } from "../../../engine/selector";
+import type { WorldState } from "../../../engine/state";
+import { agendaFor } from "../../../engine/tracks";
+import { lastSighting } from "../../../engine/seen";
+import { hiddenNameCheck, playerKnows } from "../../../engine/player-events";
+import { canSeeEntity, canSeeField, canSeePlace, findLeaks, HIDDEN_PLACE_NAME, knows, loreGateReader, unrevealedSecrets, visibilityOf } from "../../../engine/visibility";
+import { loreReadable } from "../../../engine/lore";
+import { commitments, isPlayed, laidPlans, livesPlans, planTier, plansOf, type CommitmentBlock } from "./commitments";
+import { cueIssues, cuesFor } from "./cues";
+import { birthdayOf, FOND, occasionOf } from "./occasions";
+import { bedPlace, homeOf, placeOfType } from "./places";
+import { activeBlocks, blockOnDay, blockPlace, chatRoles, chatScheduleDefs, followOf, ROUTINE_OPTION, routineDay, routineLived, routineRole, routinesLint, routineYields, scheduleOff, schedulesLint, skipLifeOf, skipPlanOf, withPov, worldRoutines } from "./routines";
+import { ROUTINE_EFFECT, routineChannel, storyEvents } from "./story";
+import { usualRoutineHints } from "./usual";
+import { needWords } from "../../../engine/word-tables";
+
+export { commitments, type CommitmentBlock, type CommitmentKind } from "./commitments";
+
+// ---------------------------------------------------------------- needs
+
+/**
+ * The needs (DESIGN §8, §24.8; 0 = met, 100 = urgent): the activities that meet each and the times of
+ * day (minutes) a routine meets it. Their names and words are `needWords`, shared with every surface.
+ * Whether each is on, how fast it grows and the points it is told and alerts at are the world's
+ * (`world.needs`, `needsSettingsOf`). Only the POV's needs, and one a rule or an action set for
+ * someone, are recorded; an NPC's follow what their day's plan has them do, and the routine's times
+ * stand in before the day has met a need and for anyone the planner doesn't plan.
+ */
+export const NEEDS: Record<NeedId, { satisfiedBy: string[]; daily: number[] }> = {
+  hunger: { satisfiedBy: ["eat", "meal", "lunch", "dinner", "breakfast"], daily: [420, 750, 1110] },
+  fatigue: { satisfiedBy: ["sleep"], daily: [420] },
+  social: { satisfiedBy: ["socialize", "chat", "drinks"], daily: [1140] },
+  // `waiting` is a rest's activity (the Rest action): a rest the turn speeds through meets fun as it ends.
+  fun: { satisfiedBy: ["leisure", "exercise", "drinks", "socialize", "waiting"], daily: [1200] },
+};
+
+function satisfies(activity: string, need: NeedId): boolean {
+  return NEEDS[need].satisfiedBy.some((w) => activity.includes(w));
+}
+
+/** The needs an activity meets, of those the world has on. */
+function needsMetBy(ctx: ReadContext, activity: string): NeedId[] {
+  return needsOn(ctx.world).filter((n) => satisfies(activity, n));
+}
+
+/** How fast the social and fun needs grow for each sociability (DESIGN §8): half as fast, as they are, half again. */
+const SOCIABILITY_RATE: Record<RoutineSociability, number> = { reserved: 0.5, usual: 1, outgoing: 1.5 };
+
+/** Each world's needs as read, kept by its settings' identity: needs are read in the planner's inner loops. */
+const TUNINGS = new WeakMap<object, Record<NeedId, NeedTuning>>();
+
+/**
+ * The needs as a chat reads them: the world's settings; or, folding an event an earlier build recorded
+ * without the value it started from (`legacy`), the defaults those builds had fixed in code, so an
+ * older chat folds as it did whatever its world now sets.
+ */
+function tuningOf(ctx: ReadContext, legacy = false): Record<NeedId, NeedTuning> {
+  const set = ctx.world.needs;
+  if (legacy || set === undefined) return NEED_DEFAULTS;
+  const known = TUNINGS.get(set);
+  if (known) return known;
+  const read = needsSettingsOf(ctx.world);
+  TUNINGS.set(set, read);
+  return read;
+}
+
+/** A need's growth per hour for someone: the world's rate, and its sociability for an NPC's social and fun needs; the POV's are its own. */
+function rateOf(ctx: ReadContext, who: EntityId, need: NeedId, rate: number): number {
+  return who === ctx.world.pov || (need !== "social" && need !== "fun") ? rate : rate * SOCIABILITY_RATE[routineSettingsOf(ctx.world).sociability];
+}
+
+/**
+ * A need at `at` given the blocks of the person's day: from its recorded anchor `{v, t}` (the POV's
+ * starts at 20 at the world's start; one a need met at the end of an activity is at that end, the need
+ * held there until then); else from when those blocks last met it (the end of the latest satisfying
+ * block begun by then, or `at` while they're in it), else from the routine's last time. A need the
+ * world has off is always 0: it never grows, shows, is told or alerts.
+ */
+function needIn(ctx: ReadContext, who: EntityId, need: string, at: number, blocks: readonly Pick<PlanBlock, "start" | "end" | "activity">[], legacy = false): number {
+  if (!isNeedId(need)) return 0;
+  const tuned = tuningOf(ctx, legacy)[need];
+  if (!tuned.on) return 0;
+  const rate = rateOf(ctx, who, need, tuned.rate);
+  const n = objOf(own(objOf(own(ctx.state.entities, who)?.fields.needs), need));
+  if (typeof n.t === "number" || who === ctx.world.pov) {
+    const v = numOf(n.v, 20);
+    const t = numOf(n.t, minutesBetween(ctx.world.calendar.epoch, ctx.world.start.at));
+    return Math.max(0, Math.min(100, v + (rate * Math.max(0, at - t)) / 60));
+  }
+  let met = -Infinity;
+  for (const b of blocks) if (b.start <= at && satisfies(b.activity, need)) met = Math.max(met, Math.min(b.end, at));
+  if (met === -Infinity) {
+    const minute = dateAt(calendarOf(ctx.world), at).minuteOfDay;
+    met = at - Math.min(...NEEDS[need].daily.map((t) => (minute - t + MINUTES_PER_DAY) % MINUTES_PER_DAY));
+  }
+  return Math.min(100, (rate * (at - met)) / 60);
+}
+
+/**
+ * A need now (DESIGN §8, §24.8): recorded, or for an NPC the planner plans (an LOD1 agent from Cast
+ * life 3) from what their day's plan had them do by then, else from the routine's times. `legacy`
+ * reads the day as the template of earlier builds laid it, at the rates they had: only to fold a
+ * `castlife.need` event they recorded without the value it started from, so an older chat folds as it did.
+ */
+export function needValue(ctx: ReadContext, who: EntityId, need: string, at = ctx.state.clock, legacy = false): number {
+  const recorded = typeof objOf(own(objOf(own(ctx.state.entities, who)?.fields.needs), need)).t === "number";
+  const planned = !recorded && livesPlans(ctx, who);
+  const day = dateAt(calendarOf(ctx.world), at).dayIndex;
+  return needIn(ctx, who, need, at, planned ? (legacy ? legacyDayPlan(ctx, who, day) : dayPlan(ctx, who, day)).blocks : [], legacy);
+}
+
+/**
+ * The event that meets a need at `at` (DESIGN §8): it starts from the need as it stands then, so a
+ * fold reads no day plan, and records nothing for a need already met then (or off). `at` may be ahead
+ * of the clock, the end of what meets it: the need grows again only from that end. `lived`: met by the
+ * ordinary time a turn passed rather than by anything done in it, which no player line tells.
+ */
+function metAt(ctx: ReadContext, who: EntityId, need: NeedId, at: number, lived = false): LedgerEvent[] {
+  const v = needValue(ctx, who, need, at);
+  return v > 0 ? [{ type: "castlife.need", data: { entity: who, need, delta: -v, at, from: v, ...(lived ? { lived: true } : {}) } }] : [];
+}
+
+/** A meal's time: the stated length, else half an hour. */
+const EAT_FOR = "minutes > 0 ? minutes : 30";
+/** A rest lasts the stated length, else half an hour: the span of its activity, `waiting`. */
+const REST_FOR = "minutes > 0 ? minutes : 30";
+/** The rest's own time, half an hour or a shorter stated one: the rest of a longer one is its activity's, which the Speed through policy carries (DESIGN §9.2). */
+const REST_TURN = "minutes > 0 ? min(minutes, 30) : 30";
+/** When sleep ends: the stated length, else 07:00. */
+const SLEEP_UNTIL = "minutes > 0 ? clock + minutes : next_time('07:00')";
+/** Going to bed's own five minutes: the rest of the nap is its activity's, which the Speed through policy carries; the night's, a skip's. */
+const SLEEP_TURN = "minutes > 0 ? min(minutes, 5) : 5";
+/** What a stated nap meets as it ends, fatigue; going to bed for the night meets nothing until it's slept through (no need). */
+const NAP_MEETS = "minutes > 0 ? 'fatigue' : ''";
+
+/** Taking someone to their bed, through the one move path; none without a bed or when they're there already. */
+function toBed(ctx: ReadContext, who: EntityId): LedgerEvent[] {
+  const to = bedPlace(ctx, who);
+  return to === null || placeOfEntity(ctx.state, who) === to ? [] : movesOf(relocate(ctx, who, to));
+}
+
+/**
+ * A conversation the POV is in meets its social need (DESIGN §8): at once, unless it is the POV's own
+ * chat, whose span is still going on (`activitySpanEnd`, the length it was stated, else the chat's own):
+ * that is met as the span ends, by the action that began it (`povSpanEnded`, so "Not an action?" takes
+ * it back too) or by the skip that passes it. While the clock is paused or a fight holds it no turn
+ * reaches that end, so it is met at once then too. Nothing for a conversation between others: only
+ * the POV's needs are recorded.
+ */
+function companyMet(ctx: ReadContext, pair: readonly EntityId[]): LedgerEvent[] {
+  const pov = ctx.world.pov;
+  const e = own(ctx.state.entities, pov);
+  if (!e || !pair.includes(pov)) return [];
+  const end = e.fields.activity === "chat" ? activitySpanEnd(e.fields) : null;
+  const held = clockPaused(ctx.world, ctx.state) || fightHoldsClock(ctx);
+  return end !== null && end > ctx.state.clock && !held ? [] : metAt(ctx, pov, "social", ctx.state.clock);
+}
+
+/**
+ * One need of a person as it stands (DESIGN §8): its name and the word it is marked with once it presses ("hungry"), its value of
+ * 100 (rounded, as the gauge shows it) and whether it presses, from the point the world tells it at (read from the value itself);
+ * since when by the story's clock where it presses and its record says (a need the planner reads from a day's blocks keeps none);
+ * the point at which it falls due and alerts a timelapse; and what meets it.
+ */
+export interface NeedStanding {
+  need: NeedId;
+  name: string;
+  label: string;
+  value: number;
+  pressing: boolean;
+  tell: number;
+  alert: number;
+  metBy: string;
+  since: number | null;
+}
+
+/** The minute a need first reached the point it presses from, by its recorded anchor and its rate; null where no anchor is kept. */
+function pressingSince(ctx: ReadContext, who: EntityId, need: NeedId, tuned: NeedTuning): number | null {
+  const n = objOf(own(objOf(own(ctx.state.entities, who)?.fields.needs), need));
+  if (typeof n.t !== "number" && who !== ctx.world.pov) return null;
+  const v = numOf(n.v, 20);
+  const t = numOf(n.t, minutesBetween(ctx.world.calendar.epoch, ctx.world.start.at));
+  const rate = rateOf(ctx, who, need, tuned.rate);
+  if (v >= tuned.tell) return t;
+  return rate > 0 ? t + Math.ceil(((tuned.tell - v) * 60) / rate) : null;
+}
+
+/**
+ * A person's needs as they stand at `at`, each the world has on: the one reading the Needs panel, the narrator's People section and
+ * every agent's read of a person (`needsWords`) give.
+ */
+export function needsOf(ctx: ReadContext, who: EntityId, at = ctx.state.clock): NeedStanding[] {
+  const tuning = tuningOf(ctx);
+  return needsOn(ctx.world).map((need) => {
+    const raw = needValue(ctx, who, need, at);
+    const words = needWords[need];
+    const pressing = raw >= tuning[need].tell;
+    return { need, name: words.name, label: words.word, value: Math.round(raw), pressing, tell: tuning[need].tell, alert: tuning[need].alert, metBy: words.metBy, since: pressing ? pressingSince(ctx, who, need, tuning[need]) : null };
+  });
+}
+
+/** One need in the words an agent is told it (`need_standing`): its name, its value, its word and since when, what meets it, and when it falls due. */
+export function needStandingWords(ctx: ReadContext, who: EntityId, n: NeedStanding): string {
+  const since = n.since === null ? null : formatClock(calendarOf(ctx.world), n.since, placeOffset(ctx.world, n.since, placeOfEntity(ctx.state, who)));
+  return say("need_standing", { name: n.name, value: n.value, word: n.label, pressing: n.pressing, since, if_since: since !== null, tell: n.tell, alert: n.alert, met_by: n.metBy });
+}
+
+/** A need at `value` (a planner's reading of it, at some moment of a day it lays): in the same words (`needStandingWords`), with no since. */
+export function needAtWords(ctx: ReadContext, who: EntityId, need: string, value: number): string {
+  if (!isNeedId(need)) return need;
+  const tuned = tuningOf(ctx)[need];
+  const words = needWords[need];
+  return needStandingWords(ctx, who, { need, name: words.name, label: words.word, value: Math.round(value), pressing: value >= tuned.tell, tell: tuned.tell, alert: tuned.alert, metBy: words.metBy, since: null });
+}
+
+/** A need that falls due when time passes, as it stands at `at`, the moment it reaches the point it alerts at: in the same words (`needStandingWords`). */
+export function needDueWords(ctx: ReadContext, who: EntityId, need: NeedId, at: number): string | undefined {
+  const n = needsOf(ctx, who, at).find((x) => x.need === need);
+  return n === undefined ? undefined : needStandingWords(ctx, who, n);
+}
+
+/**
+ * A person's needs in the words an agent is told them, each as the Needs view gives the player's: the POV's from Cast life 4, and
+ * anyone whose needs are recorded (as the due list lists theirs); never the record they are kept in. Null for anyone else.
+ */
+export function needsWords(ctx: ReadContext, who: EntityId): string | null {
+  const recorded = isRecord(own(ctx.state.entities, who)?.fields.needs);
+  if (!recorded && (who !== ctx.world.pov || ctx.levelOf(who, "castlife") < 4)) return null;
+  const needs = needsOf(ctx, who);
+  return needs.length === 0 ? say("needs_none") : needs.map((n) => needStandingWords(ctx, who, n)).join(" ");
+}
+
+/**
+ * The player character's needs as Play's Me shows them (DESIGN §8): each the world has on, from Cast
+ * life 4, with the point it's told from and what meets it, so the panel can say what a high one means.
+ */
+export interface NeedsView {
+  needs: NeedStanding[];
+}
+
+/** The needs view, or none below Cast life 4, with every need off, or for a POV that doesn't act: Play then shows no Needs. */
+export function buildNeedsView(ctx: ReadContext): NeedsView | null {
+  const pov = ctx.world.pov;
+  if (ctx.levelOf(pov, "castlife") < 4 || needsOn(ctx.world).length === 0 || !acts(ctx, pov)) return null;
+  return { needs: needsOf(ctx, pov) };
+}
+
+/** The world's needs settings as Check world reads them: what a write would refuse, and an alert set below the point the need is told at. */
+function needsIssues(world: WorldDoc): LintIssue[] {
+  if (world.needs === undefined) return [];
+  const problems = needsSettingsProblems(world.needs);
+  if (problems.length > 0) return problems.map((message) => ({ severity: "error", code: "castlife.needs", message: say("lint_needs_settings_message_the_engine_reads_it", { message: message }), path: "needs" }));
+  const tuning = needsSettingsOf(world);
+  return NEED_IDS.flatMap((need): LintIssue[] =>
+    tuning[need].on && tuning[need].alert < tuning[need].tell ? [{ severity: "warning", code: "castlife.needs", message: say("lint_name_s_alert_alert_is_below_the", { name: needWords[need].name, alert: tuning[need].alert, tell: tuning[need].tell }), path: `needs.${need}` }] : [],
+  );
+}
+
+// ---------------------------------------------------------------- planning
+
+function within(dayStart: number, fromH: number, toH: number): { from: number; to: number } {
+  return { from: dayStart + fromH * 60, to: dayStart + toH * 60 };
+}
+
+/** The planner's option id prefix for an agenda's step: `agenda:<track>`. */
+export const AGENDA_OPTION = "agenda:";
+
+/** The activity an agenda's step sets; which agenda it is isn't recorded with it. */
+const AGENDA_ACTIVITY = "agenda";
+
+/** The option id prefix for the block a host's invitation lays in a guest's day: `invited:<host>:<block>`. */
+const INVITED_OPTION = "invited:";
+
+/** Whether a track is public: the only agendas the player is shown. */
+function publicTrack(world: WorldDoc, track: string): boolean {
+  return visibilityOf(own(world.tracks, track)?.visibility) === "public";
+}
+
+/**
+ * A person's activity as the player and the narrator read it (DESIGN §7): as it is, except an
+ * agenda's step or a private block of their routine. An agenda's step doesn't say which agenda it is,
+ * so it reads "busy" unless every agenda the person has is public: it never says they are pursuing
+ * one the player may not know of; a private routine block's activity always reads "busy".
+ */
+export function shownActivity(ctx: ReadContext, who: EntityId, activity: string): string {
+  if (activity !== AGENDA_ACTIVITY) return activeBlocks(ctx, who).some((a) => a.block.private === true && a.block.activity === activity) ? "busy" : activity;
+  const agendas = agendaFor(ctx.world, ctx.state, who);
+  return agendas.length > 0 && agendas.every((a) => publicTrack(ctx.world, a.track)) ? activity : "busy";
+}
+
+/**
+ * The planner's options besides someone's routine, each grounded in the world or the story: their own
+ * chores (authored), the steps of their agendas (story tracks), and getting back a thing an overdue
+ * loan keeps from them.
+ */
+function groundedOptions(ctx: ReadContext, who: EntityId, dayStart: number): PlanOption[] {
+  const home = homeOf(ctx, who);
+  const options: PlanOption[] = [];
+  const chores = own(ctx.state.entities, who)?.fields.chores;
+  if (Array.isArray(chores)) {
+    chores.forEach((raw, i) => {
+      const c = objOf(raw);
+      options.push({ id: `chore:${i}`, label: strOf(c.label, "Chores"), activity: "chores", place: strOf(c.place) || home, duration: numOf(c.minutes, 45), window: within(dayStart, 8, 20), utility: numOf(c.utility, 2), reasons: ["chore"] });
+    });
+  }
+  for (const a of agendaFor(ctx.world, ctx.state, who)) options.push({ id: `${AGENDA_OPTION}${a.track}`, label: a.stageLabel, activity: AGENDA_ACTIVITY, place: home, duration: 60, window: within(dayStart, 9, 20), utility: 1 + a.priority, reasons: [say("plan_reason_agenda", { agenda: a.label })] });
+  const overdue = optionalQuery(ctx, "gear.overdue");
+  if (overdue) {
+    for (const g of overdue(ctx, who)) {
+      const where = placeOfEntity(ctx.state, g.borrower) ?? placeOfEntity(ctx.state, g.thing);
+      options.push({ id: `retrieve:${g.thing}`, label: say("plan_label_retrieve", { thing: own(ctx.state.entities, g.thing)?.name ?? g.thing, borrower: own(ctx.state.entities, g.borrower)?.name ?? g.borrower }), activity: `retrieve:${g.thing}`, place: where, duration: 45, window: within(dayStart, 8, 20), utility: 7, reasons: [say("plan_reason_overdue_loan")] });
+    }
+  }
+  return options;
+}
+
+/**
+ * The day template earlier builds planned every agent's day from, story or no story: sleep, meals,
+ * seeing friends and time out, holidays and birthdays, shaped by the day's occasion. It plans no new
+ * day: it is kept only so a `castlife.need` event an earlier build recorded, without the value it
+ * started from, folds as it did (`needValue` with `legacy`), which reads that day as it was laid then.
+ */
+export function legacyDayOptions(ctx: ReadContext, who: EntityId, dayStart: number): PlanOption[] {
+  const level = ctx.levelOf(who, "castlife");
+  const home = homeOf(ctx, who);
+  const cal = calendarOf(ctx.world);
+  const hourOf = (t: number): number => dateAt(cal, t).minuteOfDay / 60;
+  const need = (n: string, t: number, laid: readonly PlanBlock[]): number => (level >= 4 ? needIn(ctx, who, n, t, laid, true) : 0);
+  // A need that presses on a block is its reason, in the words an agent is told a need (`needAtWords`).
+  const pressed =
+    (n: string) =>
+    (t: number, laid: readonly PlanBlock[]): string[] => {
+      const v = need(n, t, laid);
+      return v >= 50 ? [needAtWords(ctx, who, n, v)] : [];
+    };
+  const occasion = occasionOf(ctx, who, dateAt(cal, dayStart).dayIndex);
+  const off = occasion.dayOff;
+  const company = placeOfType(ctx, "conversation", home) ?? home;
+  const outdoors = occasion.foul ? home : (placeOfType(ctx, "exploration", home) ?? home);
+  const outside = (occasion.season === "summer" ? 0.5 : occasion.season === "winter" ? -0.5 : 0) - (occasion.foul ? 1 : 0);
+  const unwind = [...(off ? [say("plan_reason_a_day_off")] : []), ...(occasion.season === "summer" || occasion.season === "winter" ? [wordOf("season", occasion.season)] : []), ...(occasion.foul ? [say("plan_reason_bad_weather")] : [])];
+  const options: PlanOption[] = [
+    { id: "sleep", label: say("plan_label_sleep"), activity: "sleep", place: home, duration: 480, repeat: true, reasons: [say("plan_reason_night")], utility: (t) => (hourOf(t) >= 21.5 || hourOf(t) < 6 ? 10 : 0) },
+    { id: "breakfast", label: say("plan_label_breakfast"), activity: "breakfast", place: home, duration: 30, window: off ? within(dayStart, 7, 11) : within(dayStart, 6, 10), utility: (t, laid) => 4 + need("hunger", t, laid) / 20, reasons: off ? [say("plan_reason_morning_meal"), say("plan_reason_a_slow_morning")] : [say("plan_reason_morning_meal")], because: pressed("hunger") },
+    { id: "lunch", label: say("plan_label_lunch"), activity: "lunch", place: company, duration: 45, window: within(dayStart, 11, 14), utility: (t, laid) => 4 + need("hunger", t, laid) / 20, reasons: [say("plan_reason_midday_meal")], because: pressed("hunger") },
+    { id: "dinner", label: say("plan_label_dinner"), activity: "dinner", place: home, duration: 60, window: within(dayStart, 17, 21), utility: (t, laid) => 4.5 + need("hunger", t, laid) / 20, reasons: [say("plan_reason_evening_meal")], because: pressed("hunger") },
+    { id: "leisure", label: say("plan_label_leisure"), activity: "leisure", place: outdoors, duration: 60, window: within(dayStart, 9, off ? 22 : 20), utility: (t, laid) => 1.5 + (off ? 1 : 0) + outside + need("fun", t, laid) / 30, reasons: [say("plan_reason_unwind"), ...unwind], because: pressed("fun") },
+  ];
+  const social = optionalQuery(ctx, "regard");
+  let fondness = 0;
+  if (social) for (const other of Object.keys(ctx.state.entities)) if (other !== who && kindIs(ctx.registry, ctx.world, own(ctx.state.entities, other)?.kind ?? "", "person")) fondness = Math.max(fondness, social(ctx, who, other));
+  options.push({ id: "socialize", label: say("plan_label_socialize"), activity: "socialize", place: company, duration: 90, window: off ? within(dayStart, 12, 23) : within(dayStart, 17, 22), utility: (t, laid) => 2.5 + (off ? 1 : 0) - (occasion.foul ? 0.5 : 0) + fondness / 50 + need("social", t, laid) / 25, reasons: [say("plan_reason_company"), ...(fondness >= FOND ? [say("plan_reason_a_close_friend")] : []), ...(off ? [say("plan_reason_a_day_off")] : [])], because: pressed("social") });
+  options.push(...groundedOptions(ctx, who, dayStart));
+  for (const h of occasion.holidays) {
+    options.push(h.dayOff ? { id: `holiday:${h.id}`, label: h.label, activity: "socialize", place: home, duration: 180, window: within(dayStart, 12, 20), utility: 5.5, reasons: [h.label] } : { id: `holiday:${h.id}`, label: h.label, activity: "leisure", place: company, duration: 90, window: within(dayStart, 17, 22), utility: 3, reasons: [h.label] });
+  }
+  if (occasion.birthday) options.push({ id: "birthday", label: say("plan_label_birthday"), activity: "socialize", place: company, duration: 150, window: within(dayStart, 17, 23), utility: 6.5, reasons: [say("plan_reason_their_birthday")] });
+  for (const friend of occasion.friends.slice(0, 2)) {
+    const theirs = homeOf(ctx, friend);
+    options.push({ id: `birthday:${friend}`, label: say("plan_label_a_friend_s_birthday"), activity: "socialize", place: theirs !== null && own(ctx.world.places, theirs) ? theirs : company, duration: 90, window: within(dayStart, 17, 22), utility: 4 + (social?.(ctx, who, friend) ?? 0) / 50, reasons: [say("plan_label_a_friend_s_birthday")] });
+  }
+  return options;
+}
+
+/**
+ * The blocks invitations lay in a guest's day (DESIGN §8, with invitations between everyone): each
+ * fixed block of someone's routine that asks its company along, on that day, with the guest among
+ * its company, when the guest knows the host and follows their routine with invitations, cut around
+ * the guest's commitments. Only an enforced routine asks anyone along: an informative one moves no
+ * one, so its host wouldn't be there.
+ */
+function invitedBlocks(ctx: ReadContext, guest: EntityId, day: number, commitments: readonly FixedBlock[]): FixedBlock[] {
+  if (routineSettingsOf(ctx.world).invitations !== "everyone" || followOf(ctx, guest).mode !== "follows" || guest === ctx.world.pov) return [];
+  const cal = calendarOf(ctx.world);
+  const start = clockAt(cal, day, 0);
+  const hosts = new Set<EntityId>();
+  for (const def of worldRoutines(ctx.world)) if (def.blocks.some((b) => !isOff(b) && b.company?.invite === true)) for (const who of Object.keys(ctx.state.entities).sort()) hosts.add(who);
+  const out: FixedBlock[] = [];
+  for (const host of [...hosts].sort()) {
+    if (host === guest || !acquainted(ctx.state, host, guest) || followOf(ctx, host).mode !== "follows" || routineRole(ctx, host) !== "enforced") continue;
+    for (const { block } of activeBlocks(ctx, host, day)) {
+      if (block.kind !== "fixed" || block.company?.invite !== true || !selectEntities(ctx.registry, ctx.world, ctx.state, block.company.who).includes(guest) || !blockOnDay(ctx, host, block, day)) continue;
+      const s = start + parseHHMM(block.at ?? "00:00");
+      const e = s + block.minutes;
+      if (commitments.some((c) => c.start < e && c.end > s)) continue;
+      out.push({ start: s, end: e, label: block.label, activity: block.activity, place: blockPlace(ctx, host, block), reason: "invited", option: `${INVITED_OPTION}${host}:${block.id}` });
+    }
+  }
+  return out;
+}
+
+export interface DayPlan {
+  day: number;
+  /** `option` is the planner's option the block came from (`routine:<block>`, `plan:<plan>`, `agenda:<track>` for an agenda's step, `invited:<host>:<block>`). */
+  blocks: { start: number; end: number; option: string; label: string; activity: string; place: PlaceId | null; reasons: string[]; fixed: boolean }[];
+  ties: { key: string; chosen: string; via: string; options: string[] }[];
+  tieZone: boolean;
+}
+
+function decisions(state: Readonly<WorldState>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(objOf(sliceOf(state, "castlife").decisions))) if (typeof v === "string") out[k] = v;
+  return out;
+}
+
+/**
+ * Plans a day (DESIGN §8, §24.8): commitments fixed (schedules, appointments, trips, story plans),
+ * then the fixed blocks of their routine and blocks invitations lay, then the flexible and optional
+ * ones and what the world grounds (chores, agendas, overdue loans) by utility in the free time; ties
+ * use a recorded `npc.choose` decision, else the seed. Only a person has a routine. `legacy` lays the
+ * day from the template of earlier builds instead (`legacyDayOptions`), for folding what they recorded.
+ */
+export function planFor(ctx: ReadContext, who: EntityId, day: number, rng: Rng, legacy = false): DayPlan {
+  const cal = calendarOf(ctx.world);
+  const start = clockAt(cal, day, 0);
+  const end = start + MINUTES_PER_DAY;
+  const fixed = commitments(ctx, who, start, end);
+  const person = kindIs(ctx.registry, ctx.world, own(ctx.state.entities, who)?.kind ?? "", "person");
+  const level = ctx.levelOf(who, "castlife");
+  const routine = !legacy && person ? routineDay(ctx, who, day, fixed, { need: (n, t, laid) => (level >= 4 ? needIn(ctx, who, n, t, laid) : 0), words: (n, v) => needAtWords(ctx, who, n, v), meets: (activity) => needsMetBy(ctx, activity) }) : { fixed: [], options: [] };
+  const invited = legacy || !person ? [] : invitedBlocks(ctx, who, day, [...fixed, ...routine.fixed]);
+  const options = legacy ? legacyDayOptions(ctx, who, start) : [...routine.options, ...groundedOptions(ctx, who, start)];
+  const plan = planDay({ agent: who, start, end, fixed: [...fixed, ...routine.fixed, ...invited], options, rng, recorded: decisions(ctx.state) });
+  return {
+    day,
+    // Chosen-by-utility blocks state their utility; a close call says so, and says when the person's own choice (the recorded `npc.choose` decision) settled it.
+    blocks: plan.blocks.map((b: PlanBlock) => {
+      const tie = plan.ties.find((t) => t.at === b.start);
+      const close = tie ? [tie.via === "seed" ? say("plan_reason_close_call") : say("plan_reason_close_call_chose", { name: own(ctx.state.entities, who)?.name.split(" ")[0] ?? say("plan_word_they") })] : [];
+      return { start: b.start, end: b.end, option: b.option, label: b.label, activity: b.activity, place: b.place, reasons: b.fixed || b.utility <= 0 ? b.reasons : [...b.reasons, say("plan_reason_utility", { utility: Math.round(b.utility * 10) / 10 }), ...close], fixed: b.fixed };
+    }),
+    ties: plan.ties.map((t) => ({ key: t.key, chosen: t.chosen, via: t.via, options: t.options.map((o) => o.id) })),
+    tieZone: plan.tieZone,
+  };
+}
+
+/**
+ * A person's plan for a day (default today): a pure function of the state and a per-(world,
+ * person, day) seed, so it is re-derived wherever it is needed and never recorded. Only
+ * `npc.choose` decisions for its ties are (`castlife.decision`).
+ */
+export function dayPlan(ctx: ReadContext, who: EntityId, day = dateAt(calendarOf(ctx.world), ctx.state.clock).dayIndex): DayPlan {
+  return planFor(ctx, who, day, createRng(hashParts("castlife.plan", ctx.world.id, who, String(day))));
+}
+
+/** A day as the template of earlier builds laid it, with the same seed: only for folding what they recorded (`needValue` with `legacy`). */
+function legacyDayPlan(ctx: ReadContext, who: EntityId, day: number): DayPlan {
+  return planFor(ctx, who, day, createRng(hashParts("castlife.plan", ctx.world.id, who, String(day))), true);
+}
+
+function held(state: Readonly<WorldState>, who: EntityId, target: string, at: number): boolean {
+  const until = own(objOf(own(state.entities, who)?.fields.holds), target);
+  return typeof until === "number" && until > at;
+}
+
+/** Chance per slot that an agent runs into someone where it is, and the share of strangers who then get acquainted. */
+const ENCOUNTER_CHANCE = 0.25;
+const ACQUAINT_CHANCE = 0.15;
+
+/** Two people know each other when either holds a regard relation toward the other. */
+function acquainted(state: Readonly<WorldState>, a: EntityId, b: EntityId): boolean {
+  return !!own(state.entities, a)?.relations.some((r) => r.type === "regard" && r.to === b) || !!own(state.entities, b)?.relations.some((r) => r.type === "regard" && r.to === a);
+}
+
+// ---------------------------------------------------------------- the agent process
+
+/**
+ * Someone takes up a block of their day (DESIGN §8): its place and its activity (null leaves either
+ * as it is), unless a hold keeps either, a fight under way keeps them (the combat pack's
+ * `combat.engaged`) or the POV's routine can't take it there (stranded, or the place out of reach).
+ * Arriving where the POV is says so; `quiet`, it only notes, as an arrival a Live or Near character's
+ * routine makes in a skip never stops it. `seen`, a block of their skip life taking them out of the
+ * POV's scene: the POV sees them go, a note the Montage tells. A block of their own plan (`holdUntil`,
+ * its end) holds its place and activity for its span, as a trip does, so a routine's schedule edge
+ * inside it doesn't take them back (DESIGN §24.8).
+ */
+function takeUp(ctx: ReadContext, who: EntityId, place: PlaceId | null, activity: string | null, at: number, holdUntil?: number, quiet = false, seen = false): LedgerEvent[] {
+  const out: LedgerEvent[] = [];
+  const e = own(ctx.state.entities, who);
+  if (!e || routineStays(ctx, who, place) || optionalQuery(ctx, "combat.engaged")?.(ctx, who) === true) return out;
+  if (!held(ctx.state, who, "place", at) && place && own(ctx.world.places, place) && placeOfEntity(ctx.state, who) !== place) {
+    // Seen as their arrival is: by a POV that can see them, whether or not it holds a `knows` link to them.
+    if (seen && withPov(ctx, who)) out.push(...noteOf("person_leaves", { name: e.name }, { entity: who, visibility: "public" }));
+    // The player character's party goes with it, as on every move it makes (DESIGN §9.4).
+    out.push(...movesOf(relocate(ctx, who, place, { party: true })));
+    if (who !== ctx.world.pov && place === placeOfEntity(ctx.state, ctx.world.pov)) out.push(...signalOf("arrival", "person_arrives", { name: e.name }, { entity: who, ...(quiet ? { stops: false } : {}) }));
+  }
+  if (activity !== null && !held(ctx.state, who, "activity", at) && e.fields.activity !== activity) out.push({ type: "set", entity: who, field: "activity", value: activity });
+  if (holdUntil !== undefined && holdUntil > at) {
+    const holds = objOf(e.fields.holds);
+    const kept = { ...holds, place: Math.max(numOf(holds.place, 0), holdUntil), activity: Math.max(numOf(holds.activity, 0), holdUntil) };
+    if (kept.place !== holds.place || kept.activity !== holds.activity) out.push({ type: "set", entity: who, field: "holds", value: kept });
+  }
+  return out;
+}
+
+/** A move's events through the one move path (`relocate`); someone the world doesn't have moves nowhere. */
+function movesOf(moved: LedgerEvent[] | Rejection): LedgerEvent[] {
+  return "code" in moved ? [] : moved;
+}
+
+/** The activity a block sets: an overdue loan's retrieval is an errand. */
+function blockActivity(activity: string): string {
+  return activity.startsWith("retrieve:") ? "errand" : activity;
+}
+
+/**
+ * Someone lives the block of their day that holds from `at` (DESIGN §8): what the story established
+ * wins over it. A block of their own plan (the story's) moves them unless they're in a scene with the
+ * POV. Any other block of their day (their routine, their schedules, the basic needs, what the world
+ * grounds) moves only someone whose routine is lived now (`routineLived`: enforced, or informative in
+ * a skip they spend on it, `skip`): for anyone else it is context only. It moves them at its own start (`edge`), as `routineYields` decides against
+ * where their routine had them since the step before (`from`): on an edge, every block from the one
+ * that held at `from` (the day before's, across midnight) to the one before this one, since the
+ * blocks between were lived at their own moments in a timelapse, or not at all in a catch-up; between
+ * the block's own edges, this block and the one before it. A block that names no place, after one
+ * that did, takes them home, as a plan's end does. Going to bed is where balanced awareness hands the
+ * day back to the routine. A scene with the POV holds them only while the story holds the POV
+ * (`scene`, `SlotInfo.povRoutine` false); while time runs on its own, there's none.
+ */
+function liveBlock(ctx: ReadContext, who: EntityId, plan: DayPlan, block: DayPlan["blocks"][number], from: number, at: number, scene: boolean, skip: boolean): LedgerEvent[] {
+  const activity = blockActivity(block.activity);
+  if (block.option.startsWith("plan:")) return scene && withPov(ctx, who) ? [] : takeUp(ctx, who, block.place, activity, at, block.end);
+  if (who !== ctx.world.pov && !routineLived(ctx, who, skip)) return [];
+  const edge = block.start > from && block.start <= at;
+  const index = plan.blocks.indexOf(block);
+  const earlier = from < clockAt(calendarOf(ctx.world), plan.day, 0) ? [...dayPlan(ctx, who, plan.day - 1).blocks, ...plan.blocks.slice(0, index)] : plan.blocks.slice(0, index);
+  const had = (edge ? earlier.filter((b) => b.end > from) : [...earlier.slice(-1), block]).reverse();
+  const e = own(ctx.state.entities, who);
+  const home = homeOf(ctx, who);
+  // A place or activity any of those blocks set is the routine's own; anything else, the story's. So is
+  // home after free time (which takes them there), and resting after a schedule (whose end returns them to rest).
+  const rests = had.some((b) => b.option.startsWith("schedule:"));
+  const places = [...had.flatMap((b) => (b.place !== null ? [b.place] : [])), ...(home !== null && (rests || had.some((b) => b.place === null)) ? [home] : [])];
+  const resting = rests && e ? fieldDef(ctx.registry, ctx.world, e.kind, "activity")?.default : undefined;
+  const doings = [...had.map((b) => blockActivity(b.activity)), ...(typeof resting === "string" ? [resting] : [])];
+  const wasPlace = places.find((p) => p === e?.fields.place) ?? places[0] ?? [...earlier].reverse().find((b) => b.place !== null)?.place ?? home;
+  const wasDoing = doings.find((d) => d === e?.fields.activity) ?? doings[0] ?? null;
+  const target = block.place ?? (edge && earlier.at(-1)?.place ? home : null);
+  const opts = { edge, release: block.activity === "sleep", scene, skip, at };
+  const place = target !== null && !routineYields(ctx, who, "place", wasPlace, opts) ? target : null;
+  const doing = routineYields(ctx, who, "activity", wasDoing, opts) ? null : activity;
+  // A routine never stops a skip for the cast the story is about, nor for anyone it moves only in a
+  // skip: their arrival only notes, and the POV sees the latter go from its scene (DESIGN §8 skip lives).
+  const skipLife = skip && who !== ctx.world.pov && routineRole(ctx, who) !== "enforced";
+  const tier = skip && place !== null ? (optionalQuery(ctx, "minds.tier")?.(ctx, who) ?? "background") : "background";
+  return takeUp(ctx, who, place, doing, at, undefined, tier === "live" || tier === "near" || skipLife, skipLife);
+}
+
+/**
+ * A character's plans settled at a slot step (DESIGN §24.8): done once every block laid for one has
+ * passed by the slot's end, dropped once its window has with none laid (no time was free in it, a
+ * trip took it, or a Background character follows routine only). Each says when it was settled, the
+ * end of its last block or of its window, never the clock: catch-up settles it late but alike.
+ */
+function planOutcomes(ctx: ReadContext, who: EntityId, slot: SlotInfo): LedgerEvent[] {
+  if (who === ctx.world.pov) return [];
+  const due = (optionalQuery(ctx, "minds.plans")?.(ctx, who) ?? []).filter((p) => p.status === "open" && isPlayed(p) && p.when.from <= slot.end);
+  if (due.length === 0) return [];
+  const tier = planTier(ctx, who);
+  const routineOnly = tier === "background" && followOf(ctx, who).awareness !== "story_first";
+  const laid = laidPlans(ctx, who, routineOnly ? [] : due);
+  const out: LedgerEvent[] = [];
+  for (const p of due) {
+    const blocks = laid.get(p.id) ?? [];
+    const last = Math.max(...blocks.map((b) => b.end));
+    if (blocks.length > 0 && last <= slot.end) out.push({ type: MINDS_EVENTS.plan, data: { entity: who, plan: p.id, status: "done", at: last, reason: null } });
+    else if (blocks.length === 0 && p.when.to <= slot.end) out.push({ type: MINDS_EVENTS.plan, data: { entity: who, plan: p.id, status: "dropped", at: p.when.to, reason: routineOnly ? say("reason_routine_only") : say("reason_no_time_for_it") } });
+  }
+  return out;
+}
+
+/** How far ahead of a plan with the POV its invitation comes, at most: never before the day it's on, and at the earliest the moment after the plan was made. */
+const INVITE_LEAD = 6 * 60;
+
+/** Something that asks the POV along: when it asks, and when and where it meets, under a key naming it once. */
+export interface Ask {
+  key: string;
+  ask: number;
+  at: number;
+  place: PlaceId | null;
+  origin: { type: "plan"; plan: string } | { type: "routine"; block: string };
+}
+
+/**
+ * Whether `host` may ask the POV along to `place` now (DESIGN §8): only on a ground (an ask is one),
+ * and never from the cast the story is about (Live and Near characters: their minds and the scene
+ * speak for them, so nothing interrupts play for them), from someone with the POV already, from
+ * someone the chat set to make no invitations, to a POV that doesn't act, is held away, or is where
+ * they'd meet, nor between people who don't know each other or where the host regards the POV badly.
+ */
+function mayInvite(ctx: ReadContext, host: EntityId, place: PlaceId | null): boolean {
+  const pov = ctx.world.pov;
+  if (followOf(ctx, host).mode !== "follows" || withPov(ctx, host) || !acts(ctx, pov)) return false;
+  const tier = optionalQuery(ctx, "minds.tier")?.(ctx, host) ?? "background";
+  if (tier === "live" || tier === "near") return false;
+  if (held(ctx.state, pov, "place", ctx.state.clock) || (place !== null && placeOfEntity(ctx.state, pov) === place)) return false;
+  if (!acquainted(ctx.state, host, pov) && !knows(ctx.state, host, pov)) return false;
+  return (optionalQuery(ctx, "regard")?.(ctx, host, pov) ?? 0) >= 0;
+}
+
+/**
+ * Everything of a character's that asks the POV along (DESIGN §8, §24.8): each of their plans with
+ * the POV that something was laid for, and, while their routine is enforced (an informative one moves
+ * no one, so they wouldn't be there), from their routine each block on `days` that asks its company
+ * along with the POV among it, while the world's invitations reach the player. Each asks at most 6
+ * hours ahead, never before the day it's on, and a plan never before the moment after it was made.
+ */
+export function asksOf(ctx: ReadContext, who: EntityId, days: readonly number[]): Ask[] {
+  const pov = ctx.world.pov;
+  const cal = calendarOf(ctx.world);
+  const out: Ask[] = [];
+  const plans = plansOf(ctx, who).filter((p) => p.with.includes(pov));
+  if (plans.length > 0) {
+    const laid = laidPlans(ctx, who, plans);
+    for (const p of plans) {
+      const first = laid.get(p.id)?.[0];
+      // A plan everyone in it shares asks once, whoever in it asks first: its key names the plan alone.
+      if (first) out.push({ key: p.shared === true ? `plan:${p.id}` : `${who}:plan:${p.id}`, ask: Math.max(first.start - INVITE_LEAD, p.made + 1, clockAt(cal, dateAt(cal, first.start).dayIndex, 0)), at: first.start, place: first.place ?? null, origin: { type: "plan", plan: p.id } });
+    }
+  }
+  if (routineSettingsOf(ctx.world).invitations === "off" || followOf(ctx, who).mode !== "follows" || routineRole(ctx, who) !== "enforced") return out;
+  const asking = activeBlocks(ctx, who).filter(({ block }) => block.company?.invite === true && selectEntities(ctx.registry, ctx.world, ctx.state, block.company.who).includes(pov));
+  if (asking.length === 0) return out;
+  for (const day of days) {
+    for (const b of dayPlan(ctx, who, day).blocks) {
+      const id = b.option.startsWith(ROUTINE_OPTION) ? b.option.slice(ROUTINE_OPTION.length) : null;
+      if (id === null || !asking.some((a) => a.block.id === id)) continue;
+      out.push({ key: `${who}:routine:${id}:${day}`, ask: Math.max(b.start - INVITE_LEAD, clockAt(cal, day, 0)), at: b.start, place: b.place, origin: { type: "routine", block: id } });
+    }
+  }
+  return out;
+}
+
+/** The days a slot touches, for the asks inside it. */
+function slotDays(ctx: ReadContext, slot: SlotInfo): number[] {
+  const cal = calendarOf(ctx.world);
+  const first = dateAt(cal, slot.start).dayIndex;
+  const last = dateAt(cal, slot.end).dayIndex;
+  return first === last ? [first] : [first, last];
+}
+
+/**
+ * An ask's invitation (DESIGN §8, §24.8), once: the POV asked to where and when it meets, under its
+ * key, when the host may invite (`mayInvite`) at that moment. Its text never names a place the POV
+ * can't see.
+ */
+function invitation(ctx: ReadContext, who: EntityId, ask: Ask): LedgerEvent[] {
+  const given = sliceOf(ctx.state, "castlife").invitations;
+  if (!mayInvite(ctx, who, ask.place) || (Array.isArray(given) && given.some((i) => objOf(i).key === ask.key))) return [];
+  const text = invitationText(ctx, who, ask.place, ask.at, ctx.world.pov);
+  return [{ type: "castlife.invitation", data: { agent: who, place: ask.place, at: ask.at, text, key: ask.key, origin: ask.origin.type === "plan" ? `plan:${ask.origin.plan}` : `routine:${ask.origin.block}` } }, ...(text === "" ? [] : [{ type: ENGINE_EVENTS.signal, data: { class: "invitation", text, entity: who } }])];
+}
+
+/**
+ * The invitations to the POV still open (`invited`): the meeting at most 3 hours past and at most a
+ * day ahead, from a host the POV doesn't know to have stopped acting.
+ */
+function openInvitations(ctx: ReadContext): JsonObject[] {
+  const list = sliceOf(ctx.state, "castlife").invitations;
+  const now = ctx.state.clock;
+  return (Array.isArray(list) ? list : []).map(objOf).filter((inv) => {
+    const at = numOf(inv.at);
+    return povLife(ctx.world, ctx.state, strOf(inv.agent))?.acts !== false && at >= now - 180 && at <= now + MINUTES_PER_DAY;
+  });
+}
+
+/**
+ * Accepting `host`'s open invitation books it (DESIGN §8, §24.8): an appointment in the POV's day at
+ * the meeting's time, for as long as the host's own block for it lasts (an hour when it can't be
+ * found), with everyone in the plan that asked (the host alone for a routine's), under the
+ * invitation's key, so accepting it again books nothing more. Its place only when the POV can see
+ * it, so its day never takes it somewhere it doesn't know of; its label names only the host, never
+ * a plan's words, which stay the character's own.
+ */
+function bookInvitation(ctx: ReadContext, host: EntityId): LedgerEvent[] {
+  const pov = ctx.world.pov;
+  const inv = openInvitations(ctx).findLast((i) => strOf(i.agent) === host);
+  const e = own(ctx.state.entities, pov);
+  if (!inv || !e) return [];
+  const at = numOf(inv.at);
+  const key = strOf(inv.key) || `${host}:${at}`;
+  const booked = Array.isArray(e.fields.appointments) ? e.fields.appointments : [];
+  if (booked.some((a) => objOf(a).invitation === key)) return [];
+  const origin = strOf(inv.origin);
+  const plan = origin.startsWith("plan:") ? (optionalQuery(ctx, "minds.plans")?.(ctx, host) ?? []).find((p) => `plan:${p.id}` === origin) : undefined;
+  const cal = calendarOf(ctx.world);
+  const blocks = plan ? (laidPlans(ctx, host, [plan]).get(plan.id) ?? []) : dayPlan(ctx, host, dateAt(cal, at).dayIndex).blocks;
+  const end = blocks.find((b) => b.start === at)?.end;
+  const place = typeof inv.place === "string" && own(ctx.world.places, inv.place) && canSeePlace(ctx.registry, ctx.world, ctx.state, pov, inv.place) ? inv.place : null;
+  const people = [...new Set([host, ...(plan?.with ?? [])])].filter((id) => id !== pov);
+  const appointment: JsonObject = { at, minutes: end !== undefined && end > at ? end - at : 60, ...(place ? { place } : {}), label: say("plan_label_with", { host: own(ctx.state.entities, host)?.name ?? host }), with: people, invitation: key };
+  return [{ type: "set", entity: pov, field: "appointments", value: [...booked, appointment] }];
+}
+
+/**
+ * An agent's moments between slot steps (DESIGN §8, §24.8, `ProcessDef.instants`): each block of
+ * their plans starting or ending inside the slot; while their routine is lived (`routineLived`), the
+ * start of every other block of their day inside it, so a fixed block happens at its time and dinner
+ * at dinner time, unless a plan's end hands them to it or it is a trip (`stepTrips` takes them away);
+ * in a skip the model planned for them, the start of each block of their skip life (`skipBlocksOf`:
+ * the plan's, and the basic needs filling the time it leaves open); and from
+ * Cast life 4 the moment something of theirs asks the POV along. The POV's day only while its routine
+ * runs (`SlotInfo.povRoutine`). Laid from the plans, the routine, the commitments and the recorded
+ * skip plan alone, so every segment of a timelapse finds the same.
+ */
+function planMoments(ctx: ReadContext, who: EntityId, slot: SlotInfo): AgentInstant[] {
+  const inside = (at: number): boolean => at > slot.start && at < slot.end;
+  const out: AgentInstant[] = [];
+  if (plansOf(ctx, who).length > 0) {
+    for (const c of commitments(ctx, who, slot.start, slot.end)) {
+      if (c.plan === undefined) continue;
+      if (inside(c.start)) out.push({ at: c.start, key: `start:${c.plan}` });
+      if (inside(c.end)) out.push({ at: c.end, key: `end:${c.plan}` });
+    }
+  }
+  const from = skipPlanOf(ctx.state)?.from;
+  for (const b of skipBlocksOf(ctx, who, slot)) {
+    // A block already under way as the skip starts is taken up at its start (`opens`), not at the slot's step.
+    if (from !== undefined && b.start <= from && from < b.end) {
+      if (from >= slot.start && from < slot.end) out.push({ at: from, key: `skip:${b.start}`, opens: true });
+    } else if (inside(b.start)) out.push({ at: b.start, key: `skip:${b.start}` });
+  }
+  if (who === ctx.world.pov ? slot.povRoutine !== false : routineLived(ctx, who, slot.timelapse === true)) {
+    const cal = calendarOf(ctx.world);
+    const handed = new Set(out.flatMap((m) => (m.key.startsWith("end:") ? [m.at] : [])));
+    const lived = livedAtMinute(ctx, who, slot);
+    const home = homeOf(ctx, who);
+    // Where they are as each block starts: where they are now, then each block's place, and home in
+    // free time after a block with one (`liveBlock`).
+    let before = placeOfEntity(ctx.state, who);
+    let placed = false;
+    for (let day = dateAt(cal, slot.start).dayIndex; day <= dateAt(cal, slot.end - 1).dayIndex; day++) {
+      for (const b of dayPlan(ctx, who, day).blocks) {
+        if (!inside(b.start)) continue;
+        if (!b.option.startsWith("plan:") && b.activity !== "trip" && !handed.has(b.start) && lived(b, before)) out.push({ at: b.start, key: `block:${b.option}` });
+        before = b.place ?? (placed ? home : before);
+        placed = b.place !== null;
+      }
+    }
+  }
+  if (ctx.levelOf(who, "castlife") >= 4) for (const a of asksOf(ctx, who, slotDays(ctx, slot))) if (inside(a.ask)) out.push({ at: a.ask, key: `invite:${a.key}` });
+  if (who === ctx.world.pov) out.push(...activityEndMoment(ctx, slot));
+  return out;
+}
+
+/** Whether someone lives every block of their day at its own minute in this slot: in a turn, everyone; in a Timelapse, the POV and the Live, Near and Far cast. */
+function livesEveryBlock(ctx: ReadContext, who: EntityId, slot: SlotInfo): boolean {
+  return slot.timelapse !== true || who === ctx.world.pov || (optionalQuery(ctx, "minds.tier")?.(ctx, who) ?? "background") !== "background";
+}
+
+/**
+ * Which blocks of someone's day starting inside a slot they live at their own minute (DESIGN §8,
+ * observable fidelity): every one, if they live every block (`livesEveryBlock`); otherwise only where
+ * the POV could see it, meeting them where the block takes them while it lasts or seeing them leave
+ * (`before`, where they were). An off-screen Background agent in a Timelapse otherwise lives the day
+ * at slot steps only, as net state, so a skip spends no events on what no one sees.
+ */
+function livedAtMinute(ctx: ReadContext, who: EntityId, slot: SlotInfo): (block: DayPlan["blocks"][number], before: PlaceId | null) => boolean {
+  if (livesEveryBlock(ctx, who, slot)) return () => true;
+  const pov = ctx.world.pov;
+  const here = placeOfEntity(ctx.state, pov);
+  const home = homeOf(ctx, pov) ?? here;
+  const cal = calendarOf(ctx.world);
+  const plans = new Map<number, DayPlan>();
+  const planOf = (day: number): DayPlan => {
+    const plan = plans.get(day) ?? dayPlan(ctx, pov, day);
+    plans.set(day, plan);
+    return plan;
+  };
+  // Where the POV is over part of the slot: where the story holds it, else where its own day has it
+  // (free time after a block with a place takes it home, as `liveBlock` lives it).
+  const povAt = (from: number, to: number): Set<PlaceId> => {
+    const out = new Set<PlaceId>();
+    if (slot.povRoutine === false) {
+      if (here !== null) out.add(here);
+      return out;
+    }
+    for (let day = dateAt(cal, from).dayIndex; day <= dateAt(cal, to - 1).dayIndex; day++) {
+      const blocks = planOf(day).blocks;
+      blocks.forEach((b, i) => {
+        if (b.end <= from || b.start >= to) return;
+        const place = b.place ?? (blocks.slice(0, i).some((x) => x.place !== null) ? home : here);
+        if (place !== null) out.add(place);
+      });
+    }
+    return out;
+  };
+  // Lived at its minute where the POV could meet them there while it lasts, or sees them leave.
+  return (block, before) => (block.place !== null && povAt(block.start, block.end).has(block.place)) || (before !== null && povAt(block.start, block.start + 1).has(before));
+}
+
+/** A block someone lives in a skip the model planned for them (DESIGN §8): one of its blocks, or a basic need or rest in time none covers (`place` null: where they are). */
+type SkipLived = Pick<SkipBlock, "start" | "end" | "activity"> & { place: PlaceId | null };
+
+/** The basic need (`BASIC_BLOCKS`) a day plan's block is, by its id: laid as `routine:<id>`, a night's sleep past midnight as `routine:<id>:carried`; null for any other block. */
+function basicNeedOf(option: string): string | null {
+  const id = option.startsWith(ROUTINE_OPTION) ? option.slice(ROUTINE_OPTION.length).replace(/:carried$/, "") : null;
+  return BASIC_BLOCKS.some((b) => b.id === id) ? id : null;
+}
+
+/**
+ * The blocks someone lives in this slot's skip while they spend skips as the model plans (DESIGN §8):
+ * the recorded plan's blocks for them (`castlife.skip_plan`) and, in every minute of its span that no
+ * planned block covers (between its blocks; all of it for someone it left out, or when its call failed),
+ * their basic needs as their day lays them (sleep at home at night, their meals; one laid at work where
+ * they are, since the floor never sends anyone to work), at rest after one
+ * until the next block. Nothing else of their routine: basic needs are the floor, and they go home to
+ * sleep on their own, so a plan never has to name a home the POV may not know. None outside a skip or
+ * its span, or for anyone else. Laid for the slot's own days, which is all a slot looks up.
+ */
+function skipBlocksOf(ctx: ReadContext, who: EntityId, slot: SlotInfo): readonly SkipLived[] {
+  if (slot.timelapse !== true || skipLifeOf(ctx, who) !== "model") return [];
+  const plan = skipPlanOf(ctx.state);
+  if (!plan) return [];
+  const planned = plan.plans.find((p) => p.entity === who)?.blocks ?? [];
+  const lo = Math.max(slot.start, plan.from);
+  const hi = Math.min(slot.end, plan.to);
+  if (lo > hi) return planned;
+  // Part of [start, end) inside the span that no planned block covers.
+  const open = (start: number, end: number): [number, number][] => {
+    let pieces: [number, number][] = [[Math.max(start, plan.from), Math.min(end, plan.to)]];
+    for (const b of planned) pieces = pieces.flatMap(([s, e]): [number, number][] => (b.end <= s || b.start >= e ? [[s, e]] : [...(s < b.start ? [[s, b.start] as [number, number]] : []), ...(b.end < e ? [[b.end, e] as [number, number]] : [])]));
+    return pieces.filter(([s, e]) => s < e);
+  };
+  const cal = calendarOf(ctx.world);
+  const basic: SkipLived[] = [];
+  for (let day = dateAt(cal, lo).dayIndex; day <= dateAt(cal, hi).dayIndex; day++) {
+    const atWork = activeBlocks(ctx, who, day).flatMap(({ block }) => (block.place === "work" ? [block.id] : []));
+    for (const b of dayPlan(ctx, who, day).blocks) {
+      const need = basicNeedOf(b.option);
+      if (need === null) continue;
+      for (const [start, end] of open(b.start, b.end)) basic.push({ start, end, place: atWork.includes(need) ? null : b.place, activity: b.activity });
+    }
+  }
+  // After a basic need, at rest where it left them until the next block (planned or basic), as after a story plan.
+  const rest = fieldDef(ctx.registry, ctx.world, own(ctx.state.entities, who)?.kind ?? "", "activity")?.default;
+  const starts = [...planned, ...basic].map((b) => b.start);
+  const resting =
+    typeof rest !== "string"
+      ? []
+      : basic.flatMap((b): SkipLived[] => {
+          const next = Math.min(plan.to, ...starts.filter((s) => s >= b.end));
+          return next > b.end ? [{ start: b.end, end: next, place: null, activity: rest }] : [];
+        });
+  return [...planned, ...basic, ...resting];
+}
+
+/**
+ * Someone takes up a block of their skip life (DESIGN §8: the model's, or a basic need filling time it
+ * left open), as an enforced routine's block is taken up: not while a story plan (or an order of the
+ * party's), a trip or an appointment of theirs holds the moment, nor against the GM's intent or a timed
+ * order under way (`orgs.on_order`). Being their skip life's, it may take them out of the scene the
+ * story holds with the POV, which sees them go (a note the Montage tells), and back: their arrival
+ * where the POV is only notes.
+ */
+function liveSkipBlock(ctx: ReadContext, who: EntityId, block: SkipLived, at: number): LedgerEvent[] {
+  if (commitments(ctx, who, at, at + 1).some((c) => c.kind === "plan" || c.kind === "trip" || c.kind === "appointment")) return [];
+  if (optionalQuery(ctx, "minds.intent")?.(ctx, who) === true || optionalQuery(ctx, "orgs.on_order")?.(ctx, who, at) === true) return [];
+  return takeUp(ctx, who, block.place, block.activity, at, undefined, true, true);
+}
+
+/**
+ * What an agent does at a moment: the invitation goes out; at a block of their day starting, they
+ * live it as a slot step would (`liveBlock`, so the story still comes first); at a block the model
+ * planned for their skip starting, they take it up (`liveSkipBlock`); or at their own plan's start or
+ * end they take up the block of their day that holds from then (the plan's own, held for its span;
+ * after its end what follows, home when that names no place), unless they are in a scene with the POV
+ * while the story holds the POV (`SlotInfo.povRoutine` false), which in a skip only a story plan's
+ * block is held to. Someone whose routine isn't lived takes up only their plans: after one they take
+ * up the skip's planned block holding then, if any, else stay where it left them, at rest, until the
+ * story moves them. After a plan's block, someone on a timed order of the party's still under way
+ * stays at it (`orgs.on_order`, assess-party §6.2): what follows is routine, which gives way to it.
+ */
+function atPlanMoment(ctx: ReadContext, who: EntityId, moment: AgentInstant, slot: SlotInfo): LedgerEvent[] {
+  if (moment.key === ACTIVITY_END) return povLivedNeeds(ctx, slot, moment.at);
+  const cal = calendarOf(ctx.world);
+  if (moment.key.startsWith("invite:")) {
+    const ask = asksOf(ctx, who, [dateAt(cal, moment.at).dayIndex, dateAt(cal, moment.at).dayIndex + 1]).find((a) => `invite:${a.key}` === moment.key);
+    return ask ? invitation(ctx, who, ask) : [];
+  }
+  const scene = slot.povRoutine === false;
+  const planned = skipBlocksOf(ctx, who, slot);
+  if (moment.key.startsWith("skip:")) {
+    const starting = planned.find((b) => `skip:${b.start}` === moment.key);
+    return starting ? liveSkipBlock(ctx, who, starting, moment.at) : [];
+  }
+  const plan = dayPlan(ctx, who, dateAt(cal, moment.at).dayIndex);
+  if (moment.key.startsWith("block:")) {
+    const starting = plan.blocks.find((b) => b.start === moment.at);
+    // Someone who lives only the blocks the POV could see lived none since the slot's step but those:
+    // the routine had them anywhere since then, as a slot step reads it.
+    const from = livesEveryBlock(ctx, who, slot) ? moment.at - 1 : slot.start;
+    return starting ? liveBlock(ctx, who, plan, starting, from, moment.at, scene, slot.timelapse === true) : [];
+  }
+  const block = plan.blocks.find((b) => b.start <= moment.at && moment.at < b.end);
+  if (!block) return [];
+  if (moment.key.startsWith("end:") && !block.option.startsWith("plan:") && optionalQuery(ctx, "orgs.on_order")?.(ctx, who, moment.at) === true) return [];
+  const skipLife = slot.timelapse === true && who !== ctx.world.pov && routineRole(ctx, who) !== "enforced" && !block.option.startsWith("plan:");
+  if (scene && withPov(ctx, who) && !skipLife) return [];
+  if (who !== ctx.world.pov && !block.option.startsWith("plan:") && !routineLived(ctx, who, slot.timelapse === true)) {
+    const holding = planned.find((b) => b.start <= moment.at && moment.at < b.end);
+    if (holding) return liveSkipBlock(ctx, who, holding, moment.at);
+    if (scene && withPov(ctx, who)) return [];
+    const rest = fieldDef(ctx.registry, ctx.world, own(ctx.state.entities, who)?.kind ?? "", "activity")?.default;
+    return takeUp(ctx, who, null, typeof rest === "string" ? rest : null, moment.at);
+  }
+  return takeUp(ctx, who, block.place ?? (moment.key.startsWith("end:") ? homeOf(ctx, who) : null), blockActivity(block.activity), moment.at, block.option.startsWith("plan:") ? block.end : undefined, skipLife, skipLife);
+}
+
+/**
+ * Until when the POV lived `activity` in the span (`since`, `at`] (DESIGN §8): `at`, while its routine
+ * runs and the block of its day holding then is that activity (it sleeps at night by routine); else
+ * the end of the span the action that began it gave it (`activitySpanEnd`: only while that is still
+ * the activity, never an end another one left behind), when that reaches past `since`. Null when
+ * nothing says it lived it then: an activity the story left behind long ago meets nothing.
+ */
+function livedUntil(ctx: ReadContext, activity: string, since: number, at: number, routine: boolean): number | null {
+  if (activity === "") return null;
+  const pov = ctx.world.pov;
+  if (routine) {
+    const plan = dayPlan(ctx, pov, dateAt(calendarOf(ctx.world), at - 1).dayIndex);
+    if (plan.blocks.some((b) => b.start < at && at <= b.end && blockActivity(b.activity) === activity)) return at;
+  }
+  const fields = own(ctx.state.entities, pov)?.fields;
+  const until = fields?.activity === activity ? activitySpanEnd(fields) : null;
+  return until !== null && until > since ? Math.min(until, at) : null;
+}
+
+/** Whether someone the POV knows (seen and met, still acting) is with it now: time with them is company. */
+function inCompany(ctx: ReadContext): boolean {
+  const pov = ctx.world.pov;
+  const here = placeOfEntity(ctx.state, pov);
+  if (here === null) return false;
+  return Object.entries(ctx.state.entities).some(
+    ([id, e]) => id !== pov && kindIs(ctx.registry, ctx.world, e.kind, "person") && !isGone(ctx.state, id) && acts(ctx, id) && together(ctx.world, here, placeOfEntity(ctx.state, id)) && playerKnows(ctx.registry, ctx.world, ctx.state, pov, id),
+  );
+}
+
+/**
+ * Where the time a skip passes in a slot begins (DESIGN §8): the slot's start, or the run's when it
+ * began inside the slot. A slot the run only catches the POV up through was played in ordinary turns,
+ * so it begins at or past that slot's end: what the POV did then is the story's, never read from now.
+ */
+function passedFrom(slot: SlotInfo): number {
+  return Math.max(slot.start, slot.run?.from ?? slot.start);
+}
+
+/**
+ * What the POV's time in a skip met by `at` (DESIGN §8; a slot's end, or where the run stops inside
+ * the slot): the needs the activity it lived up to then meets (its sleep, its meals, time out), met
+ * when it stopped or at `at`, and at a slot's end company: someone it knows with it meets its social
+ * need. Only for time the run itself passes; a need already met by then records nothing.
+ */
+function povLivedNeeds(ctx: ReadContext, slot: SlotInfo, at = slot.end): LedgerEvent[] {
+  const pov = ctx.world.pov;
+  const since = passedFrom(slot);
+  if (at <= since) return [];
+  const activity = strOf(own(ctx.state.entities, pov)?.fields.activity);
+  const end = livedUntil(ctx, activity, since, at, slot.povRoutine !== false);
+  const met: [NeedId, number][] = end === null ? [] : needsMetBy(ctx, activity).map((n) => [n, end]);
+  if (at === slot.end && !met.some(([n]) => n === "social") && needsOn(ctx.world).includes("social") && inCompany(ctx)) met.push(["social", at]);
+  return met.flatMap(([need, t]) => metAt(ctx, pov, need, t));
+}
+
+/**
+ * What the POV lived through an ordinary turn's own time (DESIGN §8; `ProcessDef.lived`), read as it
+ * ends: someone it knows with it then meets its social need. What an activity meets as its span ends
+ * is the turn's to read (`povSpanEnded`) or its Speed through's; the story holds the POV in a turn, so
+ * its routine says nothing here, and no skip reads this time again (`passedFrom`).
+ */
+function povTurnNeeds(ctx: ReadContext, who: EntityId, span: { from: number; to: number }): LedgerEvent[] {
+  if (who !== ctx.world.pov || ctx.levelOf(who, "castlife") < 4 || !needsOn(ctx.world).includes("social") || !inCompany(ctx)) return [];
+  return metAt(ctx, who, "social", span.to, true);
+}
+
+/**
+ * What an activity met as its span ended within a turn's time (DESIGN §8; `ProcessDef.ended`): the
+ * needs that activity meets, at that end (a world's own dinner, a chat, the rest of a bath an earlier
+ * turn began). The turn makes the action's own span part of that action, so "Not an action?" takes
+ * it back with the activity; worded, unlike what a turn's own time met.
+ */
+function povSpanEnded(ctx: ReadContext, who: EntityId, activity: { type: string; until: number }): LedgerEvent[] {
+  if (who !== ctx.world.pov || ctx.levelOf(who, "castlife") < 4) return [];
+  return needsMetBy(ctx, activity.type).flatMap((n) => metAt(ctx, who, n, activity.until));
+}
+
+/**
+ * A moment that moves the POV off an activity it was living (its routine waking it, taking it from a
+ * meal) meets what that activity met, then (DESIGN §8); a slot's step reads the rest (`povLivedNeeds`).
+ * A moment the run only catches up through meets nothing.
+ */
+function povActivityEnds(ctx: ReadContext, who: EntityId, at: number, slot: SlotInfo, events: LedgerEvent[]): LedgerEvent[] {
+  if (who !== ctx.world.pov || ctx.levelOf(who, "castlife") < 4 || at <= passedFrom(slot)) return events;
+  const was = strOf(own(ctx.state.entities, who)?.fields.activity);
+  const moved = events.some((ev) => ev.type === "set" && ev.entity === who && ev.field === "activity" && ev.value !== was);
+  const end = moved ? livedUntil(ctx, was, passedFrom(slot), at, slot.povRoutine !== false) : null;
+  return end === null ? events : [...needsMetBy(ctx, was).flatMap((n) => metAt(ctx, who, n, end)), ...events];
+}
+
+/** The moment the span of the POV's activity ends inside a slot, or the run does first (`AgentInstant.key`). */
+const ACTIVITY_END = "needs:end";
+
+/**
+ * The POV's moment in a slot where what it is doing stops being lived by this run (DESIGN §8): the end
+ * of the span its action gave it (`activitySpanEnd`), or the run's own end when that comes first inside
+ * the slot, so a skip ending mid-slot (a speed-through to 07:00) meets the activity's needs then.
+ * `povLivedNeeds` reads at that moment what it lived, so a span that ended before the run meets nothing.
+ */
+function activityEndMoment(ctx: ReadContext, slot: SlotInfo): AgentInstant[] {
+  const pov = ctx.world.pov;
+  const e = own(ctx.state.entities, pov);
+  if (ctx.levelOf(pov, "castlife") < 4 || needsMetBy(ctx, strOf(e?.fields.activity)).length === 0) return [];
+  const from = passedFrom(slot);
+  const until = activitySpanEnd(e?.fields);
+  const ends = [...(until !== null && until > from ? [until] : []), ...(slot.run ? [slot.run.to] : [])];
+  const at = ends.length > 0 ? Math.min(...ends) : null;
+  return at !== null && at > from && at < slot.end ? [{ at, key: ACTIVITY_END }] : [];
+}
+
+/**
+ * Steps one LOD1 agent through one slot (Cast life ≥ 3): plan the day, live the block (the POV only
+ * while its routine runs: `SlotInfo.povRoutine`), settle their plans, needs, encounters and
+ * invitations; nothing for someone who doesn't act.
+ */
+function stepAgent(slot: SlotInfo, ctx: ReadContext, rngFor: (entity: EntityId) => Rng, who: EntityId): LedgerEvent[] {
+  const out: LedgerEvent[] = [];
+  const e = own(ctx.state.entities, who);
+  if (!e || !acts(ctx, who)) return out;
+  const level = ctx.levelOf(who, "castlife");
+  const cal = calendarOf(ctx.world);
+  // A slot is stepped when it completes: the agent takes up the block that holds from the slot's end.
+  const day = dateAt(cal, slot.end).dayIndex;
+  const rng = rngFor(who);
+  const plan = dayPlan(ctx, who, day);
+  const block = plan.blocks.find((b) => b.start <= slot.end && slot.end < b.end) ?? plan.blocks[plan.blocks.length - 1];
+  if (!block) return out;
+  const pov = ctx.world.pov;
+  if (block.activity.startsWith("retrieve:")) {
+    // The owner's retrieval plan for an overdue use grant: the thing comes back (a vehicle to its home base).
+    const thing = block.activity.slice("retrieve:".length);
+    const lent = own(ctx.state.entities, thing)?.fields.owner === who && Object.values(ctx.state.entities).some((x) => x.relations.some((r) => r.type === "uses" && r.to === thing));
+    const retrieve = lent ? optionalService(ctx, "gear.retrieve") : null;
+    if (retrieve) {
+      const got = retrieve(ctx, thing);
+      if (Array.isArray(got)) out.push(...got, ...noteOf("thing_got_back", { name: e.name, thing: own(ctx.state.entities, thing)?.name ?? thing }, { entity: who, visibility: "known_by" }));
+    }
+  }
+  if (who !== pov || slot.povRoutine !== false) out.push(...liveBlock(ctx, who, plan, block, slot.start, slot.end, slot.povRoutine === false, slot.timelapse === true));
+  // In a skip the model planned for them, the planned block holding from the slot's end (taken up at its start already, unless something held them then).
+  const planned = skipBlocksOf(ctx, who, slot).find((b) => b.start <= slot.end && slot.end < b.end);
+  if (planned) out.push(...liveSkipBlock(ctx, who, planned, slot.end));
+  out.push(...planOutcomes(ctx, who, slot));
+  if (level < 4) return out;
+
+  // Needs: only the POV's are recorded (an NPC's follow their day's plan). It is stepped only in a
+  // skip, which meets what it lived through (its sleep, its meals, time out, company); a need that
+  // crossed its alert point and wasn't met raises the alert.
+  if (who === pov) {
+    const lived = povLivedNeeds(ctx, slot);
+    out.push(...lived);
+    const met = new Set(lived.map((ev) => ("data" in ev ? strOf(ev.data.need) : "")));
+    const tuning = tuningOf(ctx);
+    for (const need of needsOn(ctx.world)) {
+      const alert = tuning[need].alert;
+      if (!met.has(need) && needValue(ctx, who, need, slot.end) >= alert && needValue(ctx, who, need, slot.start) < alert) out.push(...signalOf("needs", "need_alert", { word: needWords[need].word }, { entity: pov }));
+    }
+    return out;
+  }
+
+  // NPC↔NPC encounters: at most one per slot, with someone at the block's place who still acts.
+  // Acquaintances (a regard relation either way) meet and their regard moves; strangers sometimes get acquainted.
+  const appraise = optionalService(ctx, "relationship.appraise");
+  const g = rng.fork("encounters");
+  if (appraise && block.place && g.next() < ENCOUNTER_CHANCE) {
+    const here = Object.keys(ctx.state.entities)
+      .sort()
+      .filter((other) => other !== who && other !== pov && kindIs(ctx.registry, ctx.world, own(ctx.state.entities, other)?.kind ?? "", "person") && placeOfEntity(ctx.state, other) === block.place && acts(ctx, other));
+    const other = here[Math.floor(g.next() * here.length)];
+    if (other) {
+      const known = acquainted(ctx.state, who, other);
+      const kind = known ? (g.next() < 0.1 ? "argument" : "encounter") : g.next() < ACQUAINT_CHANCE ? "greeting" : null;
+      if (kind) out.push(...appraise(ctx, who, other, kind, `${kind} at ${own(ctx.world.places, block.place)?.name ?? block.place}`, true));
+    }
+  }
+
+  // Invitations come only on a ground (a plan with the POV, a routine block that asks it along): at
+  // their moment inside a slot, or here when the ask falls on the slot's end or catch-up steps the
+  // agent late. Nothing asks the POV along for company's sake alone.
+  for (const a of asksOf(ctx, who, slotDays(ctx, slot))) if (a.ask > slot.start && a.ask <= slot.end) out.push(...invitation(ctx, who, a));
+  return out;
+}
+
+/**
+ * An invitation as `viewer` reads it: where to meet only when they can see the place, else just "meet
+ * up"; with no viewer (the GM's lines, Check world), the place by its own name.
+ */
+export function invitationText(ctx: ReadContext, agent: EntityId, place: PlaceId | null, at: number, viewer?: EntityId): string {
+  const named = place !== null && (viewer === undefined || canSeePlace(ctx.registry, ctx.world, ctx.state, viewer, place)) ? (own(ctx.world.places, place)?.name ?? place) : null;
+  return say("invitation", { name: own(ctx.state.entities, agent)?.name ?? agent, ...(named !== null ? { place: named } : {}), time: formatTimeOfDay(dateAt(calendarOf(ctx.world), at).minuteOfDay) });
+}
+
+/**
+ * Plans of people the planner doesn't live them for (DESIGN §24.8, `livesPlans`): anyone but an LOD1
+ * agent from Cast life 3 follows routine only, so each of their plans is dropped once its window has
+ * passed, as a Background character's is, with its own time, so a late step settles it alike.
+ */
+function dropUnlived(slot: SlotInfo, ctx: ReadContext): LedgerEvent[] {
+  const plans = optionalQuery(ctx, "minds.plans");
+  if (!plans) return [];
+  const out: LedgerEvent[] = [];
+  for (const who of Object.keys(ctx.state.entities).sort()) {
+    if (who === ctx.world.pov || livesPlans(ctx, who)) continue;
+    for (const p of plans(ctx, who)) if (p.status === "open" && isPlayed(p) && p.when.to <= slot.end) out.push({ type: MINDS_EVENTS.plan, data: { entity: who, plan: p.id, status: "dropped", at: p.when.to, reason: say("reason_routine_only") } });
+  }
+  return out;
+}
+
+/**
+ * Trips and vacations hold people away (LOD0, every person who still acts, Cast life ≥ 1). A slot
+ * is stepped when it completes, so a trip under way at the slot's end takes the person away then
+ * (once: the hold marks it), and one ending within the slot brings them home. No one in a fight
+ * under way leaves for a trip or comes home from one, as no day plan walks them out of it (the
+ * combat pack's `combat.engaged`); someone still held away by a trip that has ended (the fight, or a
+ * state that didn't act, kept them) comes home at the first slot they can. A trip that is over lets
+ * go of its holds, wherever the person is, so a later visit to its place is only a visit.
+ */
+function stepTrips(slot: SlotInfo, ctx: ReadContext): LedgerEvent[] {
+  const out: LedgerEvent[] = [];
+  const engaged = optionalQuery(ctx, "combat.engaged");
+  for (const who of Object.keys(ctx.state.entities).sort()) {
+    const e = own(ctx.state.entities, who);
+    const trips = e?.fields.trips;
+    if (!e || !Array.isArray(trips) || ctx.levelOf(who, "castlife") < 1 || !acts(ctx, who) || engaged?.(ctx, who) === true) continue;
+    // The holds as this slot's trips leave them, so one trip letting go never undoes another taking hold.
+    let holds = objOf(e.fields.holds);
+    for (const raw of trips) {
+      const t = objOf(raw);
+      const from = numOf(t.from, NaN);
+      const until = numOf(t.until, NaN);
+      const place = strOf(t.place);
+      // The trip took them away and hasn't let go of them yet.
+      const holding = objOf(e.fields.holds).place === until;
+      const away = holding && e.fields.place === place;
+      // A trip doesn't take anyone out of a scene with the POV while the story holds the POV (DESIGN
+      // §8): they leave once the scene lets them go. In a timelapse the POV's routine runs in, they go.
+      if (from <= slot.end && slot.end < until && !away && own(ctx.world.places, place) && !(slot.povRoutine === false && withPov(ctx, who))) {
+        holds = { ...holds, place: until, activity: until };
+        out.push({ type: "set", entity: who, field: "holds", value: holds }, ...movesOf(relocate(ctx, who, place, { party: true })), { type: "set", entity: who, field: "activity", value: "trip" });
+      }
+      if (!(until <= slot.end && (until > slot.start || holding))) continue;
+      // Nor does its end take anyone out of a scene the story holds with the POV: they stay, held by
+      // the trip, and go home once the scene lets them go (DESIGN §8).
+      if (slot.povRoutine === false && withPov(ctx, who)) continue;
+      // Over: home if it ended within the slot, or if it still holds them at its place after slots
+      // that couldn't end it (anyone something else took elsewhere meanwhile stays there).
+      const home = homeOf(ctx, who);
+      if ((until > slot.start || away) && home) out.push(...movesOf(relocate(ctx, who, home, { party: true })), { type: "set", entity: who, field: "activity", value: "idle" });
+      // Its holds have run out (they last until it ends), so dropping them changes nothing they hold:
+      // it only keeps the trip from taking them for still away the next time they stand at its place.
+      const kept = Object.fromEntries(Object.entries(holds).filter(([target, at]) => !((target === "place" || target === "activity") && at === until)));
+      if (Object.keys(kept).length < Object.keys(holds).length) {
+        holds = kept;
+        out.push({ type: "set", entity: who, field: "holds", value: holds });
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- events, view, pack
+
+/** A chat's own source as an event carries it: the GM's or the story's, with its time (the story's, said by the player when `by` says so). */
+function isChatSource(v: JsonValue | undefined): boolean {
+  const o = objOf(v);
+  return typeof o.at === "number" && (o.type === "gm" || (o.type === "story" && (o.turn === undefined || typeof o.turn === "string") && (o.by === undefined || o.by === "player")));
+}
+
+/** A schedule change as an event carries it: off (until a time or for good), or their own slots with an optional recurrence. */
+function isScheduleChange(v: JsonValue | undefined): boolean {
+  const o = objOf(v);
+  if (o.off === true) return o.until === null || typeof o.until === "number";
+  const time = /^([01]\d|2[0-4]):[0-5]\d$/;
+  return Array.isArray(o.slots) && o.slots.length > 0 && o.slots.every((s) => typeof objOf(s).start === "string" && time.test(strOf(objOf(s).start)) && time.test(strOf(objOf(s).end))) && (o.recurrence === undefined || typeof objOf(o.recurrence).every === "string");
+}
+
+/**
+ * A chat's routine change for the GM, in a sentence with where it came from (the line `castlife_in_chat`): a
+ * player's line never tells of one (DESIGN §8, §24.9). `what` is the sentence for the person's name.
+ */
+function changeLine(ctx: ReadContext, e: PackEvent, viewer: EntityId | undefined, what: (name: string) => string): string {
+  if (viewer !== undefined) return "";
+  const name = own(ctx.state.entities, strOf(e.data.entity))?.name ?? strOf(e.data.entity);
+  const said = what(name);
+  return said === "" ? "" : say("castlife_in_chat", { what: said, ...(objOf(e.data.source).type === "story" ? { story: true } : {}) });
+}
+
+/** How someone follows their routine in a chat, each part the chat sets as what it does (the lines `follow_mode_*`, `follow_awareness_*`, `follow_role_*`, `follow_skips_*`; null parts are the world's and go unsaid). */
+function followWords(follow: JsonObject): string[] {
+  const mode = ROUTINE_MODES.find((m) => m === follow.mode);
+  const awareness = ROUTINE_AWARENESS.find((a) => a === follow.awareness);
+  const role = ROUTINE_ROLES.find((r) => r === follow.role);
+  const skips = SKIP_LIVES.find((s) => s === follow.skips);
+  return [mode ? say(`follow_mode_${mode}`) : "", awareness ? say(`follow_awareness_${awareness}`) : "", role ? say(`follow_role_${role}`) : "", skips ? say(`follow_skips_${skips}`) : ""].filter((w) => w !== "");
+}
+
+/** A routine block by its label: the chat's own value's, else the world's block of that id, else a basic need's. */
+function blockLabel(ctx: ReadContext, block: string, value: JsonValue | undefined): string {
+  const label = objOf(value).label;
+  if (typeof label === "string" && label !== "") return label;
+  for (const r of worldRoutines(ctx.world)) for (const b of r.blocks) if (b.id === block && "label" in b && typeof b.label === "string") return b.label;
+  return BASIC_BLOCKS.find((b) => b.id === block)?.label ?? block.replace(/_/g, " ");
+}
+
+const EVENTS: EventTypeDef<PackEvent>[] = [
+  {
+    type: "castlife.need",
+    validate: (e, ctx) => (own(ctx.state.entities, strOf(e.data.entity)) && own(NEEDS, strOf(e.data.need)) && typeof e.data.delta === "number" ? null : { code: "bad_event", reason: say("why_need_needs_an_entity_a_known_need") }),
+    // The need it started from rides with it (`from`), so the fold reads no day plan; an event an
+    // earlier build recorded without it reads the day as that build laid it, so it folds as it did.
+    apply: (e, state, ctx) => {
+      const who = own(state.entities, strOf(e.data.entity));
+      if (!who) return;
+      const at = numOf(e.data.at, state.clock);
+      const need = strOf(e.data.need);
+      const from = typeof e.data.from === "number" ? e.data.from : needValue(ctx, strOf(e.data.entity), need, at, true);
+      const v = Math.max(0, Math.min(100, from + numOf(e.data.delta)));
+      who.fields.needs = { ...objOf(who.fields.needs), [need]: { v, t: at } };
+    },
+    touches: (e) => [{ entity: strOf(e.data.entity), field: "needs" }],
+    // One carrying the need it started from sets the need whole, whatever came before, so a skip's
+    // record keeps only the last of each person's need; one without it reads the state it lands on.
+    coarsen: { key: (e) => (typeof e.data.from === "number" ? `${strOf(e.data.entity)}:${strOf(e.data.need)}` : null), merge: (_earlier, later) => later },
+    // A need the turn's own time met (`lived`) is the turn's bookkeeping, as catch-up's is: Play → Me
+    // shows it, and no "what changed" line repeats it every turn spent with friends.
+    describe: (e, ctx, viewer) => {
+      if (e.data.lived === true) return "";
+      const who = strOf(e.data.entity);
+      return say(numOf(e.data.delta) < 0 ? "need_eased" : "need_rose", { ...(viewer !== undefined && who === viewer ? { you: true } : { name: own(ctx.state.entities, who)?.name ?? who }), need: strOf(e.data.need).replace(/_/g, " ") });
+    },
+  },
+  {
+    type: "castlife.decision",
+    validate: (e) => (strOf(e.data.key) !== "" && strOf(e.data.choice) !== "" ? null : { code: "bad_event", reason: say("why_a_decision_needs_a_key_and_a") }),
+    apply: (e, state) => {
+      sliceRecord(state, "castlife", "decisions")[strOf(e.data.key)] = strOf(e.data.choice);
+    },
+    describe: (e) => say("castlife_decided", { choice: strOf(e.data.choice) }),
+  },
+  {
+    type: "castlife.invitation",
+    validate: (e, ctx) => (own(ctx.state.entities, strOf(e.data.agent)) ? null : { code: "missing_entity", reason: say("why_invitation_needs_an_agent") }),
+    apply: (e, state) => {
+      const s = mutableSlice(state, "castlife");
+      const list = Array.isArray(s.invitations) ? s.invitations.slice(-9) : [];
+      list.push({ agent: strOf(e.data.agent), place: e.data.place ?? null, at: numOf(e.data.at), text: strOf(e.data.text), ...(typeof e.data.key === "string" ? { key: e.data.key } : {}), ...(typeof e.data.origin === "string" ? { origin: e.data.origin } : {}) });
+      s.invitations = list;
+    },
+    describe: (e, ctx, viewer) => invitationText(ctx, strOf(e.data.agent), typeof e.data.place === "string" ? e.data.place : null, numOf(e.data.at), viewer),
+  },
+  {
+    // How someone follows their routine in this chat (`routine_follow`), set whole; null clears it.
+    // An earlier build's event has no role or skip life: it folds as it did, with none.
+    type: ROUTINE_EVENTS.follow,
+    validate: (e, ctx) => {
+      if (!own(ctx.state.entities, strOf(e.data.entity))) return { code: "missing_entity", reason: say("why_a_routine_setting_names_someone_in_the") };
+      const f = e.data.follow;
+      if (f === null) return null;
+      const o = objOf(f);
+      const mode = o.mode === null || ROUTINE_MODES.some((m) => m === o.mode);
+      const awareness = o.awareness === null || ROUTINE_AWARENESS.some((a) => a === o.awareness);
+      const role = o.role === undefined || o.role === null || ROUTINE_ROLES.some((r) => r === o.role);
+      const skips = o.skips === undefined || o.skips === null || SKIP_LIVES.some((s) => s === o.skips);
+      const some = o.mode !== null || o.awareness !== null || (o.role !== undefined && o.role !== null) || (o.skips !== undefined && o.skips !== null);
+      return mode && awareness && role && skips && some ? null : { code: "bad_event", reason: say("why_a_routine_setting_is_a_mode_an") };
+    },
+    apply: (e, state) => {
+      const follow = sliceRecord(state, "castlife", "follow");
+      const who = strOf(e.data.entity);
+      const f = objOf(e.data.follow);
+      if (e.data.follow === null) delete follow[who];
+      else follow[who] = { mode: f.mode ?? null, awareness: f.awareness ?? null, ...(f.role !== undefined ? { role: f.role } : {}), ...(f.skips !== undefined ? { skips: f.skips } : {}) };
+    },
+    describe: (e, ctx, viewer) =>
+      changeLine(ctx, e, viewer, (name) => {
+        const words = e.data.follow === null ? [] : followWords(objOf(e.data.follow));
+        return words.length === 0 ? say("castlife_follow_world", { name }) : say("castlife_follow", { name, parts: listOf(words) });
+      }),
+  },
+  {
+    // The model's plan for a time skip (DESIGN §8), recorded in the turn ahead of the timelapse it
+    // plans and kept whole, so a replay, or a Continue inside its span, reads it and never asks again.
+    // Only a well-formed plan is kept: people in the world, each block inside its span at a place the world has.
+    type: ROUTINE_EVENTS.skipPlan,
+    validate: (e, ctx) => {
+      const { from, to, plans, note } = e.data;
+      if (typeof from !== "number" || typeof to !== "number" || from >= to || !Array.isArray(plans) || (note !== undefined && typeof note !== "string")) return { code: "bad_event", reason: say("why_a_skip_plan_has_its_span_its") };
+      const block = (raw: JsonValue): boolean => {
+        const b = objOf(raw);
+        return typeof b.label === "string" && typeof b.start === "number" && typeof b.end === "number" && from <= b.start && b.start < b.end && b.end <= to && own(ctx.world.places, strOf(b.place)) !== undefined && strOf(b.activity) !== "" && (b.days === undefined || typeof b.days === "string");
+      };
+      const planned = plans.every((raw) => own(ctx.state.entities, strOf(objOf(raw).entity)) !== undefined && Array.isArray(objOf(raw).blocks) && (objOf(raw).blocks as JsonValue[]).every(block));
+      return planned ? null : { code: "bad_value", reason: say("why_a_skip_plan_names_people_in_the") };
+    },
+    apply: (e, state) => {
+      mutableSlice(state, "castlife").skipPlan = structuredClone(e.data);
+    },
+    // The GM's line only: what someone did in a skip is no player's news.
+    describe: (e, _ctx, viewer) => {
+      if (viewer !== undefined) return "";
+      const plans = Array.isArray(e.data.plans) ? e.data.plans.length : 0;
+      return say("castlife_skip", { plans, one: plans === 1, ...(typeof e.data.note === "string" ? { note: e.data.note } : {}) });
+    },
+  },
+  {
+    // One block of someone's routine in this chat (`routine_block`, or the story's): the block whole, or null to drop the chat's change.
+    type: ROUTINE_EVENTS.block,
+    validate: (e, ctx) => {
+      if (!own(ctx.state.entities, strOf(e.data.entity))) return { code: "missing_entity", reason: say("why_a_routine_change_names_someone_in_the") };
+      if (strOf(e.data.block) === "" || !isChatSource(e.data.source)) return { code: "bad_event", reason: say("why_a_routine_change_names_its_block_and") };
+      const v = e.data.value;
+      if (v === null) return null;
+      const problems = blockShapeProblems(v, false);
+      return problems.length === 0 && objOf(v).id === e.data.block ? null : { code: "bad_value", reason: problems[0] ?? say("why_the_blocks_id_is_the_one_it") };
+    },
+    apply: (e, state) => {
+      const routines = sliceRecord(state, "castlife", "routines");
+      const who = strOf(e.data.entity);
+      const mine = { ...objOf(routines[who]) };
+      if (e.data.value === null) delete mine[strOf(e.data.block)];
+      else mine[strOf(e.data.block)] = { value: structuredClone(e.data.value ?? null), source: structuredClone(e.data.source ?? null) };
+      if (Object.keys(mine).length === 0) delete routines[who];
+      else routines[who] = mine;
+    },
+    describe: (e, ctx, viewer) =>
+      changeLine(ctx, e, viewer, (name) => say(e.data.value === null ? "castlife_block_back" : objOf(e.data.value).off === true ? "castlife_block_off" : "castlife_block_changed", { name, block: blockLabel(ctx, strOf(e.data.block), e.data.value) })),
+  },
+  {
+    // One of someone's schedules in this chat (`schedule_override`, or the story's): off, their own slots, or null to drop the chat's change.
+    type: ROUTINE_EVENTS.schedule,
+    validate: (e, ctx) => {
+      if (!own(ctx.state.entities, strOf(e.data.entity))) return { code: "missing_entity", reason: say("why_a_schedule_change_names_someone_in_the") };
+      if (!allSchedules(ctx.registry, ctx.world).some((s) => s.id === strOf(e.data.schedule)) || !isChatSource(e.data.source)) return { code: "bad_event", reason: say("why_a_schedule_change_names_one_of_the") };
+      return e.data.value === null || isScheduleChange(e.data.value) ? null : { code: "bad_value", reason: say("why_a_schedule_change_is_off_until_a") };
+    },
+    apply: (e, state) => {
+      const schedules = sliceRecord(state, "castlife", "schedules");
+      const who = strOf(e.data.entity);
+      const mine = { ...objOf(schedules[who]) };
+      if (e.data.value === null) delete mine[strOf(e.data.schedule)];
+      else mine[strOf(e.data.schedule)] = { value: structuredClone(e.data.value ?? null), source: structuredClone(e.data.source ?? null) };
+      if (Object.keys(mine).length === 0) delete schedules[who];
+      else schedules[who] = mine;
+    },
+    describe: (e, ctx, viewer) =>
+      changeLine(ctx, e, viewer, (name) => {
+        // A schedule has no name of its own: its id, and what it sets ("where they are").
+        const target = allSchedules(ctx.registry, ctx.world).find((s) => s.id === strOf(e.data.schedule))?.target;
+        const sets = target === "place" ? say("schedule_sets_place") : target === "activity" ? say("schedule_sets_activity") : target ? say("schedule_sets_field", { field: target.replace(/_/g, " ") }) : "";
+        const label = say("castlife_schedule_label", { schedule: strOf(e.data.schedule).replace(/_/g, " "), ...(sets !== "" ? { sets } : {}) });
+        return say(e.data.value === null ? "castlife_schedule_world" : objOf(e.data.value).off === true ? "castlife_schedule_off" : "castlife_schedule_own", { name, label });
+      }),
+  },
+];
+
+/**
+ * The GM's routine controls as the events of one `fix` entry (DESIGN §8): how someone follows their
+ * routine (each part kept unless given; null returns it to the world's), one block of their routine,
+ * or one of their schedules, in this chat. Each event carries the change whole.
+ */
+function routineEdit(ctx: ReadContext, op: RoutineEditOp): LedgerEvent[] | Rejection {
+  const e = own(ctx.state.entities, op.entity);
+  if (!e) return { code: "missing_entity", reason: say("why_no_party", { party: labelOf(ctx, op.entity) }) };
+  if (!kindIs(ctx.registry, ctx.world, e.kind, "person")) return { code: "not_person", reason: say("why_name_has_no_routine_only_people_do", { name: e.name }) };
+  const source = { type: "gm", at: ctx.state.clock };
+  if (op.op === "routine_follow") {
+    const now = followOf(ctx, op.entity).chat;
+    const mode = op.mode === undefined ? (now?.mode ?? null) : op.mode;
+    const awareness = op.awareness === undefined ? (now?.awareness ?? null) : op.awareness;
+    const role = op.role === undefined ? (now?.role ?? null) : op.role;
+    const skips = op.skips === undefined ? (now?.skips ?? null) : op.skips;
+    return [{ type: ROUTINE_EVENTS.follow, data: { entity: op.entity, follow: mode === null && awareness === null && role === null && skips === null ? null : { mode, awareness, role, skips } } }];
+  }
+  if (op.op === "routine_block") {
+    if (op.value === null) return [{ type: ROUTINE_EVENTS.block, data: { entity: op.entity, block: op.block, value: null, source } }];
+    const value = { ...op.value, id: op.block } as unknown as JsonObject;
+    const problems = blockShapeProblems(value, false);
+    if (problems.length > 0) return { code: "bad_value", reason: problems.join("; ") };
+    return [{ type: ROUTINE_EVENTS.block, data: { entity: op.entity, block: op.block, value, source } }];
+  }
+  const schedule = allSchedules(ctx.registry, ctx.world).find((s) => s.id === op.schedule);
+  if (!schedule) return { code: "missing_schedule", reason: say("why_theres_no_schedule_schedule", { schedule: op.schedule }) };
+  if (op.value !== null && "off" in op.value && !scheduleOwners(ctx.registry, ctx.world, ctx.state, schedule).includes(op.entity)) return { code: "not_owner", reason: say("why_name_doesnt_follow_schedule", { name: e.name, schedule: op.schedule }) };
+  const value = op.value === null ? null : (structuredClone(op.value) as unknown as JsonObject);
+  if (value !== null && !isScheduleChange(value)) return { code: "bad_value", reason: say("why_a_schedule_change_is_off_until_a_2") };
+  return [{ type: ROUTINE_EVENTS.schedule, data: { entity: op.entity, schedule: op.schedule, value, source } }];
+}
+
+export interface CastPerson {
+  id: EntityId;
+  name: string;
+  role: string;
+  here: boolean;
+  activity?: string;
+  place?: string;
+  /** Someone away: where (when the POV may name the place) and when the POV last saw them. */
+  lastSeen?: { place?: string; at: string };
+  /** Their life state as the POV knows it (DESIGN §8), when that isn't alive: its label. */
+  life?: string;
+  regard?: { axis: string; band: string; value?: number }[];
+  /** Their day as the POV may know it (`playerBlocks`): no place, company or GM change; `source` says why each block is there. */
+  timeline?: { start: string; end: string; label: string; kind: "work" | "sleep" | "free" | "travel" | "other"; reasons: string[]; source: PlayerBlock["source"] }[];
+  agenda?: { label: string; stage: string }[];
+  next?: { at: string; label: string };
+  /**
+   * For grouping and filters: the person's tier, their values of the facets players can see, and
+   * their groups. Hidden facets and tags are authoring data and never reach this view.
+   */
+  tier: TierId;
+  classes: Record<FacetId, FacetValueId[]>;
+  /** Every group shown that the person belongs to, directly or through a member group; `role` from a direct membership. */
+  groups: { id: EntityId; role?: string }[];
+}
+
+/** A group as Cast shows it, with the POV's own membership details when it is one of theirs. */
+export interface CastGroup {
+  id: EntityId;
+  name: string;
+  kind: string;
+  role?: string;
+  rank?: number;
+  since?: string;
+}
+
+export interface CastView {
+  level: number;
+  people: CastPerson[];
+  /** The facets players can see (`shown`), in order, each value with its parent, depth first: Cast groups and filters by them. */
+  facets: { id: FacetId; label: string; multiple: boolean; values: { id: FacetValueId; label: string; parent?: FacetValueId }[] }[];
+  /** The tiers people are in, in the world's order. */
+  tiers: { id: TierId; label: string }[];
+  /** Every group shown that someone listed belongs to, by name. */
+  groups: CastGroup[];
+  /** The groups the POV belongs to, with its role in each. */
+  mine: CastGroup[];
+}
+
+export function kindOfBlock(activity: string): "work" | "sleep" | "free" | "travel" | "other" {
+  if (/work|shift|school/.test(activity)) return "work";
+  if (activity === "sleep") return "sleep";
+  if (activity === "trip" || activity === "travel") return "travel";
+  if (/leisure|socialize|idle|breakfast|lunch|dinner/.test(activity)) return "free";
+  return "other";
+}
+
+/**
+ * A day's blocks as the player may know them (DESIGN §7, §8), for Cast and the player's routine view:
+ * each with its times, label, kind and reasons, and why it's there: their routine, a lore entry the
+ * POV may read (by its title), the story, their own plan, a commitment, or free time. A block of an
+ * agenda that isn't public, or a private routine block, reads "Busy" for their own business; a lore
+ * entry the POV may not read, and any change the GM made, read as their routine.
+ */
+export function playerBlocks(ctx: ReadContext, who: EntityId, plan: DayPlan): (PlayerBlock & { start: number })[] {
+  const cal = calendarOf(ctx.world);
+  const applied = new Map(activeBlocks(ctx, who, plan.day).map((a) => [a.block.id, a]));
+  const open = loreGateReader(ctx.registry, ctx.world, ctx.state);
+  return plan.blocks.map((b) => {
+    const from = formatTimeOfDay(dateAt(cal, b.start).minuteOfDay);
+    const to = formatTimeOfDay(dateAt(cal, b.end).minuteOfDay);
+    const routineId = b.option.startsWith(ROUTINE_OPTION) ? b.option.slice(ROUTINE_OPTION.length).replace(/:carried$/, "") : null;
+    const a = routineId !== null ? applied.get(routineId) : undefined;
+    if ((b.option.startsWith(AGENDA_OPTION) && !publicTrack(ctx.world, b.option.slice(AGENDA_OPTION.length))) || a?.block.private === true) return { start: b.start, from, to, label: say("plan_label_busy"), kind: "other", reasons: [say("plan_reason_their_own_business")], source: { type: "routine" } };
+    let source: PlayerBlock["source"];
+    if (a) {
+      const entry = a.from.source.type === "lore" ? own(ctx.world.lore, a.from.source.entry) : undefined;
+      source = entry && loreReadable(ctx.registry, ctx.world, ctx.state, entry, "brief", false, open) ? { type: "lore", entry: entry.id, title: entry.title } : a.from.source.type === "story" ? { type: "story" } : { type: "routine" };
+    } else if (b.option.startsWith("plan:")) source = { type: "plan" };
+    else if (b.fixed && !b.option.startsWith(INVITED_OPTION)) source = { type: "commitment" };
+    else if (b.option === "idle" || b.option.startsWith("retrieve:")) source = { type: "free" };
+    else source = { type: "routine" };
+    return { start: b.start, from, to, label: b.label, kind: kindOfBlock(b.activity), reasons: b.reasons, source };
+  });
+}
+
+/**
+ * Play → Cast (DESIGN §7, §12): the people the POV knows (`playerKnows`) and anyone it can see here.
+ * Someone here shows what they are doing and, with LOD1, their day; someone away shows only where
+ * and when the POV last saw them, never where they are now or what they plan. A life state shows as
+ * the POV knows it, and someone it knows doesn't act shows no doing or day. Fields follow field
+ * visibility, and agendas show only when public: each agenda on its own, so a secret one never
+ * shows behind a public one, and a block of the day spent on one that isn't public reads as busy.
+ */
+export function buildCastView(ctx: ReadContext): CastView {
+  const pov = ctx.world.pov;
+  const level = ctx.levelOf(pov, "castlife");
+  const cal = calendarOf(ctx.world);
+  const here = placeOfEntity(ctx.state, pov);
+  const view = optionalQuery(ctx, "relationships.view");
+  // Who the POV can see: the groups shown (a trust is a group of its own type, never one of the cast's), and the people present (the shared rules, `isGone` included).
+  const shown = (id: EntityId): boolean => canSeeEntity(ctx.registry, ctx.world, ctx.state, pov, id);
+  const groupIds = Object.keys(ctx.state.entities)
+    .sort()
+    .filter((id) => isGroup(ctx.registry, ctx.world, ctx.state, id) && !kindIs(ctx.registry, ctx.world, own(ctx.state.entities, id)?.kind ?? "", TRUST_KIND) && shown(id));
+  const membershipsOf = (who: EntityId): { id: EntityId; role?: string; rank?: number; since?: string }[] =>
+    groupIds
+      .filter((g) => isMemberOf(ctx, who, g))
+      .map((g) => {
+        const direct = objOf(own(ctx.state.entities, who)?.relations.find((r) => r.type === MEMBER_OF && r.to === g)?.fields);
+        return { id: g, ...(typeof direct.role === "string" && direct.role !== "" ? { role: direct.role } : {}), ...(typeof direct.rank === "number" ? { rank: direct.rank } : {}), ...(typeof direct.since === "string" ? { since: direct.since } : {}) };
+      });
+  const facets = facetsInOrder(ctx.world).filter(([, f]) => f.shown === true);
+  const people: CastPerson[] = [];
+  for (const id of Object.keys(ctx.state.entities).sort()) {
+    const e = own(ctx.state.entities, id);
+    if (!e || id === pov || !kindIs(ctx.registry, ctx.world, e.kind, "person") || isGone(ctx.state, id)) continue;
+    const place = placeOfEntity(ctx.state, id);
+    const present = place !== null && place === here;
+    if (!(present ? shown(id) : playerKnows(ctx.registry, ctx.world, ctx.state, pov, id))) continue;
+    const classes: Record<FacetId, FacetValueId[]> = {};
+    for (const [facet] of facets) {
+      const values = classValues(ctx.world, ctx.state, id, facet);
+      if (values.length > 0) classes[facet] = [...values];
+    }
+    const sees = (field: string): boolean => canSeeField(ctx.registry, ctx.world, ctx.state, pov, id, field);
+    const role = sees("role") ? strOf(e.fields.role) : "";
+    const p: CastPerson = {
+      id,
+      name: e.name,
+      role: role !== "" ? role : sees("occupation") ? strOf(e.fields.occupation).replace(/_/g, " ") : "",
+      here: present,
+      tier: e.tier,
+      classes,
+      groups: membershipsOf(id).map((m) => ({ id: m.id, ...(m.role !== undefined ? { role: m.role } : {}) })),
+    };
+    const life = povLife(ctx.world, ctx.state, id);
+    if (life) p.life = life.label;
+    const still = life !== null && !life.acts;
+    if (present) {
+      if (typeof e.fields.activity === "string" && sees("activity") && !still) p.activity = shownActivity(ctx, id, e.fields.activity).replace(/_/g, " ");
+      // Someone here is where the POV is: a place it can't see is named as every player surface names it.
+      if (sees("place")) p.place = canSeePlace(ctx.registry, ctx.world, ctx.state, pov, place) ? (own(ctx.world.places, place)?.name ?? place) : HIDDEN_PLACE_NAME;
+    } else if (level >= 2) {
+      const last = lastSighting(ctx.state, id);
+      if (last) p.lastSeen = { ...(canSeePlace(ctx.registry, ctx.world, ctx.state, pov, last.place) ? { place: own(ctx.world.places, last.place)?.name ?? last.place } : {}), at: formatClock(cal, last.at) };
+    }
+    const regard = view ? view(ctx, id, pov) : [];
+    if (regard.length > 0) p.regard = regard;
+    const plan = present && e.agent && !still ? dayPlan(ctx, id) : null;
+    const blocks = plan ? playerBlocks(ctx, id, plan) : null;
+    if (blocks && level >= 3) p.timeline = blocks.map((b) => ({ start: b.from, end: b.to, label: b.label, kind: b.kind, reasons: b.reasons, source: b.source }));
+    const agenda = agendaFor(ctx.world, ctx.state, id).filter((a) => publicTrack(ctx.world, a.track));
+    if (agenda.length > 0) p.agenda = agenda.map((a) => ({ label: a.label, stage: a.stageLabel }));
+    const next = blocks?.find((b) => b.start > ctx.state.clock);
+    if (next) p.next = { at: formatClock(cal, next.start), label: next.label };
+    people.push(p);
+  }
+  const group = (id: EntityId): CastGroup => {
+    const g = own(ctx.state.entities, id);
+    return { id, name: g?.name ?? id, kind: kindDef(ctx.registry, ctx.world, g?.kind ?? "")?.label ?? g?.kind ?? "" };
+  };
+  const listed = new Set(people.flatMap((p) => p.groups.map((m) => m.id)));
+  const byName = (a: CastGroup, b: CastGroup): number => a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+  const tierIds = new Set(people.map((p) => p.tier));
+  const tiers = [...tiersInOrder(ctx.world).map(([id]) => id).filter((id) => tierIds.has(id)), ...[...tierIds].filter((id) => !tierOf(ctx.world, id)).sort()];
+  return {
+    level,
+    people,
+    facets: facets.map(([id, f]) => ({ id, label: f.label, multiple: f.multiple === true, values: facetTree(f.values).map((v) => ({ id: v.id, label: v.value.label, ...(v.value.parent !== undefined ? { parent: v.value.parent } : {}) })) })),
+    tiers: tiers.map((id) => ({ id, label: tierLabel(ctx.world, id) })),
+    groups: groupIds.filter((g) => listed.has(g)).map(group).sort(byName),
+    mine: membershipsOf(pov)
+      .map((m) => ({ ...group(m.id), ...(m.role !== undefined ? { role: m.role } : {}), ...(m.rank !== undefined ? { rank: m.rank } : {}), ...(m.since !== undefined ? { since: m.since } : {}) }))
+      .sort(byName),
+  };
+}
+
+// ---------------------------------------------------------------- the Stance section
+
+/**
+ * Whether someone acts (DESIGN §6.6, §8): still in the world and in a life state that acts. The one
+ * test Cast life reads, so encounters, trips, day-plan ties and the Stance section agree: someone who
+ * doesn't act has no stance to tell, and a body the POV knows of reads through the people lines.
+ */
+export function acts(ctx: ReadContext, who: EntityId): boolean {
+  return !isGone(ctx.state, who) && lifeActs(ctx.world, ctx.state, who);
+}
+
+/** "Label: one; two." Clauses as one sentence: whitespace collapsed, each without its own full stop. */
+function listed(label: string, clauses: readonly string[]): string {
+  const body = clauses.map((c) => c.replace(/\s+/g, " ").trim().replace(/[.;]$/, "")).join("; ");
+  return `${label}: ${body}${/[.!?…]$/.test(body) ? "" : "."}`;
+}
+
+/**
+ * The block of today's plan that `who`'s own recorded choice settled (`npc.choose`, or an author's
+ * `castlife.decide`), the one under way or the next, named as Cast names the day (`playerBlocks`): a
+ * block of an agenda that isn't public, or a private routine block, is "Busy". Null when no such
+ * block is left today.
+ */
+function decidedBlock(ctx: ReadContext, who: EntityId): string | null {
+  const cal = calendarOf(ctx.world);
+  const plan = dayPlan(ctx, who);
+  const dayStart = clockAt(cal, plan.day, 0);
+  const chosen = new Set(plan.ties.filter((t) => t.via === "recorded").map((t) => t.key));
+  const block = playerBlocks(ctx, who, plan).find((b, i) => (plan.blocks[i]?.end ?? 0) > ctx.state.clock && chosen.has(tieKey(who, dayStart, b.start)));
+  if (!block) return null;
+  return block.start <= ctx.state.clock ? block.label : `${block.label} at ${block.from}`;
+}
+
+/**
+ * Who the Stance section tells of (DESIGN §6.6): everyone in the POV's scene (`together`) it can
+ * see who acts, in id order, and the test each piece about them passes: no unrevealed secret,
+ * nothing hidden named. The test is built on its first use, so a renderer with nothing to check
+ * never pays for it.
+ */
+function stanceCast(ctx: ReadContext): { people: EntityId[]; safe: (text: string) => boolean } {
+  const { registry: reg, world, state } = ctx;
+  const pov = world.pov;
+  const here = placeOfEntity(state, pov);
+  // Who acts as far as the POV knows, as People and Cast read it: a body it hasn't found reads as them.
+  // A character the Minds section tells of this turn has no Stance line (DESIGN §24.3): their mind says it.
+  const minded = new Set(optionalQuery(ctx, "minds.minded")?.(ctx) ?? []);
+  const people = here === null ? [] : Object.keys(state.entities).sort().filter((id) => id !== pov && together(world, here, placeOfEntity(state, id)) && kindIs(reg, world, own(state.entities, id)?.kind ?? "", "person") && canSeeEntity(reg, world, state, pov, id) && !isGone(state, id) && povLife(world, state, id)?.acts !== false && !minded.has(id));
+  let check: ((text: string) => boolean) | null = null;
+  const safe = (text: string): boolean => {
+    if (!check) {
+      const secrets = unrevealedSecrets(reg, world, state);
+      const namesHidden = hiddenNameCheck(reg, world, state, pov);
+      check = (t) => findLeaks(t, secrets).length === 0 && !namesHidden(t);
+    }
+    return check(text);
+  };
+  return { people, safe };
+}
+
+/**
+ * The Stance section's own lines (DESIGN §6.6): for each person it tells of, what they know of the
+ * POV and what they are about. Each piece that would carry an unrevealed secret or name something
+ * the POV can't see is left out on its own.
+ */
+export function stanceLines(ctx: ReadContext): string[] {
+  const { registry: reg, world, state } = ctx;
+  const pov = world.pov;
+  const { people, safe } = stanceCast(ctx);
+  const regard = optionalQuery(ctx, "relationships.words");
+  const lines: string[] = [];
+  for (const id of people) {
+    const e = own(state.entities, id);
+    if (!e) continue;
+    // Nobody regards a stranger: regard toward the POV is knowing it as much as a `knows` relation.
+    const known = knows(state, id, pov) || e.relations.some((r) => r.type === "regard" && r.to === pov);
+    const words = regard?.(ctx, id, pov) ?? null;
+    const parts = [say("feed_name_knowsdoesnt_know_you_and_feels_words", { name: e.name, words: words, if_known: !!(known), if_words: !!(words) })];
+    const activity = canSeeField(reg, world, state, pov, id, "activity") ? e.fields.activity : undefined;
+    const doing = typeof activity === "string" ? activityPhrase(shownActivity(ctx, id, activity)) : null;
+    if (doing !== null && safe(doing)) parts.push(say("feed_right_now_they_are_doing", { doing: doing }));
+    // A public agenda's current stage, in its cue's words where the author wrote one, else its label as Cast shows it.
+    const agenda = agendaFor(world, state, id)
+      .filter((a) => publicTrack(world, a.track))
+      .map((a) => {
+        const track = own(world.tracks, a.track);
+        const cue = track ? own(track.stages, a.stage)?.cue?.trim() : undefined;
+        return cue ? cue : a.stageLabel;
+      })
+      .filter(safe);
+    if (agenda.length > 0) parts.push(listed(say("feed_agenda"), agenda));
+    const decided = e.agent && ctx.levelOf(id, "castlife") >= 3 ? decidedBlock(ctx, id) : null;
+    if (decided !== null && safe(decided)) parts.push(listed(say("feed_decided"), [decided]));
+    lines.push(parts.join(" "));
+  }
+  return lines;
+}
+
+/**
+ * Stance by scope (DESIGN §6.11): its people's lines as the POV may read them; in `scene` scope,
+ * each one's `known_by` agendas, at their stage, as theirs to know; a secret agenda is the GM's
+ * alone, so only the `gm` scope tells it.
+ */
+export function stanceFeed(ctx: ReadContext, scope: FeedScope): FeedLine[] {
+  const lines: FeedLine[] = stanceLines(ctx).map((text) => ({ text, known: "pov" }));
+  if (scope === "player") return lines;
+  for (const id of stanceCast(ctx).people) {
+    const name = own(ctx.state.entities, id)?.name ?? id;
+    for (const a of agendaFor(ctx.world, ctx.state, id).filter((x) => !publicTrack(ctx.world, x.track))) {
+      const track = own(ctx.world.tracks, a.track);
+      const secret = visibilityOf(track?.visibility) === "secret";
+      const text = say("feed_name_s_private_agenda_track_stagelabel", { name: name, track: track?.label ?? a.track, stageLabel: a.stageLabel });
+      if (!secret) lines.push({ text, known: "scene", who: name });
+      else if (scope === "gm") lines.push({ text, known: "gm" });
+    }
+  }
+  return lines;
+}
+
+/**
+ * The Stance section's hints (DESIGN §6.6): a line of cues for each person it tells of who has any
+ * kept. They follow what the POV doesn't know, so they ride last on the section budget (`hint`).
+ */
+export function stanceCues(ctx: ReadContext): string[] {
+  const { people, safe } = stanceCast(ctx);
+  return people.flatMap((id) => {
+    const cues = cuesFor(ctx, id, safe);
+    return cues.length > 0 ? [listed(say("feed_id_s_cues", { id: own(ctx.state.entities, id)?.name ?? id }), cues)] : [];
+  });
+}
+
+/**
+ * The People section (DESIGN §6.6, §6.11): the POV by name with its pressing needs, then each person
+ * with it that it can see, marked with their tier when they are in its party (assess-party §6.1,
+ * "Danny Okafor (party companion) is here."), what they are doing as it may see it and how they
+ * regard it. In `scene` scope, also someone here the POV can't see whom another person here knows,
+ * marked with who; in `gm`, someone here no one the POV can see knows of, marked as the GM's.
+ */
+export function peopleLines(ctx: ReadContext, scope: FeedScope): FeedLine[] {
+  const pov = ctx.world.pov;
+  const see = (who: EntityId, id: EntityId): boolean => canSeeEntity(ctx.registry, ctx.world, ctx.state, who, id);
+  // The POV leads, by name, so the narrator knows who "you" is, with the needs pressing on it (`needsOf`, as the Needs view reads them):
+  // each the world has on, from the point the world tells it at.
+  const urgent = ctx.levelOf(pov, "castlife") >= 4 ? needsOf(ctx, pov).flatMap((n) => (n.pressing ? [n.label] : [])) : [];
+  const lead = povLead(own(ctx.state.entities, pov)?.name ?? pov);
+  const lines: FeedLine[] = [{ text: urgent.length > 0 ? `${lead}: ${urgent.join(", ")}.` : `${lead}.`, known: "pov" }];
+  const here = placeOfEntity(ctx.state, pov);
+  const voice = optionalQuery(ctx, "relationships.voice");
+  const present = Object.keys(ctx.state.entities)
+    .sort()
+    .filter((id) => {
+      const e = own(ctx.state.entities, id);
+      return !!e && id !== pov && together(ctx.world, here, placeOfEntity(ctx.state, id)) && kindIs(ctx.registry, ctx.world, e.kind, "person") && !isGone(ctx.state, id);
+    });
+  for (const id of present) {
+    const e = own(ctx.state.entities, id);
+    if (!e) continue;
+    if (!see(pov, id)) {
+      // The narrator is told only who the POV can see, unless the scope asks for more, marked.
+      if (scope === "player") continue;
+      const knowers = present.filter((k) => k !== id && see(pov, k) && see(k, id)).map((k) => own(ctx.state.entities, k)?.name ?? k);
+      const act = typeof e.fields.activity === "string" ? activityPhrase(e.fields.activity) : null;
+      const text = say("feed_name_is_here_act", { name: e.name, act: act, if_act: !!(act) });
+      if (knowers.length > 0) lines.push({ text, known: "scene", who: knowers.join(", ") });
+      else if (scope === "gm") lines.push({ text, known: "gm" });
+      continue;
+    }
+    // What they are doing is a field: told only when the POV may see it. A life state the POV
+    // knows reads instead ("lies dead"); one it doesn't know of is never told.
+    const life = povLife(ctx.world, ctx.state, id);
+    const act = canSeeField(ctx.registry, ctx.world, ctx.state, pov, id, "activity") ? e.fields.activity : undefined;
+    // "Danny Okafor is here, at work."; with nothing they're seen doing, only that they are here.
+    const doing = typeof act === "string" ? activityPhrase(shownActivity(ctx, id, act)) : null;
+    // Their party tier, then their titles where an organization ties them to the POV (ORG-SPEC §3.15): "Marcus Delgado (owner of Alder Automotive, where you work)".
+    const tier = partyTierIn(e.relations, pov);
+    const marks = [...(tier ? [say(`word_tier_${tier}`)] : []), ...(optionalQuery(ctx, "orgs.titles")?.(ctx, id) ?? [])];
+    const name = marks.length > 0 ? `${e.name} (${marks.join("; ")})` : e.name;
+    lines.push({ text: life ? `${name} ${life.reads}.` : say("feed_name_is_here_act", { name: name, act: doing, if_act: !!(doing) }), known: "pov" });
+    // How they regard the POV follows them; a body the POV knows of holds no regard to voice.
+    const regard = life && !life.acts ? null : (voice?.(ctx, id) ?? null);
+    if (regard) lines.push({ text: regard, known: "pov" });
+  }
+  return lines;
+}
+
+declare module "../../../engine/registry" {
+  interface ServiceMap {
+    /** The GM's routine controls (DESIGN §8): a character's follow setting, one block of their routine and one of their schedules in this chat, as events. */
+    "castlife.edit": (ctx: ReadContext, op: RoutineEditOp) => LedgerEvent[] | Rejection;
+  }
+  interface QueryMap {
+    /** Ties the planner left to the seed and invitations not yet decided: inputs for `npc.choose`. */
+    "castlife.tie_zones": (ctx: ReadContext) => { key: string; agent: EntityId; options: string[] }[];
+    /** A person's activity as the player and the narrator read it: an agenda's step reads "busy" unless all their agendas are public (`shownActivity`). */
+    "castlife.activity": (ctx: ReadContext, who: EntityId, activity: string) => string;
+    /** The blocks a person is committed to in [start, end), after every cut (a trip, a plan of their own, a more specific schedule): what they will actually be doing. */
+    "castlife.commitments": (ctx: ReadContext, who: EntityId, start: number, end: number) => CommitmentBlock[];
+    /** Invitations to the POV still open (`invited`), each with its host and as `viewer` reads it ("Danny invites you to Bluebird Coffee at 19:00."). */
+    "castlife.invitations": (ctx: ReadContext, viewer: EntityId) => { host: EntityId; text: string }[];
+    /** Whether a schedule's edge must leave someone's place or activity as the story has it (`routineYields`: whether their routine is lived, `release` where a balanced routine takes the day back, `scene` false while time runs on its own, `skip` in a time skip). */
+    "castlife.yields": (ctx: ReadContext, who: EntityId, field: "place" | "activity", expected: JsonValue | null, release: boolean, scene: boolean, skip: boolean) => boolean;
+    /** Whether the chat took someone off a schedule at `at` (`schedule_override`). */
+    "castlife.schedule_off": (ctx: ReadContext, who: EntityId, schedule: string, at: number) => boolean;
+    /** The chat's own versions of schedules, each owned by the one person it's for. */
+    "castlife.chat_schedules": (ctx: ReadContext) => ScheduleDef[];
+    /** Everyone the chat set a routine role for (`routine_follow`), with it: the GM view's. */
+    "castlife.chat_roles": (ctx: ReadContext) => { entity: EntityId; role: RoutineRole }[];
+  }
+}
+
+export const castlifePack: PackDef = {
+  id: "castlife",
+  label: "Cast life",
+  version: 1,
+  domain: "castlife",
+  requires: ["space", "gear", "relationships"],
+  register(r) {
+    for (const def of EVENTS) r.event(def);
+    r.service("castlife.edit", routineEdit);
+    r.query("castlife.yields", (ctx, who, field, expected, release, scene, skip) => routineYields(ctx, who, field, expected, { edge: true, release, scene, skip }));
+    r.query("castlife.schedule_off", (ctx, who, schedule, at) => scheduleOff(ctx.state, who, schedule, at));
+    r.query("castlife.chat_schedules", chatScheduleDefs);
+    r.query("castlife.chat_roles", (ctx) => chatRoles(ctx.state));
+    r.process({ id: "castlife.agents", domain: "castlife", minLevel: 3, scope: "agent", step: (slot, ctx, rng, agent) => (agent ? stepAgent(slot, ctx, rng, agent) : []), instants: planMoments, atInstant: (ctx, who, moment, slot) => povActivityEnds(ctx, who, moment.at, slot, atPlanMoment(ctx, who, moment, slot)), lived: povTurnNeeds, ended: povSpanEnded });
+    r.process({ id: "castlife.trips", domain: "castlife", minLevel: 1, step: (slot, ctx) => stepTrips(slot, ctx) });
+    // Whatever the level: a plan nothing lives is still settled.
+    r.process({ id: "castlife.plans", domain: "castlife", minLevel: 0, step: (slot, ctx) => dropUnlived(slot, ctx) });
+    r.query("castlife.activity", shownActivity);
+    r.query("castlife.commitments", (ctx, who, start, end) => commitments(ctx, who, start, end).map((c) => ({ start: c.start, end: c.end, activity: c.activity, place: c.place ?? null, kind: c.kind, label: c.label, ...(c.plan !== undefined ? { plan: c.plan } : {}) })));
+    r.query("castlife.tie_zones", (ctx) => {
+      const out: { key: string; agent: EntityId; options: string[] }[] = [];
+      const decided = decisions(ctx.state);
+      for (const id of Object.keys(ctx.state.entities).sort()) {
+        const plan = own(ctx.state.entities, id)?.agent && acts(ctx, id) ? dayPlan(ctx, id) : null;
+        for (const t of plan?.ties ?? []) if (t.via === "seed" && !own(decided, t.key)) out.push({ key: t.key, agent: id, options: t.options });
+      }
+      return out;
+    });
+    // Accepting an invitation books it in the POV's day (`bookInvitation`).
+    r.effect({ type: "castlife.book_invitation", args: ["host"], resolve: (a, ctx) => bookInvitation(ctx, strOf(a.host)) });
+    r.formula("invited", (ctx, host) => openInvitations(ctx).some((inv) => strOf(inv.agent) === String(host ?? "")));
+    r.query("castlife.invitations", (ctx, viewer) => openInvitations(ctx).map((inv) => ({ host: strOf(inv.agent), text: invitationText(ctx, strOf(inv.agent), typeof inv.place === "string" ? inv.place : null, numOf(inv.at), viewer) })));
+    r.formula("need", (ctx, who, need) => needValue(ctx, String(who ?? ctx.world.pov), String(need ?? "")));
+    r.formula("busy", (ctx, who) => {
+      const id = String(who ?? "");
+      return commitments(ctx, id, ctx.state.clock, ctx.state.clock + 1).length > 0;
+    });
+
+    // The need it starts from rides with the event, so a fold reads no day plan (DESIGN §8). What an
+    // action meets it meets at the end of `minutes`, not as it starts. With `activity`, the span is that
+    // activity's, past the action's own time (`after`): met then only when the span passes within the
+    // turn, under its Speed through threshold (DESIGN §9.2); one the turn offers or runs as a Timelapse
+    // is met by what the skip passes (`activityEndMoment`), so a skip declined meets nothing.
+    r.effect({
+      type: "castlife.satisfy",
+      args: ["need", "entity?", "minutes?", "activity?", "after?"],
+      resolve: (a, ctx) => {
+        const who = strOf(a.entity) || ctx.world.pov;
+        const need = strOf(a.need);
+        const minutes = Math.max(0, Math.round(numOf(a.minutes, 0)));
+        const sped = typeof a.activity === "string" && speedThrough(ctx.state, a.activity, minutes - numOf(a.after, 0)) !== "elapse";
+        return isNeedId(need) && own(ctx.state.entities, who) && !sped ? metAt(ctx, who, need, ctx.state.clock + minutes) : [];
+      },
+    });
+    // Going to bed takes the sleeper to their bed (DESIGN §8): nothing when they have none, it's
+    // nowhere, or they're there already.
+    r.effect({ type: "castlife.to_bed", args: ["entity?"], resolve: (a, ctx) => toBed(ctx, strOf(a.entity) || ctx.world.pov) });
+    // A conversation is company (DESIGN §8): the regard a chat makes (relationships' `chat_with`) meets
+    // the POV's social need as the chat ends. Cast life reads the chat, so relationships needs nothing of it.
+    r.effect({ type: "castlife.company", args: ["with", "to"], resolve: (a, ctx) => companyMet(ctx, [strOf(a.with), strOf(a.to)]) });
+    r.rule({ id: "castlife.conversation", pack: "castlife", on: { event: "relationships.regard" }, when: `event.data.why == '${CONVERSATION}'`, do: [{ type: "castlife.company", args: { with: "=event.data.from", to: "=event.data.to" } }] });
+    r.effect({ type: "castlife.decide", args: ["key", "choice"], resolve: (a) => [{ type: "castlife.decision", data: { key: strOf(a.key), choice: strOf(a.choice) } }] });
+    r.effect({
+      type: "castlife.override",
+      args: ["who", "minutes?", "place?", "activity?"],
+      resolve(a, ctx) {
+        const who = strOf(a.who);
+        const e = own(ctx.state.entities, who);
+        if (!e) return { code: "missing_entity", reason: say("why_no_party", { party: labelOf(ctx, who) }) };
+        const until = ctx.state.clock + numOf(a.minutes, 60);
+        const holds: JsonObject = { ...objOf(e.fields.holds) };
+        const out: LedgerEvent[] = [];
+        if (typeof a.place === "string" && own(ctx.world.places, a.place)) {
+          holds.place = until;
+          out.push(...movesOf(relocate(ctx, who, a.place)));
+        }
+        if (typeof a.activity === "string") {
+          holds.activity = until;
+          out.push({ type: "set", entity: who, field: "activity", value: a.activity });
+        }
+        return [{ type: "set", entity: who, field: "holds", value: holds }, ...out];
+      },
+    });
+    // What the story changes of someone's routine (DESIGN §8, §9.4): the `routine` narration channel,
+    // and the effect it records with, the chat's own blocks and schedules with source `story`.
+    r.proposal(routineChannel);
+    r.effect({ type: ROUTINE_EFFECT, args: ["entity", "blocks?", "schedules?", "turn?", "by?"], resolve: storyEvents });
+
+    // A stated length ("rest for an hour", `minutes`) is a meal's time. A rest and a sleep keep their own
+    // (or a shorter stated one), and the length sets when their activity ends: the Speed through policy
+    // carries the rest (DESIGN §9.2), within the turn under its threshold, else offered or run as a
+    // Timelapse to that end. What it meets is met as it ends; a span the turn speeds through, as the skip
+    // passes it (`activityEndMoment`), so going to bed and getting up again rests no one.
+    r.action({ id: "eat", pack: "castlife", params: { minutes: STATED_MINUTES }, requires: [], outcomes: { default: [{ type: "castlife.satisfy", args: { entity: "self", need: "hunger", minutes: `=${EAT_FOR}` } }, { type: "set", args: { entity: "self", field: "activity", value: "meal" } }] }, duration: EAT_FOR, lexicon: ["eat", "have lunch", "have dinner", "grab a bite"], observable: "eats" });
+    r.action({ id: "sleep", pack: "castlife", params: { minutes: STATED_MINUTES }, requires: [], outcomes: { default: [{ type: "castlife.to_bed", args: { entity: "self" } }, { type: "castlife.satisfy", args: { entity: "self", need: `=${NAP_MEETS}`, minutes: "=minutes", activity: "sleep", after: `=${SLEEP_TURN}` } }] }, duration: SLEEP_TURN, activity: { type: "sleep", until: SLEEP_UNTIL }, lexicon: ["go to bed", "sleep", "turn in", "hit the sack"], observable: "goes to bed" });
+    r.action({ id: "rest", pack: "castlife", params: { minutes: STATED_MINUTES }, requires: [], outcomes: { default: [{ type: "castlife.satisfy", args: { entity: "self", need: "fun", minutes: `=${REST_FOR}`, activity: "waiting", after: `=${REST_TURN}` } }] }, duration: REST_TURN, activity: { type: "waiting", until: `clock + (${REST_FOR})` }, lexicon: ["rest", "relax", "take a break"], observable: "rests" });
+    // Getting up is doing something else (DESIGN §9.2): the day's activity ends the night or the rest,
+    // so nothing of its span is met after. Talking ("Goodnight, Rosa") gets no one up.
+    r.action({ id: "get_up", pack: "castlife", params: {}, requires: ["self.activity == 'sleep' or self.activity == 'waiting'"], outcomes: { default: [{ type: "set", args: { entity: "self", field: "activity", value: "idle" } }] }, duration: "2", lexicon: ["get up", "wake up", "get out of bed"], observable: "gets up" });
+    r.action({ id: "accept_invitation", pack: "castlife", params: { host: { type: "ref", ref: "person" } }, requires: ["invited(host)"], outcomes: { default: [{ type: "relationships.appraise", args: { from: "host", to: "self", appraisal: "promise_kept" } }, { type: "castlife.book_invitation", args: { host: "host" } }] }, duration: "1", lexicon: ["accept", "sure, let's", "count me in"], observable: "accepts an invitation" });
+
+    r.renderer({ slot: "people", label: "Who is here and how they feel about your character", render: (ctx) => peopleLines(ctx, "player").map((l) => l.text), feed: peopleLines });
+    // Their usual routine as background the narrator may use or ignore (DESIGN §6.6): a hint, so it
+    // rides last on the budget and stays out of the helpers' facts.
+    r.renderer({ slot: "people", source: "routines", label: "People's usual routines, as background", hint: true, render: usualRoutineHints });
+    r.view({ panel: "castlife.cast", build: (ctx) => buildCastView(ctx) as unknown as JsonValue });
+    r.view({ panel: "castlife.needs", build: (ctx) => buildNeedsView(ctx) as unknown as JsonValue });
+    r.renderer({ slot: "stance", label: "How the people here stand and what they're about", render: stanceLines, feed: stanceFeed });
+    r.renderer({ slot: "stance", source: "cues", label: "Hints of what people keep to themselves", hint: true, render: stanceCues });
+    r.lint({ code: "castlife.cues", check: cueIssues });
+    r.lint({ code: "castlife.needs", check: needsIssues });
+    // A birthday the planner can't read is no occasion: say so where it is written.
+    r.lint({
+      code: "castlife.birthday",
+      check: (world) => {
+        const cal = calendarOf(world);
+        return Object.values(world.entities).flatMap((e) =>
+          e.fields.birthday === undefined || e.fields.birthday === null || birthdayOf(cal, e.fields.birthday) ? [] : [{ severity: "warning" as const, code: "castlife.birthday", message: say("lint_name_s_birthday_doesnt_read_as_a", { name: e.name }), path: `entities.${e.id}.fields.birthday` }],
+        );
+      },
+    });
+
+    // Two schedules setting the same field of the same person at once are the engine's
+    // `schedule_overlap`; this rule covers what a schedule can't express: dated appointments and trips.
+    r.lint({
+      code: "castlife.double_booking",
+      check(world) {
+        const issues = [];
+        for (const e of Object.values(world.entities)) {
+          const owned = Object.values(world.schedules).filter((s) => s.owner === e.id && s.target === "activity");
+          // Appointments clash with each other, with trips, and with the person's activity schedules.
+          const dated = [
+            ...(Array.isArray(e.fields.appointments) ? e.fields.appointments : []).map((raw, i) => ({ path: `entities.${e.id}.fields.appointments.${i}`, label: strOf(objOf(raw).label, say("plan_label_an_appointment")), start: numOf(objOf(raw).at, NaN), end: numOf(objOf(raw).at, NaN) + numOf(objOf(raw).minutes, 60), trip: false })),
+            ...(Array.isArray(e.fields.trips) ? e.fields.trips : []).map((raw, i) => ({ path: `entities.${e.id}.fields.trips.${i}`, label: strOf(objOf(raw).label, "a trip"), start: numOf(objOf(raw).from, NaN), end: numOf(objOf(raw).until, NaN), trip: true })),
+          ].filter((d) => Number.isFinite(d.start) && Number.isFinite(d.end));
+          for (let i = 0; i < dated.length; i++) {
+            const a = dated[i];
+            if (!a) continue;
+            for (const b of dated.slice(i + 1)) if ((!a.trip || !b.trip) && a.start < b.end && b.start < a.end) issues.push({ severity: "warning" as const, code: "castlife.double_booking", message: say("lint_name_is_double_booked_label_and_b", { name: e.name, label: a.label, b: b.label }), path: b.path });
+            if (a.trip) continue;
+            for (const s of owned) {
+              const edges = scheduleInstants(world, [s], a.start - MINUTES_PER_DAY, a.end + MINUTES_PER_DAY);
+              const clash = edges.some((x) => x.edge === "start" && x.at < a.end && (edges.find((y) => y.edge === "end" && y.occurrence === x.occurrence)?.at ?? x.at) > a.start);
+              if (clash) issues.push({ severity: "warning" as const, code: "castlife.double_booking", message: say("lint_name_is_double_booked_label_falls_in", { name: e.name, label: a.label, id: s.id }), path: a.path });
+            }
+          }
+        }
+        return issues;
+      },
+    });
+
+    // Routines and the schedule checks they lean on (DESIGN §8, §13): owners as a chat starts.
+    r.lint({
+      code: "castlife.routines",
+      check(world, registry) {
+        if (!registry) return [];
+        const state = initialState(world, "", registry);
+        return [...routinesLint(world, registry, state), ...schedulesLint(world, registry, state)];
+      },
+    });
+  },
+};
+
+export default castlifePack;

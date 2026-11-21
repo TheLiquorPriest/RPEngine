@@ -1,0 +1,203 @@
+// Lore ids (plan §9.1, R-148): an id says which source its entry comes from and is a short number,
+// which stays the same for as long as RPE's database stands: `e-` and a number for a book entry,
+// `w-` and a number for a world entry. Lumiverse names a book entry by a long random id, and a world
+// document names an entry by its key (which stays the entry's address inside the world); agents copy
+// both badly and pay for them in every line that shows them, so RPE gives each entry a short number
+// the first time it sees it and keeps the number in its own database: a book entry's by the user
+// and its Lumiverse id, a world entry's by the user, its world and its key. Each kind counts from 1
+// for each user. A number is never given twice and never taken back, so an id an agent wrote down
+// names the same entry for as long as RPE's database stands, whatever becomes of the entry.
+
+import type { Database } from "bun:sqlite";
+
+/** What a lore id names: a book entry by its number, or a world entry by its number. */
+export type LoreRef = { kind: "book"; n: number } | { kind: "world"; n: number };
+
+/** A number from 1, with no leading zero, short enough to stay an exact number. */
+const NUMBER = "([1-9][0-9]{0,14})";
+const BOOK_ID = new RegExp(`^e-${NUMBER}$`);
+const WORLD_ID = new RegExp(`^w-${NUMBER}$`);
+
+export function bookEntryId(n: number): string {
+  return `e-${n}`;
+}
+
+export function worldEntryId(n: number): string {
+  return `w-${n}`;
+}
+
+/** What `id` names, or null when it is not a lore id. */
+export function loreRefOf(id: string): LoreRef | null {
+  const book = BOOK_ID.exec(id);
+  if (book) return { kind: "book", n: Number(book[1]) };
+  const world = WORLD_ID.exec(id);
+  if (world) return { kind: "world", n: Number(world[1]) };
+  return null;
+}
+
+/** An id of today's own lore index, which an agent of today wrote into a note or a mind file, with the book entry it was given to (carried by the migration). */
+export interface CarriedLoreId {
+  id: string;
+  book: string;
+  entry: string;
+}
+
+/**
+ * Keeps the ids of today's lore index a user's carried notes may name (`lore_old_id`), each with the Lumiverse book and entry it was given to. An id once given is
+ * never given again: one already kept stays as it was. It writes, so it is called inside a write of the queue. How many were new.
+ */
+export function putCarriedLoreIds(db: Database, user: string, ids: readonly CarriedLoreId[]): number {
+  const put = db.query<unknown, [string, string, string, string]>("INSERT OR IGNORE INTO lore_old_id (user, id, book, entry) VALUES (?, ?, ?, ?)");
+  let fresh = 0;
+  for (const one of ids) fresh += put.run(user, one.id, one.book, one.entry).changes;
+  return fresh;
+}
+
+/** The book and the Lumiverse entry one of today's old ids was given to; null for an id never carried. */
+export function oldRefIn(db: Database, user: string, id: string): { book: string; entry: string } | null {
+  return db.query<{ book: string; entry: string }, [string, string]>("SELECT book, entry FROM lore_old_id WHERE user = ? AND id = ?").get(user, id);
+}
+
+/** The number of each book entry asked for, by Lumiverse's id, as the table holds them now; an entry never numbered is left out. */
+export function bookNumbersIn(db: Database, user: string, entries: readonly string[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (let i = 0; i < entries.length; i += ASK_AT_ONCE) {
+    const part = entries.slice(i, i + ASK_AT_ONCE);
+    // Prepared rather than cached: the statement's shape changes with the number of entries asked about.
+    const rows = db.prepare<{ entry: string; n: number }, string[]>(`SELECT entry, n FROM lore_entry_number WHERE user = ? AND entry IN (${part.map(() => "?").join(", ")})`).all(user, ...part);
+    for (const row of rows) out.set(row.entry, row.n);
+  }
+  return out;
+}
+
+/**
+ * Gives each book entry asked for that has no number the next one, in the order asked, and answers every number of those asked for.
+ * It writes, so it is called inside a write of the queue.
+ */
+export function giveBookNumbers(db: Database, user: string, entries: readonly string[]): Map<string, number> {
+  const wanted = [...new Set(entries)];
+  const known = bookNumbersIn(db, user, wanted);
+  const fresh = wanted.filter((entry) => !known.has(entry));
+  if (fresh.length > 0) {
+    let last = db.query<{ n: number | null }, [string]>("SELECT max(n) AS n FROM lore_entry_number WHERE user = ?").get(user)?.n ?? 0;
+    const give = db.query<unknown, [string, number, string]>("INSERT OR IGNORE INTO lore_entry_number (user, n, entry) VALUES (?, ?, ?)");
+    // An entry numbered by a write queued just before this one keeps its number.
+    for (const entry of fresh) if (give.run(user, last + 1, entry).changes > 0) last++;
+  }
+  return bookNumbersIn(db, user, wanted);
+}
+
+/** What `id` names inside a write: an id RPE shows, or one of today's old ids, which names its book entry by that entry's number (given now when it has none). Null for neither. */
+export function loreRefIn(db: Database, user: string, id: string): LoreRef | null {
+  const shown = loreRefOf(id);
+  if (shown !== null) return shown;
+  const old = oldRefIn(db, user, id);
+  const n = old === null ? undefined : giveBookNumbers(db, user, [old.entry]).get(old.entry);
+  return n === undefined ? null : { kind: "book", n };
+}
+
+/**
+ * How RPE's database takes a write: queued behind every write asked for before it, run alone inside
+ * a transaction of its own (the application's write queue). Outside it the database takes no writes.
+ */
+export interface LoreWrites {
+  run<T>(write: (db: Database) => T, label?: string): Promise<T>;
+}
+
+/** Entries asked about in one statement: far below SQLite's limit on a statement's parameters. */
+const ASK_AT_ONCE = 500;
+
+/** The number of each of a world's entries asked for, by key, as the table holds them now; a key never numbered is left out. */
+export function worldNumbersIn(db: Database, user: string, world: string, keys: readonly string[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (let i = 0; i < keys.length; i += ASK_AT_ONCE) {
+    const part = keys.slice(i, i + ASK_AT_ONCE);
+    // Prepared rather than cached: the statement's shape changes with the number of keys asked about.
+    const rows = db.prepare<{ key: string; n: number }, string[]>(`SELECT key, n FROM lore_world_number WHERE user = ? AND world = ? AND key IN (${part.map(() => "?").join(", ")})`).all(user, world, ...part);
+    for (const row of rows) out.set(row.key, row.n);
+  }
+  return out;
+}
+
+/**
+ * Gives each of a world's entries asked for that has no number the next one, in the order asked, and
+ * answers every number of those asked for. It writes, so it is called inside a write of the queue.
+ */
+export function giveWorldNumbers(db: Database, user: string, world: string, keys: readonly string[]): Map<string, number> {
+  const wanted = [...new Set(keys)];
+  const fresh = wanted.filter((key) => !worldNumbersIn(db, user, world, [key]).has(key));
+  if (fresh.length > 0) {
+    let last = db.query<{ n: number | null }, [string]>("SELECT max(n) AS n FROM lore_world_number WHERE user = ?").get(user)?.n ?? 0;
+    const give = db.query<unknown, [string, number, string, string]>("INSERT OR IGNORE INTO lore_world_number (user, n, world, key) VALUES (?, ?, ?, ?)");
+    for (const key of fresh) if (give.run(user, last + 1, world, key).changes > 0) last++;
+  }
+  return worldNumbersIn(db, user, world, wanted);
+}
+
+/** The numbers of each user's lore entries (see the header). */
+export class EntryNumbers {
+  constructor(
+    private readonly db: Database,
+    private readonly writes: LoreWrites,
+  ) {}
+
+  /**
+   * The number of each book entry, by Lumiverse's id. An entry seen for the first time is given the
+   * next number, in the order asked, and the number is kept before it is given.
+   */
+  async of(user: string, entries: readonly string[]): Promise<Map<string, number>> {
+    const wanted = [...new Set(entries)];
+    const known = bookNumbersIn(this.db, user, wanted);
+    if (wanted.every((entry) => known.has(entry))) return known;
+    await this.writes.run((db) => giveBookNumbers(db, user, wanted), "numbering lore entries");
+    return bookNumbersIn(this.db, user, wanted);
+  }
+
+  /** The book and the Lumiverse entry one of today's old ids (`lre0001`, `lr0101`) was given to; null for an id the migration never carried. */
+  oldRef(user: string, id: string): { book: string; entry: string } | null {
+    return oldRefIn(this.db, user, id);
+  }
+
+  /** What `id` names: an id RPE shows, or one of today's old ids, which names its book entry by that entry's number (given when it has none). Null for neither. */
+  async refOf(user: string, id: string): Promise<LoreRef | null> {
+    const shown = loreRefOf(id);
+    if (shown !== null) return shown;
+    const old = this.oldRef(user, id);
+    const n = old === null ? undefined : (await this.of(user, [old.entry])).get(old.entry);
+    return n === undefined ? null : { kind: "book", n };
+  }
+
+  /** The Lumiverse id of the book entry `n` was given to; null for a number never given. */
+  entry(user: string, n: number): string | null {
+    return this.db.query<{ entry: string }, [string, number]>("SELECT entry FROM lore_entry_number WHERE user = ? AND n = ?").get(user, n)?.entry ?? null;
+  }
+
+  /**
+   * The number of each of a world's entries, by key. An entry seen for the first time is given the
+   * next number, in the order asked, and the number is kept before it is given.
+   */
+  async ofWorld(user: string, world: string, keys: readonly string[]): Promise<Map<string, number>> {
+    const wanted = [...new Set(keys)];
+    const known = worldNumbersIn(this.db, user, world, wanted);
+    if (wanted.every((key) => known.has(key))) return known;
+    await this.writes.run((db) => giveWorldNumbers(db, user, world, wanted), "numbering world lore entries");
+    return worldNumbersIn(this.db, user, world, wanted);
+  }
+
+  /** The world and the key of the world entry `n` was given to; null for a number never given. */
+  worldEntry(user: string, n: number): { world: string; key: string } | null {
+    return this.db.query<{ world: string; key: string }, [string, number]>("SELECT world, key FROM lore_world_number WHERE user = ? AND n = ?").get(user, n);
+  }
+
+  /**
+   * The number of the world entry with this key that the user's numbers hold: in `world` where one is named, else in whichever world
+   * holds it. Null for a key never numbered, or one several worlds hold when none is named.
+   */
+  worldNumberOf(user: string, key: string, world?: string): number | null {
+    const rows =
+      world === undefined
+        ? this.db.query<{ n: number }, [string, string]>("SELECT n FROM lore_world_number WHERE user = ? AND key = ?").all(user, key)
+        : this.db.query<{ n: number }, [string, string, string]>("SELECT n FROM lore_world_number WHERE user = ? AND key = ? AND world = ?").all(user, key, world);
+    return rows.length === 1 ? (rows[0]?.n ?? null) : null;
+  }
+}

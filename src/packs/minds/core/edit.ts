@@ -1,0 +1,220 @@
+// The GM's minds controls (DESIGN §24.9) as events of one `fix` entry: pin a character's fidelity,
+// ask for a fresh mind next turn, edit, add or delete a note, commitment or plan, set what they
+// mean to do now, and set or take away what someone knows of a fact (§24.11), the player
+// character's knowledge included. A value names only the fields that change; what it names is
+// checked here, and the event then checks the whole. The GM's words are kept whole, whitespace
+// collapsed: checked against the user's lengths (Settings → Minds → Lengths), one longer than its
+// length is refused, never cut, and one an edit leaves as it stands is kept whatever its length.
+
+import { hashParts } from "../../../shared/hash";
+import type { EntityId } from "../../../shared/ids";
+import type { JsonObject, JsonValue } from "../../../shared/json";
+import type { LedgerEvent } from "../../../shared/ledger";
+import type { CommitmentKind, CommitmentStatus, MindCommitment, MindCuts, MindEditOp, MindLengths, MindNote, MindPlan, PlanKind, PlanStatus } from "../../../shared/minds";
+import { COMMITMENT_KINDS, COMMITMENT_STATUSES, isWitnessRef, MINDS_EVENTS, PLAN_KINDS, PLAN_PRIORITY, sharedPlanId, sharesPlan } from "../../../shared/minds";
+import { labelOf, own } from "../../../engine/pack-kit";
+import type { ReadContext, Rejection } from "../../../engine/registry";
+import { kindIs } from "../../../engine/scope";
+import { holdingOf, isHolding } from "./events";
+import { readCharacter, readKnowledge } from "./state";
+import { say } from "../../../shared/lines";
+
+function reject(code: string, reason: string): Rejection {
+  return { code, reason };
+}
+
+/** Text with its whitespace collapsed, as every minds text is kept. */
+function tidy(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** Text cut at a word to `max` characters, whitespace collapsed. */
+export function capText(text: string, max: number): string {
+  const t = tidy(text);
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max + 1);
+  const at = cut.lastIndexOf(" ");
+  return `${(at > max * 0.6 ? cut.slice(0, at) : t.slice(0, max)).replace(/[\s,;:.]+$/, "")}…`;
+}
+
+/** A model's text cut to its length (`capText`, DESIGN §24.5), counted in `cuts` under `key` when it ran past it. */
+export function capCounted(text: string, max: number, cuts: MindCuts | undefined, key: keyof MindCuts): string {
+  if (cuts && tidy(text).length > max) cuts[key] = (cuts[key] ?? 0) + 1;
+  return capText(text, max);
+}
+
+/** The first `max` of a model's list (DESIGN §24.5), the items left out past it counted in `cuts` under `key`. */
+export function firstCounted<T>(items: readonly T[], max: number, cuts: MindCuts | undefined, key: keyof MindCuts): T[] {
+  if (cuts && items.length > max) cuts[key] = (cuts[key] ?? 0) + items.length - max;
+  return items.slice(0, max);
+}
+
+/**
+ * The GM's words for `what`, whitespace collapsed; null when the value gives none. Checked against
+ * the user's lengths (`max`, absent when an edit is resolved again, which keeps what it set), one
+ * longer is refused, never cut, unless it is the text as it already stands (`kept`).
+ */
+function gmText(v: JsonValue | undefined, max: number | undefined, kept: string | undefined, what: string): string | null | Rejection {
+  if (typeof v !== "string" || v.trim() === "") return null;
+  const t = tidy(v);
+  if (max === undefined || t.length <= max || t === kept) return t;
+  return reject("too_long", say("why_what_is_at_most_max_characters_as", { what, max: max.toLocaleString("en-US"), length: t.length.toLocaleString("en-US") }));
+}
+
+const minutes = (v: JsonValue | undefined): number | null => (typeof v === "number" && Number.isFinite(v) ? Math.round(v) : null);
+
+/** The entity ids among `v`, every one a person in the world: a value naming anything else refuses. */
+function peopleIn(ctx: ReadContext, v: JsonValue | undefined): EntityId[] | Rejection {
+  if (v === undefined) return [];
+  if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) return reject("bad_value", say("why_who_its_with_is_a_list_of"));
+  const ids = v as string[];
+  for (const id of ids) {
+    const e = own(ctx.state.entities, id);
+    if (!e) return reject("missing_entity", say("why_theres_no_subject", { subject: labelOf(ctx, id) }));
+    if (!kindIs(ctx.registry, ctx.world, e.kind, "person")) return reject("bad_value", say("why_name_isnt_a_person", { name: e.name }));
+  }
+  return [...new Set(ids)];
+}
+
+function noteFrom(ctx: ReadContext, who: EntityId, id: string | null, v: JsonObject, before: MindNote | undefined, lengths: Readonly<MindLengths> | undefined): MindNote | Rejection {
+  const said = gmText(v.text, lengths?.note, before?.text, "A note");
+  if (typeof said === "object" && said !== null) return said;
+  const body = said ?? before?.text ?? null;
+  if (body === null) return reject("bad_value", say("why_a_note_needs_its_text"));
+  const salience = v.salience === undefined ? (before?.salience ?? 3) : typeof v.salience === "number" && v.salience >= 1 && v.salience <= 5 ? v.salience : null;
+  if (salience === null) return reject("bad_value", say("why_a_notes_salience_is_1_to_5"));
+  return { id: id ?? `n_${hashParts("minds.gm.note", who, String(ctx.state.clock), body).slice(0, 10)}`, text: body, salience, at: before?.at ?? ctx.state.clock };
+}
+
+function commitmentFrom(ctx: ReadContext, who: EntityId, id: string | null, v: JsonObject, before: MindCommitment | undefined, lengths: Readonly<MindLengths> | undefined): MindCommitment | Rejection {
+  const said = gmText(v.text, lengths?.commitment, before?.text, "A commitment");
+  if (typeof said === "object" && said !== null) return said;
+  const body = said ?? before?.text ?? null;
+  if (body === null) return reject("bad_value", say("why_a_commitment_needs_its_text"));
+  const kind = v.kind === undefined ? (before?.kind ?? "other") : (COMMITMENT_KINDS as readonly JsonValue[]).includes(v.kind) ? (v.kind as CommitmentKind) : null;
+  if (kind === null) return reject("bad_value", say("why_a_commitment_is_one_of_join", { join: COMMITMENT_KINDS.join(", ") }));
+  const status = v.status === undefined ? (before?.status ?? "open") : (COMMITMENT_STATUSES as readonly JsonValue[]).includes(v.status) ? (v.status as CommitmentStatus) : null;
+  if (status === null) return reject("bad_value", say("why_a_commitments_status_is_one_of_join", { join: COMMITMENT_STATUSES.join(", ") }));
+  const withList = v.with === undefined ? (before?.with ?? []) : peopleIn(ctx, v.with);
+  if (!Array.isArray(withList)) return withList;
+  const due = v.due === undefined ? (before?.due ?? null) : v.due === null ? null : minutes(v.due);
+  if (v.due !== undefined && v.due !== null && due === null) return reject("bad_value", say("why_a_commitments_due_time_is_game_minutes"));
+  const closed = status === "open" ? null : before && before.status !== "open" ? before.closed : ctx.state.clock;
+  return { id: id ?? `c_${hashParts("minds.gm.commitment", who, String(ctx.state.clock), body).slice(0, 10)}`, kind, with: withList, text: body, due, status, made: before?.made ?? ctx.state.clock, closed };
+}
+
+function planFrom(ctx: ReadContext, who: EntityId, id: string | null, v: JsonObject, before: MindPlan | undefined, lengths: Readonly<MindLengths> | undefined): MindPlan | Rejection {
+  const said = gmText(v.what, lengths?.plan, before?.what, "What a plan is");
+  if (typeof said === "object" && said !== null) return said;
+  const what = said ?? before?.what ?? null;
+  if (what === null) return reject("bad_value", say("why_a_plan_needs_what_it_is"));
+  const when = v.when === undefined ? (before?.when ?? null) : typeof v.when === "object" && v.when !== null && !Array.isArray(v.when) ? { from: minutes(v.when.from), to: minutes(v.when.to) } : null;
+  if (!when || when.from === null || when.to === null || when.to < when.from) return reject("bad_value", say("why_a_plan_needs_when_from_and_to"));
+  const kind = v.kind === undefined ? (before?.kind ?? "other") : (PLAN_KINDS as readonly JsonValue[]).includes(v.kind) ? (v.kind as PlanKind) : null;
+  if (kind === null) return reject("bad_value", say("why_a_plan_is_one_of_join", { join: PLAN_KINDS.join(", ") }));
+  const where = v.where === undefined ? (before?.where ?? null) : v.where === null ? null : typeof v.where === "string" && own(ctx.world.places, v.where) ? v.where : undefined;
+  if (where === undefined) return reject("missing_place", say("why_theres_no_place_where_like_that", { where: typeof v.where === "string" ? labelOf(ctx, v.where) : undefined }));
+  const withList = v.with === undefined ? (before?.with ?? []) : peopleIn(ctx, v.with);
+  if (!Array.isArray(withList)) return withList;
+  const priority = v.priority === undefined ? (before?.priority ?? PLAN_PRIORITY.normal) : typeof v.priority === "number" && v.priority >= PLAN_PRIORITY.min && v.priority <= PLAN_PRIORITY.max ? Math.round(v.priority) : null;
+  if (priority === null) return reject("bad_value", say("why_a_plans_priority_is_min_to_max", { min: PLAN_PRIORITY.min, max: PLAN_PRIORITY.max }));
+  const statuses: readonly JsonValue[] = ["open", "done", "dropped"];
+  const status = v.status === undefined ? (before?.status ?? "open") : statuses.includes(v.status) ? (v.status as PlanStatus) : null;
+  if (status === null) return reject("bad_value", say("why_a_plans_status_is_open_done_or"));
+  const closed = status === "open" ? null : before && before.status !== "open" ? before.closed : ctx.state.clock;
+  // A pay or lend plan's amount is whole minor units, kept from before unless the edit gives one; it's handed to the first person it's with.
+  const money = kind === "pay" || kind === "lend";
+  const cents = v.cents === undefined ? before?.cents : typeof v.cents === "number" && Number.isInteger(v.cents) && v.cents > 0 ? v.cents : null;
+  if (money && (cents === null || cents === undefined || withList.length === 0)) return reject("bad_value", say("why_a_pay_or_lend_plan_needs_an"));
+  // A plan with others in it is theirs too (DESIGN §24.8): one plan, under the id the same people and start give it, whoever records it.
+  const shared = sharesPlan({ kind, with: withList });
+  return {
+    id: id ?? (shared ? sharedPlanId([who, ...withList], when.from) : `p_${hashParts("minds.gm.plan", who, String(ctx.state.clock), what).slice(0, 10)}`),
+    what,
+    kind,
+    when: { from: when.from, to: when.to },
+    where,
+    with: withList,
+    priority,
+    status,
+    made: before?.made ?? ctx.state.clock,
+    source: before?.source ?? "gm",
+    closed,
+    reason: status === "open" ? null : (before?.reason ?? say("mind_gm_edit")),
+    ...(money && cents ? { cents } : {}),
+    ...(shared ? { shared: true as const } : {}),
+    // A memory's words stay that memory's until the GM rewrites them; the GM's own are everyone's in it.
+    ...(shared && v.what === undefined && before?.by !== undefined ? { by: before.by } : {}),
+  };
+}
+
+/**
+ * A holding the GM sets (`mind_knowledge`), whole, of a fact the chat holds: its shape, then whom it
+ * names (a teller, those it's kept from), each a person in the world and never the holder, and each
+ * fact it rests on. One the holder already has, or a holding taken away that they don't have, is no
+ * change, so an edit resolved again where the story already made it so passes it over.
+ */
+function knowledgeEdit(ctx: ReadContext, op: Extract<MindEditOp, { op: "mind_knowledge" }>, name: string): LedgerEvent[] | Rejection {
+  const k = readKnowledge(ctx.state);
+  if (!own(k.facts, op.fact)) return reject("missing_fact", say("why_the_minds_hold_no_such_fact"));
+  const before = own(own(k.holdings, op.entity) ?? {}, op.fact);
+  if (op.holding === null) return before ? [{ type: MINDS_EVENTS.forget, data: { who: [op.entity], fact: op.fact } }] : reject("no_change", say("why_name_doesnt_hold_that", { name: name }));
+  const h = op.holding as unknown as JsonValue;
+  if (!isHolding(h)) return reject("bad_value", say("why_a_holding_is_how_its_held_and"));
+  // Someone who is their own teller knows it first hand: recorded with no teller, and a holding that was told, as witnessed.
+  const self = h.by === op.entity;
+  const given: typeof h = self ? { ...h, by: null, how: h.how === "told" ? "witnessed" : h.how } : h;
+  const named = peopleIn(ctx, [...(given.by === null ? [] : [given.by]), ...(Array.isArray(given.keptFrom) ? given.keptFrom : [])]);
+  if (!Array.isArray(named)) return named;
+  if (given.evidence.some((ref) => ref === op.fact || (!isWitnessRef(ref) && !own(k.facts, ref)))) return reject("missing_fact", say("why_a_holding_rests_on_facts_the_minds"));
+  const next = holdingOf(given, op.entity);
+  if (before && JSON.stringify(holdingOf(before, op.entity)) === JSON.stringify(next)) return reject("no_change", say("why_nothing_to_change"));
+  // The event carries the holding whole, so a fold reads it without the state it was made on.
+  return [{ type: MINDS_EVENTS.learn, data: { who: [op.entity], fact: op.fact, how: next.how, by: next.by, evidence: next.evidence, belief: next.belief, confidence: next.confidence, ...(next.keptFrom ? { keptFrom: next.keptFrom } : {}), msg: next.since.msg, at: next.since.at } }];
+}
+
+/**
+ * A GM minds control as the events of its `fix` entry, or why it can't apply. `lengths` are the
+ * user's (Settings → Minds → Lengths) when the edit is first checked; one resolved again has none,
+ * and keeps the words it set.
+ */
+export function mindEdit(ctx: ReadContext, op: MindEditOp, lengths?: Readonly<MindLengths>): LedgerEvent[] | Rejection {
+  const { world, state, registry } = ctx;
+  const e = own(state.entities, op.entity);
+  if (!e) return reject("missing_entity", say("why_theres_no_subject", { subject: labelOf(ctx, op.entity) }));
+  // What someone knows is anyone's to hold, the player character's too; a mind is everyone's but theirs.
+  if (op.op === "mind_knowledge") return kindIs(registry, world, e.kind, "person") ? knowledgeEdit(ctx, op, e.name) : reject("bad_value", say("why_name_isnt_a_person", { name: e.name }));
+  if (op.entity === world.pov || !kindIs(registry, world, e.kind, "person")) return reject("no_mind", say("why_name_doesnt_have_a_mind", { name: e.name }));
+  if (op.op === "mind_pin") return [{ type: MINDS_EVENTS.pin, data: { entity: op.entity, level: op.level } }];
+  if (op.op === "mind_refresh") return [{ type: MINDS_EVENTS.refresh, data: { entity: op.entity } }];
+  const c = readCharacter(state, op.entity);
+  if (op.op === "mind_intent") {
+    if (op.text === undefined && op.approach === undefined) return reject("bad_value", say("why_say_what_they_mean_to_do_or"));
+    const said = op.text === undefined ? undefined : gmText(op.text, lengths?.gmIntent, c.intent?.text, "Your intent for them");
+    if (typeof said === "object" && said !== null) return said;
+    // The event carries the intent whole, so a fold reads it without the state it was made on.
+    const text = said === undefined ? (c.intent?.text ?? "") : (said ?? "");
+    const approach = op.approach === undefined ? (c.intent?.approach ?? null) : op.approach;
+    return [{ type: MINDS_EVENTS.intent, data: { entity: op.entity, intent: text === "" && approach === null ? null : { text, approach } } }];
+  }
+  const value = op.value;
+  if (op.part === "note") {
+    const before = op.id === null ? undefined : c.notes.find((n) => n.id === op.id);
+    if (op.id !== null && !before) return reject("missing_note", say("why_name_has_no_such_note", { name: e.name }));
+    if (value === null) return op.id === null ? reject("bad_value", say("why_say_which_note_to_delete")) : [{ type: MINDS_EVENTS.noteEdit, data: { entity: op.entity, note: op.id, value: null } }];
+    const note = noteFrom(ctx, op.entity, op.id, value, before, lengths);
+    return "code" in note ? note : [{ type: MINDS_EVENTS.noteEdit, data: { entity: op.entity, note: note.id, value: note as unknown as JsonObject } }];
+  }
+  if (op.part === "commitment") {
+    const before = op.id === null ? undefined : c.commitments.find((x) => x.id === op.id);
+    if (op.id !== null && !before) return reject("missing_commitment", say("why_name_has_no_such_commitment", { name: e.name }));
+    if (value === null) return op.id === null ? reject("bad_value", say("why_say_which_commitment_to_delete")) : [{ type: MINDS_EVENTS.commitmentEdit, data: { entity: op.entity, commitment: op.id, value: null } }];
+    const commitment = commitmentFrom(ctx, op.entity, op.id, value, before, lengths);
+    return "code" in commitment ? commitment : [{ type: MINDS_EVENTS.commitmentEdit, data: { entity: op.entity, commitment: commitment.id, value: commitment as unknown as JsonObject } }];
+  }
+  const before = op.id === null ? undefined : c.plans.find((p) => p.id === op.id);
+  if (op.id !== null && !before) return reject("missing_plan", say("why_name_has_no_such_plan", { name: e.name }));
+  if (value === null) return op.id === null ? reject("bad_value", say("why_say_which_plan_to_delete")) : [{ type: MINDS_EVENTS.planEdit, data: { entity: op.entity, plan: op.id, value: null } }];
+  const plan = planFrom(ctx, op.entity, op.id, value, before, lengths);
+  return "code" in plan ? plan : [{ type: MINDS_EVENTS.planEdit, data: { entity: op.entity, plan: plan.id, value: plan as unknown as JsonObject } }];
+}

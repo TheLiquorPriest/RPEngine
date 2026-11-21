@@ -1,0 +1,940 @@
+// Build (DESIGN §13): a stack of pages, Worlds → World → Collection → Item
+// → sub-editor pages, each of them usable on a phone. Worlds lists the worlds (open, Export,
+// Delete) and New world starts one from a template or a file. Inside a world a
+// sticky bar keeps Back, the draft's state (a press shows what it changes against the last revision) and
+// Commit (which takes a note) in reach, with Discard in its overflow; the world's home groups its parts,
+// its content, its tools and its revisions (each opened for what it changed, and put in the draft); a collection lists its items by name,
+// and + New asks for a name and derives the id. Item and part pages keep Save to draft and Revert
+// in a sticky bar at the bottom. Packs replace the item page per collection (`UiRegistry.editor`).
+
+import type { ComponentChildren } from "preact";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import type { WorldId } from "../../shared/ids";
+import type { JsonObject, JsonValue } from "../../shared/json";
+import { hasOwn, isRecord } from "../../shared/json";
+import { mapSettingsForEdit } from "../../shared/map-settings";
+import type { JobKind } from "../../shared/jobs";
+import type { LintIssue } from "../../shared/lint";
+import type { WorldCollection, WorldPart } from "../../shared/world";
+import { placeCapsOf, playedKinds, type KindDef, type WorldDoc, type WorldIndex } from "../../shared/world";
+import type { BuildRoute, EntityGroup } from "../app";
+import { LorePinsKept } from "./lore-pins";
+import { useApp, useUi, useView } from "../app";
+import { Badge, Banner, Button, Empty, Field, IconButton, IdText, JsonView, List, ListRow, PageHeader, SaveBar, Section, useBusy } from "../components";
+import { humanize } from "../format";
+import { Icon } from "../../ui/icons";
+import type { EditorProps } from "../registry";
+import { scrollParent } from "../scroll";
+import { useSelect } from "../../ui/store";
+import { tierGroups } from "../batch";
+import { PickBox, SelectBar, useSelection } from "../multi-select";
+import { DraftBatchSheet } from "./batch-sheet";
+import { CheckView, issuePart, IssueRow } from "./check";
+import { COLLECTION_INFO, type CollectionInfo, deleteItem, go, holdNew, ItemHeader, itemLabel, KEPT_UNUSED, NewItem, newItemName, OverflowMenu, PART_INFO, packName, UNREAD_COLLECTIONS, UNREAD_PARTS } from "./chrome";
+import { CharacterPage } from "./character";
+import { entityFormSpecs, isCharacter, opensCharacterPage } from "./character-model";
+import { RevealItem } from "./contents";
+import { commitDraft, discardDraft, draftSend, loadDraft } from "./draft";
+import { DataUpdatesSection, useTableUpdates } from "./data-updates";
+import { ChangedElsewhere, useHeld } from "./held";
+import { WorldChatsSection } from "./upgrade";
+import { CommitPanel, RevisionsSection, UncommittedPanel } from "./history";
+import { JOB_INFO, jobStore, JobStatusBadge, JobView, keptJobs } from "./jobs";
+import { LookupTableEditor } from "./lookup-editor";
+import { NeedsEditor } from "./needs-editor";
+import { LoreEditor, LoreList } from "./lore-editor";
+import { SecrecyPage } from "./lore-secrecy";
+import { RoutineEditor, RoutineList } from "./routine-editor";
+import { RoutineSettingsEditor } from "./routine-settings";
+import { RulesetEditor } from "./ruleset-editor";
+import { COLLECTION_SPECS, newItem, PART_SPECS } from "./schema";
+import { KeptUnused } from "../kept-unused";
+import { lintAt, SchemaFields, worldIdentifiers } from "./schema-form";
+import { TableEditor } from "./table-editor";
+import { TiersEditor } from "./tiers-editor";
+import { PlaceThingsSection, ThingPage, ThingsPage } from "./things";
+import { OrganizationsPage, OrgEditor, opensOrgPage } from "./organizations";
+import { entityGroup, entityGroups, GROUP_INFO, opensThingPage } from "./things-model";
+
+/** A row of the world home: one of its lists of entities (ITEMS-SPEC §10.1), or a collection. */
+type HomeRow = { group: EntityGroup } | { collection: WorldCollection };
+
+/** The world's content in the story's own groups; every entity once in one list, and all of them under Advanced. */
+const GROUPS: readonly { title: string; rows: readonly HomeRow[] }[] = [
+  { title: "People & things", rows: [{ group: "people" }, { group: "orgs" }, { group: "things" }, { group: "money" }, { collection: "kinds" }, { collection: "classifications" }, { collection: "relations" }] },
+  { title: "Places", rows: [{ collection: "places" }, { collection: "maps" }, { collection: "routes" }, { collection: "grids" }] },
+  { title: "Daily life", rows: [{ collection: "routines" }, { collection: "schedules" }] },
+  { title: "Rules", rows: [{ collection: "actions" }, { collection: "checks" }, { collection: "rules" }] },
+  { title: "Story", rows: [{ collection: "tracks" }, { collection: "lore" }] },
+  { title: "Engine", rows: [{ collection: "tables" }, { collection: "packs" }] },
+  { title: "Advanced", rows: [{ collection: "entities" }] },
+];
+
+// Every world part, in the order Build lists them: `PART_INFO` names each one (a Record over WorldPart),
+// so a part with a page can never be left off the list, as Pinned lore once was; a part nothing kept reads has no page (`UNREAD_PARTS`).
+const PARTS = (Object.keys(PART_INFO) as WorldPart[]).filter((part) => UNREAD_PARTS[part] !== true);
+
+const TOOLS: readonly JobKind[] = ["import_lore", "index_text", "refine", "describe_map", "propose_routines", "playtest", "check_world"];
+
+export function Build() {
+  const route = useUi((ui) => ui.build);
+  const root = useRef<HTMLDivElement>(null);
+  const page = JSON.stringify(route);
+  // Every page opens at its top, as a new page does, not at the scroll the last one left.
+  useLayoutEffect(() => {
+    const scroller = root.current ? scrollParent(root.current) : null;
+    if (scroller && scroller.scrollTop > 0) scroller.scrollTop = 0;
+  }, [page]);
+  return (
+    <div ref={root} class="lre-build-root">
+      <BuildPage route={route} />
+    </div>
+  );
+}
+
+function BuildPage(props: { route: BuildRoute }) {
+  const route = props.route;
+  switch (route.view) {
+    case "worlds":
+      return <Worlds />;
+    case "check":
+      return (
+        <WithDraft worldId={route.worldId}>
+          <CheckView worldId={route.worldId} />
+        </WithDraft>
+      );
+    case "job":
+      return (
+        <WithDraft worldId={route.worldId}>
+          <JobView worldId={route.worldId} kind={route.kind} />
+        </WithDraft>
+      );
+    case "world":
+      return (
+        <WithDraft worldId={route.worldId}>
+          <WorldHome />
+        </WithDraft>
+      );
+    case "collection":
+      if (UNREAD_COLLECTIONS[route.collection] === true) return <BuildPage route={{ view: "world", worldId: route.worldId }} />;
+      return (
+        <WithDraft worldId={route.worldId}>
+          {route.collection === "lore" ? <LoreList worldId={route.worldId} /> : route.collection === "routines" ? <RoutineList worldId={route.worldId} /> : <CollectionView key={route.collection} collection={route.collection} />}
+        </WithDraft>
+      );
+    case "entities":
+      return (
+        <WithDraft worldId={route.worldId}>
+          {route.group === "things" ? <ThingsPage /> : route.group === "orgs" ? <OrganizationsPage /> : <CollectionView key={`group:${route.group}`} collection="entities" group={route.group} />}
+        </WithDraft>
+      );
+    case "item":
+      if (UNREAD_COLLECTIONS[route.collection] === true) return <BuildPage route={{ view: "world", worldId: route.worldId }} />;
+      return (
+        <WithDraft worldId={route.worldId}>
+          <ItemView collection={route.collection} id={route.id} />
+        </WithDraft>
+      );
+    case "part":
+      if (UNREAD_PARTS[route.part] === true) return <BuildPage route={{ view: "world", worldId: route.worldId }} />;
+      return (
+        <WithDraft worldId={route.worldId}>
+          <PartView part={route.part} />
+        </WithDraft>
+      );
+    case "secrecy":
+      return (
+        <WithDraft worldId={route.worldId}>
+          <SecrecyPage />
+        </WithDraft>
+      );
+  }
+}
+
+/** How many issues a part, a collection or an item has, in the colour of the worst, with an icon and words for screen readers. */
+function IssueBadge(props: { issues: readonly LintIssue[] }) {
+  const count = props.issues.length;
+  if (count === 0) return null;
+  const tone = props.issues.some((i) => i.severity === "error") ? "neg" : props.issues.some((i) => i.severity === "warning") ? "warn" : "neutral";
+  return (
+    <Badge tone={tone}>
+      <Icon name="alert" size={12} />
+      {count}
+      <span class="lre-sr">{count === 1 ? " issue" : " issues"}</span>
+    </Badge>
+  );
+}
+
+/**
+ * Loads the world's draft once, then shows the world bar over the page: Back one level, the
+ * world's name and its draft's state, Commit, and Discard in the overflow. The bar stays under the
+ * mode bar while the page scrolls, with the notice of a change made elsewhere when there is one.
+ */
+function WithDraft(props: { worldId: WorldId; children: ComponentChildren }) {
+  const app = useApp();
+  const draft = useSelect(app.drafts, (d) => d);
+  const route = useUi((ui) => ui.build);
+  const [failed, setFailed] = useState(false);
+  const [busy, run] = useBusy();
+  const [panel, setPanel] = useState<"commit" | "changes" | null>(null);
+  const load = () => {
+    setFailed(false);
+    void loadDraft(app, props.worldId).then((loaded) => setFailed(loaded === null));
+  };
+  useEffect(() => {
+    if (draft?.worldId === props.worldId) return;
+    load();
+  }, [props.worldId]);
+  // Neither panel outlives what it is about: another world's, or a draft with nothing uncommitted left (committed, discarded, or committed elsewhere).
+  useEffect(() => setPanel(null), [props.worldId]);
+  const dirty = draft?.dirty === true;
+  useEffect(() => {
+    if (!dirty) setPanel(null);
+  }, [dirty]);
+  if (!draft || draft.worldId !== props.worldId) {
+    return (
+      <div class="lre-build-page" data-lre-section="build">
+        <PageHeader title="World" onBack={() => go(app, { view: "worlds" })} backLabel="Worlds" />
+        {failed ? (
+          <Empty icon="alert" title="This world could not be loaded." action={<Button onClick={load}>Try again</Button>} />
+        ) : (
+          <Empty icon="hourglass">Loading the world…</Empty>
+        )}
+      </div>
+    );
+  }
+  const errors = draft.lint.filter((issue) => issue.severity === "error").length;
+  const warnings = draft.lint.filter((issue) => issue.severity === "warning").length;
+  // An entity's page goes back to its list (People, Things…); one in no list, to All entities.
+  const listed = route.view === "item" && route.collection === "entities" && route.id !== null && hasOwn(draft.doc.entities, route.id) ? entityGroup({ ...draft.doc, kinds: playedKinds(draft.packKinds, draft.doc.kinds) }, draft.doc.entities[route.id]?.kind ?? "") : null;
+  const up: { route: BuildRoute; label: string } =
+    route.view === "world"
+      ? { route: { view: "worlds" }, label: "Worlds" }
+      : listed !== null
+        ? { route: { view: "entities", worldId: props.worldId, group: listed }, label: GROUP_INFO[listed].label }
+        : route.view === "item"
+          ? { route: { view: "collection", worldId: props.worldId, collection: route.collection }, label: route.collection === "entities" ? "All entities" : COLLECTION_INFO[route.collection].label }
+          : route.view === "secrecy"
+            ? { route: { view: "collection", worldId: props.worldId, collection: "lore" }, label: COLLECTION_INFO.lore.label }
+            : { route: { view: "world", worldId: props.worldId }, label: draft.doc.name };
+  const blocked = errors > 0 ? `${errors} error${errors === 1 ? "" : "s"} block the commit` : undefined;
+  return (
+    <div class="lre-build" data-lre-section="build">
+      <div class="lre-build-bar" data-lre-world-bar>
+        <div class="lre-build-bar-row">
+          <IconButton icon="chevron-left" label={`Back to ${up.label}`} onClick={() => go(app, up.route)} />
+          <div class="lre-build-bar-text">
+            <span class="lre-build-bar-name">{draft.doc.name}</span>
+            <span class="lre-build-bar-state" data-lre-draft={draft.dirty ? "changed" : "committed"}>
+              {draft.dirty ? <span class="lre-dot" aria-hidden="true" /> : null}
+              {draft.dirty ? (
+                <button type="button" class="lre-build-source-name" aria-expanded={panel === "changes"} title="Show what the draft changes" onClick={() => setPanel(panel === "changes" ? null : "changes")}>
+                  Uncommitted<span class="lre-sr"> changes</span>
+                </button>
+              ) : (
+                <span>All committed</span>
+              )}
+              {errors > 0 ? <Badge tone="neg">{errors === 1 ? "1 error" : `${errors} errors`}</Badge> : null}
+              {warnings > 0 ? <Badge tone="warn">{warnings === 1 ? "1 warning" : `${warnings} warnings`}</Badge> : null}
+            </span>
+          </div>
+          <Button size="sm" variant={draft.dirty ? "primary" : "secondary"} disabled={!draft.dirty} busy={busy} title={blocked} label={blocked ? `Commit, ${blocked}` : undefined} onClick={() => setPanel(panel === "commit" ? null : "commit")}>
+            Commit
+          </Button>
+          <OverflowMenu label="Draft actions" items={[{ label: "Discard changes", icon: "trash", danger: true, disabled: !draft.dirty || busy, onSelect: () => run(() => discardDraft(app)) }]} />
+        </div>
+        <ChangedElsewhere />
+      </div>
+      {draft.dirty && panel === "changes" ? <UncommittedPanel worldId={props.worldId} version={draft.version} onClose={() => setPanel(null)} /> : null}
+      {draft.dirty && panel === "commit" ? (
+        <CommitPanel
+          busy={busy}
+          onCommit={(note) =>
+            run(async () => {
+              if (await commitDraft(app, note)) setPanel(null);
+            })
+          }
+          onClose={() => setPanel(null)}
+        />
+      ) : null}
+      {props.children}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- Worlds
+
+/** What an import flagged (macros in lore and templates), kept on screen until dismissed. */
+interface ImportReview {
+  worldId: WorldId;
+  name: string;
+  issues: LintIssue[];
+}
+
+function Worlds() {
+  const app = useApp();
+  const view = useView();
+  const [worlds, setWorlds] = useState<WorldIndex[] | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [review, setReview] = useState<ImportReview | null>(null);
+  const [busy, run] = useBusy();
+  const fileInput = useRef<HTMLInputElement>(null);
+  const refresh = () => void app.request({ type: "lre.world", op: "list" }).then((result) => setWorlds(result?.worlds ?? []));
+  useEffect(refresh, []);
+  const importFile = (file: File) =>
+    run(async () => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await file.text());
+      } catch {
+        app.toast("That file isn't JSON.", "error");
+        return;
+      }
+      const result = await app.request({ type: "lre.world", op: "import", file: parsed as JsonValue });
+      if (result) {
+        const issues = result.lint ?? [];
+        app.toast(issues.length > 0 ? `Imported “${result.world?.name ?? "world"}”. Review ${issues.length} item(s) below before playing.` : `Imported “${result.world?.name ?? "world"}”.`, "info");
+        setReview(result.world && issues.length > 0 ? { worldId: result.world.id, name: result.world.name, issues } : null);
+        setAdding(false);
+        refresh();
+      }
+    });
+  const exportWorld = (world: WorldIndex) =>
+    run(async () => {
+      const result = await app.request({ type: "lre.world", op: "export", worldId: world.id });
+      if (result?.file !== undefined) app.host.download(`${world.name.replace(/[^\w-]+/g, "_") || "world"}.lre-world.json`, JSON.stringify(result.file, null, 2));
+    });
+  const deleteWorld = (world: WorldIndex) =>
+    run(async () => {
+      // Which chats play it is said before it goes: each keeps its story at the revision it played, and plays no world until a world is attached to it.
+      const playing = (await app.request({ type: "lre.world", op: "chats", worldId: world.id }))?.chats ?? [];
+      const names = playing.map((chat) => `“${chat.name}”`);
+      const who = names.length <= 3 ? names.join(", ") : `${names.slice(0, 3).join(", ")} and ${names.length - 3} more`;
+      const words =
+        playing.length === 0
+          ? `Delete “${world.name}” and all its revisions?`
+          : `Delete “${world.name}”? ${playing.length === 1 ? "One chat plays it" : `${playing.length} chats play it`}: ${who}. ${playing.length === 1 ? "Its story stays" : "Their stories stay"} as played, at the revision ${playing.length === 1 ? "it plays" : "each plays"}, and ${playing.length === 1 ? "the chat plays" : "the chats play"} no world until you attach one.`;
+      if (!(await app.host.confirm("Delete world", words, "danger", "Delete"))) return;
+      if (await app.request({ type: "lre.world", op: "delete", worldId: world.id })) refresh();
+    });
+  return (
+    <div class="lre-build-page" data-lre-section="build">
+      {adding ? (
+        <PageHeader title="New world" subtitle="Start from a template, or bring one in" onBack={() => setAdding(false)} backLabel="Worlds" />
+      ) : (
+        <PageHeader
+          title="Worlds"
+          subtitle={worlds === null ? undefined : worlds.length === 1 ? "1 world" : `${worlds.length} worlds`}
+          actions={
+            <Button size="sm" variant="primary" icon="plus" onClick={() => setAdding(true)}>
+              New world
+            </Button>
+          }
+        />
+      )}
+      {review ? (
+        <Section title="Review before playing" aside={<Badge tone="warn">{review.issues.length}</Badge>}>
+          <div class="lre-stack" data-lre-import-review>
+            <Banner tone="warn">
+              “{review.name}” came from a file. Its lore and templates contain macros that Lumiverse runs when it builds a prompt; open each one and check it before you play.
+            </Banner>
+            <div class="lre-build-issues lre-build-well" role="list">
+              {review.issues.map((issue, i) => (
+                <IssueRow key={i} issue={issue} worldId={review.worldId} />
+              ))}
+            </div>
+            <div class="lre-build-actions">
+              <Button size="sm" variant="ghost" icon="check" onClick={() => setReview(null)}>
+                Done reviewing
+              </Button>
+            </div>
+          </div>
+        </Section>
+      ) : null}
+      {adding ? (
+        <NewWorld importing={busy} onImport={() => fileInput.current?.click()} />
+      ) : worlds === null ? (
+        <Empty icon="hourglass">Loading…</Empty>
+      ) : worlds.length === 0 ? (
+        <Empty
+          icon="globe"
+          title="No worlds yet"
+          action={
+            <Button variant="primary" icon="plus" onClick={() => setAdding(true)}>
+              New world
+            </Button>
+          }
+        >
+          Start one from a template, or import one.
+        </Empty>
+      ) : (
+        <div class="lre-build-worlds" role="list" data-lre-worlds>
+          {worlds.map((world) => (
+            <div key={world.id} class="lre-build-world" role="listitem">
+              <button type="button" class="lre-build-world-open" onClick={() => go(app, { view: "world", worldId: world.id })}>
+                <span class="lre-build-tile">
+                  <Icon name="globe" />
+                </span>
+                <span class="lre-build-world-text">
+                  <span class="lre-build-world-name">{world.name}</span>
+                  <span class="lre-build-note">{world.revisions.length === 1 ? "1 revision" : `${world.revisions.length} revisions`}</span>
+                  <IdText id={world.id} />
+                </span>
+                {view?.worldId === world.id ? <Badge tone="accent">This chat</Badge> : null}
+              </button>
+              <OverflowMenu
+                label={`More for ${world.name}`}
+                disabled={busy}
+                items={[
+                  { label: "Export", icon: "download", onSelect: () => exportWorld(world) },
+                  { label: "Delete", icon: "trash", danger: true, onSelect: () => deleteWorld(world) },
+                ]}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+      <input
+        ref={fileInput}
+        type="file"
+        accept="application/json,.json"
+        hidden
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          if (file) importFile(file);
+          event.currentTarget.value = "";
+        }}
+      />
+    </div>
+  );
+}
+
+/** A template card's choice: a starter `lre.world templates` lists, or a blank world (`id` null). */
+interface Start {
+  id: string | null;
+  name: string;
+  summary: string;
+}
+
+const BLANK: Start = { id: null, name: "Blank", summary: "An empty world with no people, places or rules yet, to build from scratch." };
+
+/**
+ * New world: the starters as cards with their blurbs, a name (a template's own until the user types
+ * one), Create; then Import a file.
+ */
+function NewWorld(props: { importing: boolean; onImport(): void }) {
+  const app = useApp();
+  const [starters, setStarters] = useState<Start[] | null>(null);
+  const [template, setTemplate] = useState<string | null>(null);
+  const [name, setName] = useState("");
+  const [typed, setTyped] = useState(false);
+  const [busy, run] = useBusy();
+  const nameId = useId();
+  const group = useId();
+  useEffect(() => {
+    void app.request({ type: "lre.world", op: "templates" }).then((result) => setStarters(result?.templates ?? []));
+  }, []);
+  const create = () => {
+    if (!name.trim()) return;
+    run(async () => {
+      const result = await app.request({ type: "lre.world", op: "create", name: name.trim(), template });
+      if (result?.world) go(app, { view: "world", worldId: result.world.id });
+    });
+  };
+  return (
+    <>
+      <Section title="Start from">
+        <div class="lre-build-templates" role="radiogroup" aria-label="Start from" data-lre-templates>
+          {[BLANK, ...(starters ?? [])].map((start) => (
+            <label key={start.id ?? ""} class="lre-build-template" data-lre-template={start.id ?? "blank"}>
+              <input
+                type="radio"
+                class="lre-sr"
+                name={group}
+                checked={template === start.id}
+                onChange={() => {
+                  setTemplate(start.id);
+                  if (!typed) setName(start.id === null ? "" : start.name);
+                }}
+              />
+              <span class="lre-build-template-text">
+                <span class="lre-build-template-name">{start.name}</span>
+                <span class="lre-build-note">{start.summary}</span>
+              </span>
+              <span class="lre-build-template-mark" aria-hidden="true">
+                <Icon name="check" size={16} />
+              </span>
+            </label>
+          ))}
+          {starters === null ? <p class="lre-build-note">Loading the starter worlds…</p> : null}
+        </div>
+      </Section>
+      <form
+        class="lre-stack"
+        onSubmit={(event) => {
+          event.preventDefault();
+          create();
+        }}
+      >
+        <Field label="Name" for={nameId}>
+          <input
+            id={nameId}
+            class="lre-input"
+            placeholder="Name your world"
+            autoComplete="off"
+            value={name}
+            onInput={(event) => {
+              setName(event.currentTarget.value);
+              setTyped(event.currentTarget.value !== "");
+            }}
+          />
+        </Field>
+        <Button type="submit" variant="primary" block disabled={!name.trim()} busy={busy}>
+          Create world
+        </Button>
+      </form>
+      <Section title="Or bring one in" flush>
+        <List>
+          <ListRow icon="upload" title="Import a file" subtitle="An lre-world-v1 file, as Export writes it" chevron disabled={props.importing} onClick={props.onImport} />
+        </List>
+      </Section>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------- a world
+
+function WorldHome() {
+  const app = useApp();
+  const draft = useSelect(app.drafts, (d) => d);
+  const view = useView();
+  const jobs = useSelect(jobStore, (all) => all);
+  const [busy, run] = useBusy();
+  // The World row says when this build ships newer data tables than the draft has (Build → World → Data updates).
+  const updates = useTableUpdates();
+  const worldId = draft?.worldId;
+  // The tools say how their last runs went: the backend keeps each world's jobs.
+  useEffect(() => {
+    if (!worldId) return;
+    void app.request({ type: "lre.job", op: "list", worldId }).then((body) => {
+      const kept = body?.jobs;
+      if (kept) jobStore.update((all) => keptJobs(all, worldId, kept));
+    });
+  }, [worldId]);
+  if (!draft) return null;
+  const doc = draft.doc;
+  const counts = (["error", "warning", "info"] as const).flatMap((severity) => {
+    const n = draft.lint.filter((issue) => issue.severity === severity).length;
+    return n === 0 ? [] : [`${n} ${severity === "info" ? "note" : severity}${n === 1 ? "" : "s"}`];
+  });
+  return (
+    <div class="lre-build-page" data-lre-world-home>
+      <Section title="World" aside={<IdText id={doc.format} />} flush>
+        <List>
+          {PARTS.map((part) => (
+            <ListRow
+              key={part}
+              icon={PART_INFO[part].icon}
+              title={PART_INFO[part].label}
+              subtitle={PART_INFO[part].hint}
+              badge={
+                <>
+                  <IssueBadge issues={draft.lint.filter((issue) => issuePart(issue.path) === part)} />
+                  {part === "meta" && updates !== null && updates.length > 0 ? <Badge tone="accent">Data updates</Badge> : null}
+                </>
+              }
+              chevron
+              onClick={() => go(app, { view: "part", worldId: draft.worldId, part })}
+            />
+          ))}
+        </List>
+      </Section>
+      <WorldContent doc={doc} packKinds={draft.packKinds} lint={draft.lint} worldId={draft.worldId} onGo={(route) => go(app, route)} />
+      <Section title="Tools" flush>
+        <List>
+          <ListRow icon="checklist" title="Problems" subtitle={counts.length === 0 ? "No issues in the draft" : counts.join(", ")} chevron onClick={() => go(app, { view: "check", worldId: draft.worldId })} />
+          {TOOLS.map((kind) => {
+            const job = jobs[`${draft.worldId}:${kind}`];
+            return <ListRow key={kind} icon={JOB_INFO[kind].icon} title={JOB_INFO[kind].title} subtitle={JOB_INFO[kind].hint} badge={job ? <JobStatusBadge status={job.status} /> : undefined} chevron onClick={() => go(app, { view: "job", worldId: draft.worldId, kind })} />;
+          })}
+          {view && view.status === "not_world" ? (
+            <ListRow
+              icon="link"
+              title="Attach to this chat"
+              subtitle="Play this world in the chat that's open"
+              disabled={busy}
+              onClick={() =>
+                run(async () => {
+                  if (!(await app.host.confirm("Attach world", `Attach “${doc.name}” to the open chat?`, "info", "Attach"))) return;
+                  if (await app.request({ type: "lre.world", op: "attach", worldId: draft.worldId, chatId: view.chatId })) void app.client.open(view.chatId);
+                })
+              }
+            />
+          ) : null}
+        </List>
+      </Section>
+      <WorldChatsSection worldId={draft.worldId} />
+      <RevisionsSection worldId={draft.worldId} />
+    </div>
+  );
+}
+
+/**
+ * The world home's content: each group's rows, an entity list (People, Organizations, Things,
+ * Money: ITEMS-SPEC §10.1) or a collection, each with how many it holds and the draft's issues in
+ * it; every entity again under Advanced, as All entities. `packKinds` sort entities into the lists.
+ */
+export function WorldContent(props: { doc: WorldDoc; packKinds: Readonly<Record<string, KindDef>>; lint: readonly LintIssue[]; worldId: WorldId; onGo(route: BuildRoute): void }) {
+  const { doc, lint } = props;
+  const lists = entityGroups({ ...doc, kinds: playedKinds(props.packKinds, doc.kinds) });
+  return (
+    <>
+      {GROUPS.map((group) => (
+        <Section key={group.title} title={group.title} flush>
+          <List>
+            {group.rows.map((row) => {
+              if ("group" in row) {
+                const ids = new Set(lists[row.group]);
+                const info = GROUP_INFO[row.group];
+                return <ListRow key={row.group} icon={info.icon} title={info.label} subtitle={info.hint} value={ids.size} valueTone="muted" badge={<IssueBadge issues={lint.filter((issue) => issue.path.startsWith("entities.") && ids.has(issue.path.split(".")[1] ?? ""))} />} chevron onClick={() => props.onGo({ view: "entities", worldId: props.worldId, group: row.group })} />;
+              }
+              const collection = row.collection;
+              return (
+                <ListRow
+                  key={collection}
+                  icon={COLLECTION_INFO[collection].icon}
+                  title={collection === "entities" ? "All entities" : COLLECTION_INFO[collection].label}
+                  subtitle={collection === "entities" ? "Every entity of every kind, in one list" : COLLECTION_INFO[collection].hint}
+                  value={Object.keys(doc[collection] ?? {}).length}
+                  valueTone="muted"
+                  badge={<IssueBadge issues={lintAt(lint, collection)} />}
+                  chevron
+                  onClick={() => props.onGo({ view: "collection", worldId: props.worldId, collection })}
+                />
+              );
+            })}
+          </List>
+        </Section>
+      ))}
+    </>
+  );
+}
+
+/** A collection's items by name, or one of the world home's entity lists (`group`: People, Organizations, Money); + New, search and bulk changes. */
+function CollectionView(props: { collection: WorldCollection; group?: Exclude<EntityGroup, "things"> }) {
+  const app = useApp();
+  const draft = useSelect(app.drafts, (d) => d);
+  const [query, setQuery] = useState("");
+  const [adding, setAdding] = useState(false);
+  // Entities and places take bulk changes: while choosing, a row's tap picks it instead of opening it.
+  const selection = useSelection();
+  const [changing, setChanging] = useState(false);
+  if (!draft) return null;
+  const bulk = props.collection === "entities" || props.collection === "places" ? props.collection : null;
+  const doc = draft.doc;
+  const kinds = playedKinds(draft.packKinds, doc.kinds);
+  const listed = props.group ? new Set(entityGroups({ ...doc, kinds })[props.group]) : null;
+  const info: CollectionInfo = props.group ? GROUP_INFO[props.group] : props.collection === "entities" ? { ...COLLECTION_INFO.entities, label: "All entities" } : COLLECTION_INFO[props.collection];
+  const items = Object.entries(doc[props.collection] as Record<string, unknown>)
+    .map(([id, value]) => ({ id, value, label: itemLabel(props.collection, id, value, doc.places, draft.packLabels), path: `${props.collection}.${id}`, note: undefined as string | undefined }))
+    .filter((item) => listed === null || listed.has(item.id));
+  const q = query.trim().toLowerCase();
+  const shown = items.filter((item) => !q || item.id.toLowerCase().includes(q) || item.label.toLowerCase().includes(q));
+  // Those picked still in the draft (a change elsewhere can remove one), in the list's order.
+  const chosen = items.filter((item) => selection.ids.includes(item.id)).map((item) => item.id);
+  // Data tables come from packs: a world edits its copy of one and never starts one.
+  const canAdd = props.collection !== "tables";
+  const detail = (value: unknown): string | undefined => {
+    if (!isRecord(value)) return undefined;
+    const parts: string[] = [];
+    if (typeof value.kind === "string" && value.kind) parts.push(hasOwn(kinds, value.kind) ? (kinds[value.kind]?.label ?? value.kind) : humanize(value.kind));
+    if (typeof value.pack === "string" && value.pack) parts.push(packName(draft.packLabels, value.pack));
+    if (typeof value.map === "string") parts.push(`Drawn by the map ${itemLabel("maps", value.map, hasOwn(doc.maps, value.map) ? doc.maps[value.map] : undefined)}`);
+    return parts.length > 0 ? parts.join(" · ") : undefined;
+  };
+  const add = (
+    <Button variant="primary" icon="plus" onClick={() => setAdding(true)}>
+      New {info.noun}
+    </Button>
+  );
+  return (
+    <div class="lre-build-page" data-lre-collection={props.collection} data-lre-group={props.group}>
+      <PageHeader
+        title={info.label}
+        subtitle={info.hint}
+        actions={
+          <>
+            {bulk && items.length > 0 ? (
+              <Button size="sm" variant={selection.on ? "primary" : "secondary"} icon="checklist" onClick={() => (selection.on ? selection.stop() : selection.start())}>
+                {selection.on ? "Done" : "Select"}
+              </Button>
+            ) : null}
+            {canAdd && !adding ? (
+              <Button size="sm" variant="primary" icon="plus" label={`New ${info.noun}`} onClick={() => setAdding(true)}>
+                New
+              </Button>
+            ) : null}
+          </>
+        }
+      />
+      {adding ? <NewItem worldId={draft.worldId} collection={props.collection} taken={new Set(items.map((item) => item.id))} onDone={() => setAdding(false)} /> : null}
+      {canAdd ? null : <p class="lre-build-note">New data tables come from packs; open one to edit this world's copy of it.</p>}
+      {items.length > 8 ? (
+        <div class="lre-build-search">
+          <Icon name="search" size={16} />
+          <input class="lre-input" type="search" placeholder={`Search ${info.label.toLowerCase()}`} aria-label={`Search ${info.label.toLowerCase()}`} value={query} onInput={(event) => setQuery(event.currentTarget.value)} />
+        </div>
+      ) : null}
+      {shown.length === 0 ? (
+        items.length === 0 ? (
+          <Empty icon={info.icon} title={`No ${info.label.toLowerCase()} yet`} action={canAdd && !adding ? add : undefined}>
+            {info.hint}
+          </Empty>
+        ) : (
+          <Empty icon="search" title="No matches">
+            Nothing here matches “{query.trim()}”.
+          </Empty>
+        )
+      ) : (
+        <Section flush>
+          <List>
+            {shown.map((item) => (
+              <ListRow
+                key={item.id}
+                title={item.label}
+                subtitle={item.note ?? detail(item.value)}
+                id={item.id}
+                leading={selection.on ? <PickBox label={`Select ${item.label}`} checked={selection.ids.includes(item.id)} /> : undefined}
+                badge={<IssueBadge issues={lintAt(draft.lint, item.path)} />}
+                chevron={!selection.on}
+                onClick={() => (selection.on ? selection.toggle(item.id) : go(app, { view: "item", worldId: draft.worldId, collection: props.collection, id: item.id }))}
+              />
+            ))}
+          </List>
+        </Section>
+      )}
+      {bulk && selection.on ? (
+        <SelectBar label={`Change the selected ${info.label.toLowerCase()}`} selection={selection} all={items.map((item) => item.id)} shown={shown.map((item) => item.id)} groups={bulk === "entities" ? tierGroups(doc) : undefined} groupLabel="Select a tier">
+          <Button variant="primary" icon="edit" disabled={chosen.length === 0} onClick={() => setChanging(true)}>
+            {chosen.length === 1 ? "Change 1…" : `Change ${chosen.length}…`}
+          </Button>
+        </SelectBar>
+      ) : null}
+      {bulk && changing && chosen.length > 0 ? <DraftBatchSheet collection={bulk} ids={chosen} onClose={() => setChanging(false)} /> : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- item and part pages
+
+/** An item a map draws (DESIGN §4.1): read-only here, edited in its map. */
+export function MapOwned(props: { worldId: string; collection: WorldCollection; id: string; value: unknown; map: string }) {
+  const app = useApp();
+  const doc = useSelect(app.drafts, (d) => d?.doc);
+  const map = itemLabel("maps", props.map, doc && hasOwn(doc.maps, props.map) ? doc.maps[props.map] : undefined);
+  return (
+    <div class="lre-build-page" data-lre-editor={props.collection} data-lre-owned={props.map}>
+      <ItemHeader title={itemLabel(props.collection, props.id, props.value, doc?.places)} id={props.id} />
+      <Banner
+        tone="info"
+        icon="lock"
+        title="Drawn by a map"
+        actions={
+          <Button size="sm" variant="primary" icon="map" onClick={() => go(app, { view: "item", worldId: props.worldId, collection: "maps", id: props.map })}>
+            Edit in map
+          </Button>
+        }
+      >
+        The map {map} draws this {COLLECTION_INFO[props.collection].noun}, so it's read-only here.
+      </Banner>
+      <Section title="As stored">
+        <JsonView value={props.value} />
+      </Section>
+      {props.collection === "places" ? <LorePinsKept target="places" id={props.id} /> : null}
+    </div>
+  );
+}
+
+/**
+ * The default editor for any collection: the schema-driven form over `COLLECTION_SPECS` on an item
+ * page; an item a map draws shows read-only. `children` (a pack's own section) follow the fields.
+ */
+export function SchemaEditor(props: EditorProps & { children?: ComponentChildren }) {
+  const app = useApp();
+  const draft = useSelect(app.drafts, (d) => d);
+  const isNew = props.id?.startsWith("new:") ?? false;
+  const id = isNew ? (props.id ?? "").slice(4) : (props.id ?? "");
+  const stored = (props.world[props.collection] as Record<string, unknown>)[id];
+  const initial: JsonObject = isRecord(stored) ? (stored as JsonObject) : newItem(props.collection, id, props.world, newItemName(props.world.id, props.collection, id));
+  const [value, setValue] = useState<JsonObject>(initial);
+  const [busy, run] = useBusy();
+  useHeld(value, setValue, initial, `${props.world.id}/${props.collection}/${props.id ?? ""}`, JSON.stringify(stored ?? null));
+  const identifiers = useMemo(() => worldIdentifiers(props.world), [props.world]);
+  // Pickers and kind-typed fields see the packs' kinds and relation types too (DESIGN §13); the world's own win.
+  const formDoc = useMemo(() => ({ ...props.world, kinds: playedKinds(draft?.packKinds, props.world.kinds), relations: { ...draft?.packRelations, ...props.world.relations } }), [props.world, draft?.packKinds, draft?.packRelations]);
+  const path = `${props.collection}.${id}`;
+  const changed = JSON.stringify(value) !== JSON.stringify(isRecord(stored) ? stored : null);
+  // A pack's entry shows the pack's own config fields, when its ui registers them, above the JSON.
+  const PackConfig = props.collection === "packs" ? app.catalog.configs.get(id) : undefined;
+  // A new item isn't in the draft until Create: leaving its page asks first.
+  const release = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    if (!isNew) return;
+    const free = holdNew(app, COLLECTION_INFO[props.collection].noun);
+    release.current = free;
+    return free;
+  }, [isNew, props.collection, props.id]);
+  if (isRecord(stored) && typeof stored.map === "string") return <MapOwned worldId={props.world.id} collection={props.collection} id={id} value={stored} map={stored.map} />;
+  const noun = COLLECTION_INFO[props.collection].noun;
+  const name = itemLabel(props.collection, id, value, props.world.places, draft?.packLabels);
+  const save = () =>
+    run(async () => {
+      const message = await props.send({ type: "lre.editor", worldId: props.world.id, base: null, op: "put", collection: props.collection, id, value });
+      if (message.type === "lre.result" && isNew) {
+        release.current();
+        go(app, { view: "item", worldId: props.world.id, collection: props.collection, id });
+      }
+    });
+  return (
+    <div class="lre-build-page" data-lre-editor={props.collection}>
+      <ItemHeader title={name} id={id} subtitle={isNew ? `New ${noun}, not in the draft until you create it` : undefined} onDelete={isNew ? undefined : () => run(() => deleteItem(app, props.send, { worldId: props.world.id, collection: props.collection, id, name }))} busy={busy} />
+      {lintAt(draft?.lint ?? [], path)
+        .filter((issue) => issue.path === path)
+        .map((issue) => (
+          <Banner key={issue.code} tone={issue.severity === "error" ? "neg" : issue.severity === "warning" ? "warn" : "info"}>
+            {issue.message}
+          </Banner>
+        ))}
+      {PackConfig ? <PackConfig world={props.world} config={isRecord(value.config) ? value.config : {}} lint={lintAt(draft?.lint ?? [], `${path}.config`)} onChange={(config) => setValue({ ...value, config })} /> : null}
+      {/* A thing's page leaves out what only a person has (life, cues, their Lumiverse card, their own day). */}
+      <SchemaFields specs={props.collection === "entities" ? entityFormSpecs(formDoc, value) : COLLECTION_SPECS[props.collection]} value={value} ctx={{ doc: formDoc, lint: draft?.lint ?? [], path, identifiers, functions: draft?.functions ?? [], fieldEditors: app.catalog.fields }} onChange={setValue} />
+      {/* A thing can be hidden until searched for (DESIGN §7); a place lists the things there (ITEMS-SPEC §10.1). */}
+      {props.collection === "entities" ? <RevealItem kinds={formDoc.kinds} value={value} onChange={setValue} /> : null}
+      {!isNew && props.collection === "places" ? <PlaceThingsSection world={props.world} id={id} /> : null}
+      {props.collection === "places"
+        ? app.catalog.placeFields.map((def) => {
+            // A pack's place field is edited inside the place's `fields`, which the JSON above shows too.
+            const fields: JsonObject = isRecord(value.fields) ? (value.fields as JsonObject) : {};
+            return (
+              <div key={def.field} data-lre-place-field={def.field}>
+                <Section title={def.label}>
+                  <def.component
+                    doc={formDoc}
+                    place={{ id, fields }}
+                    field={def.field}
+                    value={fields[def.field]}
+                    lint={lintAt(draft?.lint ?? [], `${path}.fields.${def.field}`)}
+                    path={`${path}.fields.${def.field}`}
+                    onChange={(next) => {
+                      const out: JsonObject = { ...fields };
+                      if (next === undefined) delete out[def.field];
+                      else out[def.field] = next;
+                      setValue({ ...value, fields: out });
+                    }}
+                  />
+                </Section>
+              </div>
+            );
+          })
+        : null}
+      {!isNew && (props.collection === "places" || (props.collection === "entities" && isCharacter(formDoc, value))) ? <LorePinsKept target={props.collection === "entities" ? "characters" : "places"} id={id} /> : null}
+      {props.children}
+      <SaveBar>
+        <Button variant="primary" disabled={!changed && !isNew} busy={busy} onClick={save}>
+          {isNew ? "Create" : "Save to draft"}
+        </Button>
+        <Button variant="ghost" disabled={busy || !changed} onClick={() => setValue(initial)}>
+          Revert
+        </Button>
+      </SaveBar>
+    </div>
+  );
+}
+
+function ItemView(props: { collection: WorldCollection; id: string | null }) {
+  const app = useApp();
+  const draft = useSelect(app.drafts, (d) => d);
+  const send = useMemo(() => draftSend(app), [app]);
+  if (!draft) return null;
+  const registered = app.catalog.editors.get(props.collection);
+  // A person opens the Character page and a thing its own page, never the generic editor (DESIGN §13 characters, ITEMS-SPEC §10.1); a new entity is made in the generic one first.
+  const played = { ...draft.doc, kinds: playedKinds(draft.packKinds, draft.doc.kinds) };
+  const character = opensCharacterPage(played, props.collection, props.id);
+  const thing = opensThingPage(played, props.collection, props.id);
+  const org = opensOrgPage(played, props.collection, props.id);
+  const Editor = registered ? registered.component : character ? CharacterPage : thing ? ThingPage : org ? OrgEditor : props.collection === "tables" ? TableEditor : props.collection === "lore" ? LoreEditor : props.collection === "routines" ? RoutineEditor : SchemaEditor;
+  return <Editor world={draft.doc} collection={props.collection} id={props.id} send={send} />;
+}
+
+function partValue(doc: WorldDoc, part: Exclude<WorldPart, "tiers" | "loreIndex" | "ruleset" | "minds" | "lorePins" | "routineSettings" | "needs">): JsonObject {
+  switch (part) {
+    case "calendar":
+      return doc.calendar as unknown as JsonObject;
+    case "realism":
+      return doc.realism as unknown as JsonObject;
+    case "time":
+      return doc.time as unknown as JsonObject;
+    case "meta":
+      // Map settings and the place cap show as the world plays them: a world without them, with the defaults.
+      return { name: doc.name, pov: doc.pov, narrator: doc.narrator ? { ...doc.narrator } : null, start: { ...doc.start }, lenientPricing: doc.lenientPricing, placeCap: placeCapsOf(doc).chat, lifeStates: structuredClone(doc.lifeStates ?? {}) as unknown as JsonObject, currency: { ...doc.currency }, mapSettings: structuredClone(mapSettingsForEdit(doc)) as unknown as JsonObject };
+  }
+}
+
+/** What the world's file holds of the part's fields that nothing RPE runs reads (`KEPT_UNUSED`), under the keys it names; unset where the file holds the default. */
+function unusedOf(doc: WorldDoc, part: WorldPart): Record<string, unknown> {
+  if (part === "time") return { ...doc.time };
+  if (part === "meta") return { seedMode: doc.seedMode !== "fresh" ? doc.seedMode : undefined, spawnCap: doc.spawnCap, placesPerTurn: doc.placesPerTurn };
+  return {};
+}
+
+function PartView(props: { part: WorldPart }) {
+  const app = useApp();
+  const draft = useSelect(app.drafts, (d) => d);
+  const send = useMemo(() => draftSend(app), [app]);
+  if (!draft) return null;
+  if (props.part === "tiers") return <TiersEditor doc={draft.doc} lint={draft.lint} save={(value) => send({ type: "lre.editor", worldId: draft.worldId, base: draft.base, op: "set", part: "tiers", value })} />;
+  if (props.part === "loreIndex") return <LookupTableEditor doc={draft.doc} lint={draft.lint} save={(value) => send({ type: "lre.editor", worldId: draft.worldId, base: draft.base, op: "set", part: "loreIndex", value })} />;
+  if (props.part === "ruleset") return <RulesetEditor />;
+  if (props.part === "minds" || props.part === "lorePins") return null;
+  if (props.part === "routineSettings") return <RoutineSettingsEditor />;
+  if (props.part === "needs") return <NeedsEditor />;
+  return <SchemaPartView part={props.part} />;
+}
+
+function SchemaPartView(props: { part: Exclude<WorldPart, "tiers" | "loreIndex" | "ruleset" | "minds" | "lorePins" | "routineSettings" | "needs"> }) {
+  const app = useApp();
+  const draft = useSelect(app.drafts, (d) => d);
+  const send = useMemo(() => draftSend(app), [app]);
+  const initial = draft ? partValue(draft.doc, props.part) : {};
+  const [value, setValue] = useState<JsonObject>(initial);
+  const [busy, run] = useBusy();
+  useHeld(value, setValue, initial, `${draft?.worldId ?? ""}/${props.part}`);
+  const identifiers = useMemo(() => (draft ? worldIdentifiers(draft.doc) : []), [draft?.doc]);
+  if (!draft) return null;
+  const changed = JSON.stringify(value) !== JSON.stringify(initial);
+  return (
+    <div class="lre-build-page" data-lre-editor={`part:${props.part}`}>
+      <PageHeader title={PART_INFO[props.part].label} subtitle={PART_INFO[props.part].hint} />
+      {props.part === "meta" ? <DataUpdatesSection /> : null}
+      <SchemaFields specs={PART_SPECS[props.part]} value={value} ctx={{ doc: draft.doc, lint: draft.lint, path: props.part, identifiers, functions: draft.functions }} onChange={setValue} />
+      <KeptUnused fields={KEPT_UNUSED[props.part] ?? []} held={unusedOf(draft.doc, props.part)} />
+      <SaveBar>
+        <Button
+          variant="primary"
+          disabled={!changed}
+          busy={busy}
+          onClick={() =>
+            run(async () => {
+              await send({ type: "lre.editor", worldId: draft.worldId, base: draft.base, op: "set", part: props.part, value });
+            })
+          }
+        >
+          Save to draft
+        </Button>
+        <Button variant="ghost" disabled={!changed || busy} onClick={() => setValue(initial)}>
+          Revert
+        </Button>
+      </SaveBar>
+    </div>
+  );
+}

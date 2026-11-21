@@ -1,0 +1,317 @@
+// Tracks (DESIGN §10): one state machine for quests, secret ladders, puzzles and NPC agendas.
+//
+// A stage advances only by predicates: its `fail.when` first (to `fail.to`), else the first
+// `next[i]` whose `when` holds and whose target's `gate` holds. Leaving a stage by `next` grants
+// its `rewards`, and reaching an end stage (no way out) grants its own, since it is never left;
+// entering a stage applies its `effects`, records a reveal when it carries `truth` and, for quests,
+// signals a `quest` interrupt. Each entry is one unit, its stage event recording the stage it left
+// (`from`), so wherever it is replayed it lands only from that stage, whole or not at all. Secret
+// stages are never advanced by a model; a puzzle stage with an `answer` also advances on a correct
+// answer (exact or normalized, then the authored `puzzle.answer` decision threshold). The GM's Stage
+// moves a track on as a real entry does, or back with no entry at all (`moveTrack`). Agenda stages
+// feed the planner their `priority`.
+
+import { hashParts } from "../shared/hash";
+import type { EntityId, StageId, TrackId } from "../shared/ids";
+import type { LedgerEvent } from "../shared/ledger";
+import type { StageDef, TrackDef, WorldDoc } from "../shared/world";
+import { objectiveLabel, objectiveWhen, trackOwner } from "../shared/world";
+import { applyEffects } from "./effects";
+import { ENGINE_EVENTS, readEngineSlice } from "./engine-pack";
+import type { ExprEnv } from "./expr";
+import type { Rejection } from "./registry";
+import type { Registry } from "./registry-impl";
+import { createRng } from "./rng";
+import { evalExpr, scopeEnv, truthy } from "./scope";
+import type { WorldState } from "./state";
+import { own } from "./pack-kit";
+import { ownersCue } from "./visibility";
+import type { Working } from "./working";
+import { say } from "../shared/lines";
+
+/** Transitions per track per pass: a stage cycle stops here. */
+export const TRANSITION_CAP = 8;
+
+export interface TrackChange {
+  track: TrackId;
+  from: StageId;
+  to: StageId;
+  via: "next" | "fail" | "answer" | "gm";
+  events: LedgerEvent[];
+}
+
+export function currentStage(world: WorldDoc, state: Readonly<WorldState>, track: TrackId): StageId | null {
+  const def = own(world.tracks, track);
+  if (!def) return null;
+  return own(state.tracks, track)?.stage ?? def.start;
+}
+
+/** A track's owner as `self` and `owner`, when an entity owns it (never the GM's, `GM_OWNER`). */
+function ownerBindings(track: TrackDef): Record<string, EntityId> {
+  const owner = trackOwner(track);
+  return owner ? { self: owner, owner } : {};
+}
+
+/** A stage's objectives, each by its label with whether its condition holds on the record now (its owner as `self` and `owner`). */
+export function objectivesOf(reg: Registry, w: Pick<Working, "state" | "ctx">, track: TrackDef, stage: StageId): { label: string; met: boolean }[] {
+  const env = scopeEnv({ reg, ctx: w.ctx, bindings: ownerBindings(track) });
+  return (own(track.stages, stage)?.objectives ?? []).map((o) => ({ label: objectiveLabel(o), met: truthy(evalExpr(objectiveWhen(o), env, false)) }));
+}
+
+/** What a track's predicates read (`next`, `fail`, a target's `gate`): its owner as `self` and `owner`, and `track.*` (its id, stage, minutes there, attempts and objectives met). */
+export function trackEnv(reg: Registry, w: Pick<Working, "state" | "ctx">, track: TrackDef, trackId: TrackId): ExprEnv {
+  const stage = own(w.state.tracks, trackId)?.stage ?? track.start;
+  const objectives = objectivesOf(reg, w, track, stage);
+  const done = objectives.filter((o) => o.met).length;
+  const slice = readEngineSlice(w.state);
+  return scopeEnv({
+    reg,
+    ctx: w.ctx,
+    bindings: ownerBindings(track),
+    vars: {
+      track: {
+        id: trackId,
+        stage,
+        since: w.state.clock - (own(w.state.tracks, trackId)?.since ?? 0),
+        attempts: own(slice.attempts, trackId) ?? 0,
+        objectives: objectives.length,
+        done,
+        complete: done === objectives.length,
+      },
+    },
+  });
+}
+
+/**
+ * Moves a track into a stage: the rewards of the stage it leaves (unless it fails), the stage event,
+ * its effects, its own rewards when it is an end stage, a reveal and the quest signal. The entry is
+ * one unit (`Working.unite`), and its stage event records the stage it left (`from`), which must
+ * still be where the track stands wherever the record is replayed (a rebased view, a carried or held
+ * GM edit): one the story has already made there is dropped whole, its rewards with it, never
+ * entered and paid for twice.
+ */
+function enter(reg: Registry, w: Working, trackId: TrackId, track: TrackDef, from: StageId, to: StageId, via: TrackChange["via"], seed: string): TrackChange | null {
+  const start = w.events.length;
+  const leaving = own(track.stages, from);
+  const key = hashParts(seed, "track", trackId, from, to, w.state.clock);
+  const rng = createRng(key);
+  const bindings = ownerBindings(track);
+  if (via !== "fail" && leaving?.rewards && leaving.rewards.length > 0) applyEffects(reg, w, leaving.rewards, { bindings, rng: rng.fork("rewards") });
+  if (w.apply({ type: "stage", track: trackId, to, from })) return null;
+  const entering = own(track.stages, to);
+  if (entering?.effects && entering.effects.length > 0) applyEffects(reg, w, entering.effects, { bindings, rng: rng.fork("effects") });
+  // An end stage is never left, so what it rewards comes with reaching it: the quest is done (or lost) here.
+  if (entering?.rewards && entering.rewards.length > 0 && isTerminal(track, to)) applyEffects(reg, w, entering.rewards, { bindings, rng: rng.fork("end rewards") });
+  if (entering?.truth) w.apply({ type: ENGINE_EVENTS.revealed, data: { track: trackId, stage: to } });
+  if (track.kind === "quest") {
+    // A cue that is its owner's behaviour is Stance's to tell (`ownersCue`): the signal names the stage instead.
+    const cue = entering?.cue && !ownersCue(reg, w.world, w.state, w.world.pov, trackId) ? entering.cue : null;
+    const text = cue ?? `${track.label}: ${entering?.label ?? to}`;
+    w.apply({ type: ENGINE_EVENTS.signal, data: { class: "quest", text, visibility: track.visibility } });
+  }
+  w.unite(start, `stage:${key.slice(0, 10)}`);
+  return { track: trackId, from, to, via, events: w.events.slice(start) };
+}
+
+function gateOpen(reg: Registry, w: Pick<Working, "state" | "ctx">, track: TrackDef, trackId: TrackId, to: StageId): boolean {
+  const gate = own(track.stages, to)?.gate;
+  if (gate === undefined) return true;
+  return truthy(evalExpr(gate, trackEnv(reg, w, track, trackId), false));
+}
+
+/** A way on from where a track stands that holds on the record: the stage it leads to, and how (its own failing first). */
+export interface WayOn {
+  from: StageId;
+  to: StageId;
+  via: "next" | "fail" | "answer";
+}
+
+/**
+ * The way on that holds from the stage a track stands on, as arithmetic over the record (DESIGN §10): its `fail.when` first, else for a
+ * puzzle answered its first way, else the first `next` whose `when` and whose target's `gate` hold; null where none does. It moves
+ * nothing: in a chat an agent moves a world's quest (plan §8.3), told of it by this, and the engine's own steps (`stepTracks`) take it.
+ */
+export function wayOn(reg: Registry, w: Pick<Working, "state" | "ctx">, trackId: TrackId): WayOn | null {
+  const track = own(w.ctx.world.tracks, trackId);
+  if (!track) return null;
+  const stage = own(w.state.tracks, trackId)?.stage ?? track.start;
+  const def: StageDef | undefined = own(track.stages, stage);
+  if (!def) return null;
+  const env = trackEnv(reg, w, track, trackId);
+  if (def.fail && truthy(evalExpr(def.fail.when, env, false))) return { from: stage, to: def.fail.to, via: "fail" };
+  const solvedHere = track.kind === "puzzle" && def.answer !== undefined && own(readEngineSlice(w.state).solved, trackId) === stage;
+  if (solvedHere && def.next[0] && gateOpen(reg, w, track, trackId, def.next[0].to)) return { from: stage, to: def.next[0].to, via: "answer" };
+  const next = def.next.find((n) => truthy(evalExpr(n.when, env, false)) && gateOpen(reg, w, track, trackId, n.to));
+  return next === undefined ? null : { from: stage, to: next.to, via: "next" };
+}
+
+/**
+ * A world's quest whose way on holds, as a line's fields: the quest by its label and id, the stage it stands on and the stage the way
+ * leads to by their labels, whether it fails by its own condition, and the `quest` operation of `world_apply` that moves it there (its
+ * reason, `why`, the agent's own). What every road an agent is told of it fills its line with.
+ */
+export function wayOnFields(track: TrackDef, trackId: TrackId, way: WayOn): Record<string, string | boolean> {
+  const label = (stage: StageId): string => own(track.stages, stage)?.label ?? stage;
+  const fails = way.via === "fail";
+  return { quest: `${track.label} [${trackId}]`, from: label(way.from), to: label(way.to), fails, call: JSON.stringify({ op: "quest", quest: trackId, stage: way.to, outcome: fails ? "failed" : "met" }) };
+}
+
+/** Each world track whose way on holds on `after` and did not (or led elsewhere) on `before`: what a call made hold, with its way. */
+export function waysOpened(reg: Registry, before: Pick<Working, "state" | "ctx">, after: Pick<Working, "state" | "ctx">): { track: TrackId; def: TrackDef; way: WayOn }[] {
+  return Object.entries(after.ctx.world.tracks).flatMap(([id, def]) => {
+    const way = wayOn(reg, after, id);
+    if (way === null) return [];
+    const was = wayOn(reg, before, id);
+    return was !== null && was.from === way.from && was.to === way.to ? [] : [{ track: id, def, way }];
+  });
+}
+
+/** How the record stands for the world's tracks on `w`, as the quest views read it (`questViews`'s `TrackStanding`): each stage's objectives met, and the way on that holds. */
+export function trackStanding(reg: Registry, w: Pick<Working, "state" | "ctx">): { objectives(track: TrackDef, stage: StageId): { label: string; met: boolean }[]; way(track: TrackId): { from: StageId; to: StageId; fails: boolean } | null } {
+  return {
+    objectives: (track, stage) => objectivesOf(reg, w, track, stage),
+    way: (track) => {
+      const way = wayOn(reg, w, track);
+      return way === null ? null : { from: way.from, to: way.to, fails: way.via === "fail" };
+    },
+  };
+}
+
+/** Advances every track whose predicates hold, in id order, until stable (bounded per track). */
+export function stepTracks(reg: Registry, w: Working, seed: string): TrackChange[] {
+  const changes: TrackChange[] = [];
+  for (const trackId of Object.keys(w.world.tracks).sort()) {
+    const track = own(w.world.tracks, trackId);
+    if (!track) continue;
+    for (let i = 0; i < TRANSITION_CAP; i++) {
+      const way = wayOn(reg, w, trackId);
+      const change = way === null ? null : enter(reg, w, trackId, track, way.from, way.to, way.via, seed);
+      if (!change) break;
+      changes.push(change);
+    }
+  }
+  return changes;
+}
+
+/** Every stage a track can come to from `stage` by its ways on (`next` and `fail`); `stage` itself only when a way leads back to it. */
+function stagesAfter(track: TrackDef, stage: StageId): Set<StageId> {
+  const reached = new Set<StageId>();
+  const queue: StageId[] = [stage];
+  for (let s = queue.shift(); s !== undefined; s = queue.shift()) {
+    const def = own(track.stages, s);
+    for (const to of [...(def?.next ?? []).map((n) => n.to), ...(def?.fail ? [def.fail.to] : [])]) {
+      if (reached.has(to)) continue;
+      reached.add(to);
+      queue.push(to);
+    }
+  }
+  return reached;
+}
+
+/**
+ * The GM's Stage (DESIGN §10): moves a track to `to`, recorded as the GM's edit. A stage the track
+ * can still come to from where it stands is entered as the story would enter it: the stage it leaves
+ * grants its rewards (unless `to` is how that stage fails), and the stage entered applies its
+ * effects, its rewards when it is an end stage, its reveal and a quest's signal; stages it skips play
+ * no part. A stage that doesn't follow from where it stands (one already passed, a way back) is only
+ * set, so nothing is granted, spawned or revealed twice. The stage's own ways on wait for the next
+ * step of the tracks, so the chat stands where the GM put it. The same stage again changes nothing.
+ * Either way the stage event records where the track stood (`from`), as every entry's does. Carried
+ * onto a reading of its reply in which the story moved the track itself (a Re-run, a Re-read, a reply
+ * it was held through), the edit is resolved again from where the story left it (`resolveFix`): a
+ * track already at `to` changes nothing, so nothing is entered or paid for a second time, and one
+ * anywhere else moves on to `to` from there.
+ */
+export function moveTrack(reg: Registry, w: Working, trackId: TrackId, to: StageId, seed: string): Rejection | null {
+  const track = own(w.world.tracks, trackId);
+  if (!track) return { code: "missing_track", reason: say("why_no_track_track", { track: trackId }) };
+  if (!own(track.stages, to)) return { code: "missing_stage", reason: say("why_track_has_no_stage_to", { track: track.label, to: to }) };
+  const from = own(w.state.tracks, trackId)?.stage ?? track.start;
+  if (from === to) return null;
+  if (!stagesAfter(track, from).has(to)) return w.apply({ type: "stage", track: trackId, to, from });
+  const leaving = own(track.stages, from);
+  const fails = leaving !== undefined && leaving.fail?.to === to && !leaving.next.some((n) => n.to === to);
+  return enter(reg, w, trackId, track, from, to, fails ? "fail" : "gm", seed) ? null : { code: "bad_stage", reason: say("why_track_cant_move_to_to", { track: track.label, to: to }) };
+}
+
+/** Answer normalization: case, accents, punctuation, spacing and a leading article don't matter. */
+export function normalizeAnswer(text: string): string {
+  return text
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^(the|a|an) /, "");
+}
+
+export interface AnswerCheck {
+  correct: boolean;
+  via: "exact" | "normalized" | "decision" | null;
+  /** True when the stage authored a decision threshold, nothing matched and no decision was given. */
+  needsDecision: boolean;
+  /** The attempt to record, or null (not a puzzle stage with an answer, or a decision is needed first). */
+  event: LedgerEvent | null;
+}
+
+/**
+ * Checks a puzzle answer against the current stage (pure). `decision` is the `puzzle.answer`
+ * step's probability that the answer is correct; it counts only where the author enabled it,
+ * against the authored threshold. A correct attempt marks the stage solved; the track advances to
+ * the stage's first `next` target on its next step (gate permitting).
+ */
+export function checkAnswer(world: WorldDoc, state: Readonly<WorldState>, trackId: TrackId, answer: string, decision?: number): AnswerCheck {
+  const none: AnswerCheck = { correct: false, via: null, needsDecision: false, event: null };
+  const track = own(world.tracks, trackId);
+  if (!track || track.kind !== "puzzle") return none;
+  const stage = own(state.tracks, trackId)?.stage ?? track.start;
+  const def = own(track.stages, stage);
+  if (!def?.answer) return none;
+  let via: AnswerCheck["via"] = null;
+  if (def.answer.expect.includes(answer)) via = "exact";
+  else if (def.answer.normalize && def.answer.expect.some((x) => normalizeAnswer(x) === normalizeAnswer(answer))) via = "normalized";
+  else if (def.answer.decision && decision !== undefined && decision >= def.answer.decision.threshold) via = "decision";
+  if (via === null && def.answer.decision !== undefined && decision === undefined) return { ...none, needsDecision: true };
+  return { correct: via !== null, via, needsDecision: false, event: { type: ENGINE_EVENTS.attempt, data: { track: trackId, stage, correct: via !== null, ...(via ? { via } : {}) } } };
+}
+
+export interface AnswerResult extends AnswerCheck {
+  change: TrackChange | null;
+}
+
+/** Records an answer and steps the tracks: a correct answer advances the puzzle. */
+export function answerPuzzle(reg: Registry, w: Working, trackId: TrackId, answer: string, seed: string, decision?: number): AnswerResult {
+  const check = checkAnswer(w.world, w.state, trackId, answer, decision);
+  if (!check.event || w.apply(check.event)) return { ...check, change: null };
+  const change = check.correct ? (stepTracks(reg, w, seed).find((c) => c.track === trackId && c.via === "answer") ?? null) : null;
+  return { ...check, change };
+}
+
+export interface AgendaItem {
+  track: TrackId;
+  label: string;
+  stage: StageId;
+  stageLabel: string;
+  priority: number;
+}
+
+/** Agenda tracks an agent owns, with their current stage's planner priority. */
+export function agendaFor(world: WorldDoc, state: Readonly<WorldState>, agent: EntityId): AgendaItem[] {
+  const out: AgendaItem[] = [];
+  for (const id of Object.keys(world.tracks).sort()) {
+    const t = own(world.tracks, id);
+    if (!t || t.kind !== "agenda" || t.owner !== agent) continue;
+    const stage = own(state.tracks, id)?.stage ?? t.start;
+    const def = own(t.stages, stage);
+    if (!def) continue;
+    out.push({ track: id, label: t.label, stage, stageLabel: def.label, priority: def.priority ?? 0 });
+  }
+  return out.sort((a, b) => b.priority - a.priority || a.track.localeCompare(b.track));
+}
+
+/** A terminal stage has no way out. */
+export function isTerminal(track: TrackDef, stage: StageId): boolean {
+  const def = own(track.stages, stage);
+  return !def || (def.next.length === 0 && !def.fail);
+}

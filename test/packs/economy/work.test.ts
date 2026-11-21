@@ -1,0 +1,263 @@
+import { describe, expect, test } from "bun:test";
+import { hashJson } from "../../../src/shared/hash";
+import type { Level } from "../../../src/shared/ids";
+import type { WorldDoc } from "../../../src/shared/world";
+import { materializeAll } from "../../../src/engine/materialize";
+import { migrateMoney } from "../../../src/engine/money-migrate";
+import { rowOf } from "../../../src/engine/pack-kit";
+import { placeOfEntity } from "../../../src/engine/scope";
+import { Working } from "../../../src/engine/working";
+import { STARTER_WORLDS } from "../../../src/packs/index";
+import { bracketTax, federalTables, filingStatusOf, salesTaxOn, salesTaxPct } from "../../../src/packs/economy/core/taxes";
+import { fold, startState, trialBalance } from "../support";
+import { act, CLERK, entity, ext, lapse, line, packEvents, paid, paychecks, payslips, posts, reg, setup } from "./work-world";
+
+describe("work: jobs and payroll", () => {
+  test("a summer job pays only in its season", () => {
+    const { w } = setup((world) => {
+      world.entities.job_summer = entity("job_summer", "job", "Lifeguard", { worker: "rosa", employer: "Lake Erie marina", title: "Lifeguard", basis: "hourly", rate: 1600, hours: "contract", hours_per_week: 30, season_from: "06-01", season_to: "08-31", pay_every: "weekly", pay_weekday: 5, start: "2026-06-01" });
+      world.entities.job_fall = entity("job_fall", "job", "Leaf crew", { worker: "rosa", employer: "Riverton parks", title: "Leaf crew", basis: "hourly", rate: 1600, hours: "contract", hours_per_week: 30, season_from: "10-01", season_to: "11-30", pay_every: "weekly", pay_weekday: 5, start: "2026-10-01" });
+    });
+    lapse(w, 21 * 1440);
+    expect(paid(w, "job_summer")).toEqual([]);
+    const fall = paid(w, "job_fall");
+    expect(fall.length).toBeGreaterThanOrEqual(3);
+    // A full week in season is 30 hours at $16.
+    expect(fall.some((d) => d.gross === 30 * 1600)).toBe(true);
+    const checks = paychecks(w, "rosa_checking");
+    expect(checks.length).toBe(fall.length);
+    expect(checks.every((p) => line(p, ext("employer:riverton_parks")) < 0)).toBe(true);
+    expect(trialBalance(w.state)).toBe(0);
+  });
+
+  test("a gig worker is paid each evening they work, with nothing withheld", () => {
+    const { w } = setup((world) => {
+      world.entities.job_gig = entity("job_gig", "job", "Courier", { worker: "maya", employer: "Dashway", title: "Courier", occupation: "food_delivery_courier", basis: "per_shift", rate: 9000, hours: "contract", shifts_per_week: 7, weeks_per_year: 52, pay_every: "per_job", contractor: true, start: "2026-01-01" });
+    });
+    const before = w.state.accounts.maya_checking ?? 0;
+    lapse(w, 3 * 1440);
+    const gigs = paychecks(w, "maya_checking");
+    expect(gigs.length).toBe(3);
+    for (const p of gigs) expect(p.lines).toEqual([{ account: ext("employer:dashway"), amount: -9000 }, { account: "maya_checking", amount: 9000 }]);
+    expect((w.state.accounts.maya_checking ?? 0) - before).toBeGreaterThanOrEqual(3 * 9000 - 20_000);
+    expect(paid(w, "job_gig").every((d) => d.taxes === 0 && d.contract === true)).toBe(true);
+  });
+
+  test("routing splits send a share of each paycheck to savings and the rest to checking", () => {
+    const { w } = setup((world) => {
+      world.entities.job_clerk = entity("job_clerk", "job", "Office clerk", { ...CLERK, splits: [{ to: "savings", pct: 10 }] });
+    });
+    lapse(w, 15 * 1440);
+    const [p] = paychecks(w, "checking");
+    if (!p) throw new Error("no paycheck");
+    const [slip] = paid(w, "job_clerk");
+    const net = slip?.net as number;
+    expect(line(p, "savings")).toBe(Math.round(net / 10));
+    expect(line(p, "checking")).toBe(net - Math.round(net / 10));
+    expect(line(p, "bl_operating")).toBeLessThan(-(slip?.gross as number) + 1);
+    expect(p.lines.reduce((a, l) => a + l.amount, 0)).toBe(0);
+  });
+
+  test("brackets withhold at the top level; below it the occupation's flat rate does", () => {
+    const top = setup((world) => void (world.entities.job_clerk = entity("job_clerk", "job", "Office clerk", CLERK)));
+    lapse(top.w, 15 * 1440);
+    const ctx = reg.context(top.w.world, top.w.state);
+    const t = federalTables(ctx);
+    const filing = filingStatusOf(ctx, "you");
+    const [slip] = paid(top.w, "job_clerk");
+    const gross = slip?.gross as number;
+    const federal = Math.round(bracketTax(t.brackets[filing], Math.max(0, gross * 26 - t.standardDeduction[filing])) / 26);
+    const fica = Math.round((gross * t.socialSecurityPct) / 100) + Math.round((gross * t.medicarePct) / 100);
+    const [p] = paychecks(top.w, "checking");
+    // The employer adds its own half of FICA beside the worker's.
+    expect(line(p!, ext("tax:federal"))).toBe(federal + 2 * fica);
+    expect(line(p!, "bl_operating")).toBe(-(gross + fica));
+
+    const flat = setup((world) => {
+      world.entities.job_clerk = entity("job_clerk", "job", "Office clerk", CLERK);
+      world.realism.levels.money = 3;
+      world.packs.economy = { ...world.packs.economy, config: { ...(world.packs.economy?.config ?? {}), features: { withholding: true } } };
+    });
+    lapse(flat.w, 15 * 1440);
+    const [flatSlip] = paid(flat.w, "job_clerk");
+    const [q] = paychecks(flat.w, "checking");
+    expect(line(q!, ext("tax:federal"))).toBe(Math.round(((flatSlip?.gross as number) * 14) / 100));
+    expect(line(q!, "bl_operating")).toBe(-(flatSlip?.gross as number));
+    expect(federal).not.toBe(Math.round((gross * 14) / 100));
+  });
+
+  test("hiring adds a payroll on the business's cycle; ending the job pays a last check and stops it", () => {
+    const { w } = setup((world) => void (world.entities.job_clerk = entity("job_clerk", "job", "Office clerk", CLERK)));
+    expect(act(w, "economy.hire", { business: "brightline", worker: "rosa", title: "Courier driver", basis: "hourly", rate: 2200, hours: "contract", hours_per_week: 40, by: "jordan" }).rejected).toEqual([]);
+    const [jobId, job] = Object.entries(w.state.entities).find(([, e]) => e.kind === "job" && e.fields.worker === "rosa") ?? [];
+    if (!jobId || !job) throw new Error("no job");
+    // Rosa joins the clerk's biweekly Friday cycle.
+    expect(job.fields).toMatchObject({ employer: "brightline", pay_every: "biweekly", pay_anchor: "2026-10-23" });
+    lapse(w, 8 * 1440);
+    const first = paid(w, jobId);
+    expect(first.length).toBe(1);
+    // From her first day (Fri 16 Oct) to the payday a week later: 40 hours a week, thinned to her occupation's weeks a year.
+    const minutes = first[0]?.minutes as number;
+    expect(minutes).toBeGreaterThan(40 * 60 * 0.9);
+    expect(minutes).toBeLessThanOrEqual(40 * 60);
+    expect(first[0]?.gross).toBe(Math.round((2200 * minutes) / 60));
+    expect(paychecks(w, "rosa_checking").every((p) => line(p, "bl_operating") < 0)).toBe(true);
+    expect(act(w, "economy.job_end", { job: jobId, by: "jordan" }).rejected).toEqual([]);
+    lapse(w, 30 * 1440);
+    const all = paid(w, jobId);
+    expect(all.length).toBe(2);
+    const last = all[1]!;
+    // The last check covers through the job's last day, and nothing comes after.
+    expect((last.minutes as number) > 0).toBe(true);
+    expect(payslips(w, jobId).length).toBe(2);
+    expect(paid(w, "job_clerk").length).toBeGreaterThanOrEqual(3);
+    // A stranger can't hire for Brightline.
+    expect(act(w, "economy.hire", { business: "brightline", worker: "maya", by: "you" }, "h2").rejected.length).toBe(1);
+  });
+
+  test("a 30-day timelapse pays the clerk twice or more, keeps the books balanced, and re-folds the same", () => {
+    const { world, w } = setup((wd) => void (wd.entities.job_clerk = entity("job_clerk", "job", "Office clerk", CLERK)));
+    const s0 = startState(world);
+    lapse(w, 30 * 1440);
+    expect(paychecks(w, "checking").length).toBeGreaterThanOrEqual(2);
+    expect(trialBalance(w.state)).toBe(0);
+    expect(hashJson(fold(reg, w.world, s0, w.events).accounts)).toBe(hashJson(w.state.accounts));
+  });
+
+  test("hourly pay on a named weekday: four Thursday paychecks of $940 gross land in savings, net of withholding", () => {
+    const { w } = setup((world) => {
+      world.entities.job_shop = entity("job_shop", "job", "Stock clerk", { worker: "you", employer: "Riverton Hardware", title: "Stock clerk", basis: "hourly", rate: 2350, hours: "contract", hours_per_week: 40, weeks_per_year: 52, pay_every: "weekly", pay_weekday: 4, splits: [{ to: "savings", pct: 100 }], start: "2025-01-01" });
+    });
+    const before = w.state.accounts.savings ?? 0;
+    lapse(w, 28 * 1440);
+    const pay = paychecks(w, "savings");
+    expect(pay).toHaveLength(4);
+    for (const p of pay) expect(line(p, ext("employer:riverton_hardware"))).toBe(-94_000);
+    const net = paid(w, "job_shop").map((d) => d.net as number);
+    expect(net.every((n) => n > 60_000 && n < 94_000)).toBe(true);
+    // The Money panel names the paycheck with its gross and what was withheld.
+    const ctx = reg.context(w.world, w.state);
+    expect(ctx.query("economy.finance")(ctx, "you", true).recent.find((r) => r.memo.startsWith("Payroll"))?.memo).toMatch(/gross, .* withheld/);
+    expect((w.state.accounts.savings ?? 0) - before).toBeGreaterThanOrEqual(net.reduce((a, n) => a + n, 0));
+    expect(trialBalance(w.state)).toBe(0);
+  });
+});
+
+describe("work: businesses", () => {
+  test("Port Alder's sales tax is Michigan's rate, and a purchase there pays it to Michigan", () => {
+    const make = STARTER_WORLDS.modern_slice_of_life;
+    if (!make) throw new Error("no Port Alder starter");
+    const world = make("pa", "Port Alder");
+    const w = new Working(reg, world, startState(world));
+    materializeAll(reg, w, world.pov, "run");
+    const ctx = reg.context(w.world, w.state);
+    const michigan = Number(rowOf(ctx, "economy.regions", "mi")?.sales_tax_combined_avg_pct);
+    expect(michigan).toBe(6);
+    expect(salesTaxPct(ctx, placeOfEntity(w.state, world.pov))).toBe(michigan);
+    expect(act(w, "economy.buy", { payer: world.pov, item: "latte_16oz" }).rejected).toEqual([]);
+    const [bought] = posts(w, /^Bought/);
+    const tax = line(bought!, ext("tax:sales:mi"));
+    const price = bought!.lines.filter((l) => l.amount > 0 && l.account !== ext("tax:sales:mi")).reduce((a, l) => a + l.amount, 0);
+    expect(tax).toBe(salesTaxOn(price, 6));
+    expect(tax).toBeGreaterThan(0);
+  });
+
+  test("an older Port Alder world saved without the economy's region migrates to Michigan's and charges 6%; one whose economy names a region keeps it", () => {
+    // Port Alder as worlds made before templates named the economy's region kept it: an account in
+    // the old shape, and the region only on its people (or, for the second, the economy naming one).
+    const older = (region?: string): WorldDoc => {
+      const make = STARTER_WORLDS.modern_slice_of_life;
+      if (!make) throw new Error("no Port Alder starter");
+      const world = make("pa", "Port Alder");
+      const config = world.packs.economy!.config;
+      delete config.region;
+      if (region) config.region = region;
+      const checking = world.entities.acct_pov_checking!.fields;
+      delete checking.owners;
+      delete checking.product;
+      Object.assign(checking, { owner: world.pov, type: "checking" });
+      return world;
+    };
+    const buy = (doc: WorldDoc) => {
+      const w = new Working(reg, doc, startState(doc));
+      materializeAll(reg, w, doc.pov, "run");
+      expect(act(w, "economy.buy", { payer: doc.pov, item: "latte_16oz" }).rejected).toEqual([]);
+      const [bought] = posts(w, /^Bought/);
+      const tax = bought!.lines.find((l) => l.account.startsWith(ext("tax:sales:")));
+      const price = bought!.lines.filter((l) => l.amount > 0 && l !== tax).reduce((a, l) => a + l.amount, 0);
+      return { region: doc.packs.economy?.config.region, account: tax?.account, tax: tax?.amount ?? 0, price, pct: salesTaxPct(w.ctx, placeOfEntity(w.state, doc.pov)) };
+    };
+    const base = older();
+    expect(base.packs.economy?.config.region).toBeUndefined();
+    expect(base.entities[base.pov]?.fields.region).toBe("mi");
+    const mi = buy(migrateMoney(base));
+    expect(mi).toMatchObject({ region: "mi", account: ext("tax:sales:mi"), pct: 6 });
+    expect(mi.tax).toBe(salesTaxOn(mi.price, 6));
+    const oh = buy(migrateMoney(older("oh")));
+    expect(oh).toMatchObject({ region: "oh", account: ext("tax:sales:oh") });
+    expect(oh.pct).not.toBe(6);
+    expect(oh.tax).toBe(salesTaxOn(oh.price, oh.pct));
+  });
+
+  test("sales tax applies only at the top level: at Money 3 a purchase costs its listed price, and the business neither collects nor remits", () => {
+    const run = (level: Level) => {
+      const { w } = setup((world) => {
+        world.entities.you!.fields.place = "cafe";
+        world.realism.levels.money = level;
+      });
+      expect(act(w, "economy.buy", { payer: "you", item: "latte_16oz", method: "debit" }).rejected).toEqual([]);
+      const sale = packEvents(w, "economy.sale")[0]?.data ?? {};
+      const bought = posts(w, /^Bought/)[0];
+      lapse(w, 5 * 1440); // past the 20th, when collected tax is remitted
+      return { sale, lines: bought?.lines ?? [], remitted: posts(w, /^Sales tax/).length };
+    };
+    const top = run(4);
+    const cents = top.sale.cents as number;
+    const tax = top.sale.tax as number;
+    expect(tax).toBeGreaterThan(0);
+    expect(top.lines).toEqual([{ account: "checking", amount: -(cents + tax) }, { account: "db_operating", amount: cents + tax }]);
+    expect(top.remitted).toBe(1);
+    const below = run(3);
+    expect(below.sale).toMatchObject({ tax: 0 });
+    const listed = below.sale.cents as number;
+    expect(below.lines).toEqual([{ account: "checking", amount: -listed }, { account: "db_operating", amount: listed }]);
+    expect(below.remitted).toBe(0);
+  });
+
+  test("a purchase at a business's place pays the business, with sales tax it remits on the 20th", () => {
+    const { w } = setup((world) => void (world.entities.you!.fields.place = "cafe"));
+    const ctx = reg.context(w.world, w.state);
+    const before = w.state.accounts.db_operating ?? 0;
+    expect(act(w, "economy.buy", { payer: "you", item: "latte_16oz", method: "debit" }).rejected).toEqual([]);
+    const [sale] = packEvents(w, "economy.sale");
+    const cents = sale?.data.cents as number;
+    const tax = salesTaxOn(cents, salesTaxPct(ctx, "cafe"));
+    expect(tax).toBeGreaterThan(0);
+    expect(sale?.data).toMatchObject({ business: "daybreak", tax, payer: "you" });
+    expect((w.state.accounts.db_operating ?? 0) - before).toBe(cents + tax);
+    const after = reg.context(w.world, w.state);
+    const books = after.query("economy.business_books")(after, "daybreak", w.state.clock - 1440, w.state.clock + 1);
+    // The café's books: the price as revenue; the tax it holds and what it owes its suppliers (a 60% margin) as payables.
+    expect(books).toMatchObject({ revenue: cents, payables: tax + Math.round((cents * 40) / 100) });
+    lapse(w, 5 * 1440); // past the 20th
+    const [remit] = posts(w, /^Sales tax/);
+    expect(remit?.lines).toEqual([{ account: "db_operating", amount: -tax }, { account: ext("tax:sales:us"), amount: tax }]);
+    expect(trialBalance(w.state)).toBe(0);
+  });
+
+  test("an invoice is paid by its flow on the due date, or goes late and takes its fee", () => {
+    const { w } = setup();
+    expect(act(w, "economy.invoice_issue", { business: "brightline", customer: "rosa", cents: 60_000, memo: "Freight", days: 3, by: "jordan" }).rejected).toEqual([]);
+    expect(act(w, "economy.invoice_issue", { business: "brightline", customer: "maya", cents: 5_000_000, memo: "Pallets", days: 3, by: "jordan" }, "i2").rejected).toEqual([]);
+    const invoices = Object.values(w.state.entities).filter((e) => e.kind === "invoice");
+    expect(invoices.length).toBe(2);
+    const before = w.state.accounts.bl_operating ?? 0;
+    lapse(w, 6 * 1440);
+    const freight = Object.values(w.state.entities).find((e) => e.kind === "invoice" && e.fields.memo === "Freight");
+    const pallets = Object.values(w.state.entities).find((e) => e.kind === "invoice" && e.fields.memo === "Pallets");
+    expect(freight?.fields).toMatchObject({ state: "paid", paid: 60_000 });
+    expect((w.state.accounts.bl_operating ?? 0) - before).toBeGreaterThanOrEqual(60_000);
+    expect(pallets?.fields).toMatchObject({ state: "late", fees: 1, late_fee: Math.round((5_000_000 * 1.5) / 100) });
+    expect(trialBalance(w.state)).toBe(0);
+  });
+});

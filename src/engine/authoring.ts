@@ -1,0 +1,538 @@
+// Authoring tools shared by the backend, the background lane and the command line's local engine (DESIGN §13):
+// world-document checks and migration, lint, Playtest turns, Check world days and the Sheet
+// Designer's preview. Pure and deterministic: no packages, no host, no clock.
+
+import type { EntityId, WorldId } from "../shared/ids";
+import { hasOwn, isRecord, safeKey } from "../shared/json";
+import type { LedgerEvent } from "../shared/ledger";
+import { macroHazards } from "../shared/macros";
+import type { LintIssue } from "../shared/lint";
+import type { SheetSectionView } from "../shared/state-view";
+import { currentSignals, hasRetiredSignal, knownSignal, PURPOSE_PLACEHOLDERS, STEP_OUTPUTS, STEP_PLACEHOLDERS } from "../shared/steps";
+import { MIND_PURPOSES } from "../shared/minds";
+import { defaultTiers, leadTierOf, tierOf } from "../shared/tiers";
+import type { ActionDef, WorldCurrency, WorldDoc } from "../shared/world";
+import type { DataTable } from "../shared/tables";
+import { builtInSectionsOf, DEFAULT_SECTIONS, sectionTemplateProblem } from "../shared/sections";
+import { compileMaps } from "../shared/maps";
+import { DEFAULT_CURRENCY, ENGINE_VERSION, isHardLock, readSectionFeed, requirementExpr, SECTION_FEED_KEYS, WORLD_FORMAT } from "../shared/world";
+import { timeZoneExists } from "../shared/clock-zones";
+import { knownZone } from "./calendar";
+import { applyEvent, validateEvent } from "./events";
+import { identifiers } from "./expr";
+import type { Registry } from "./registry-impl";
+import { buildEntitySheet } from "./ruleset";
+import type { InterpretOutput, TurnPipeline, TurnPlan, TurnPlanInput } from "./steps";
+import { timedProcesses } from "./simulate";
+import type { TimelapseOutcome } from "./time";
+import type { WorldState } from "./state";
+import { findLeaks, readsStory, unrevealedSecrets } from "./visibility";
+import { lintLore } from "./lore-lint";
+import { lintStructure } from "./world-lint";
+import { initialState } from "./world-state";
+import { authorLines, playerLines } from "./player-events";
+import { typedIntent } from "./typed-intent";
+import { migrateMoney } from "./money-migrate";
+import { MINDS_SLOT } from "../shared/minds";
+import { sourceOf } from "./feed";
+import { say } from "../shared/lines";
+
+// ---------------------------------------------------------------- documents
+
+/** A minimal valid world: one POV person in one place, the default tiers, Story realism, the Modern US calendar. */
+export function blankWorld(id: WorldId, name: string): WorldDoc {
+  return {
+    format: WORLD_FORMAT,
+    id,
+    name,
+    engineVersion: ENGINE_VERSION,
+    packs: {},
+    pins: { generators: {}, tables: {} },
+    kinds: { person: { id: "person", label: "Person", fields: {} } },
+    relations: {},
+    entities: { you: { id: "you", kind: "person", name: "You", tier: "principal", fields: {}, relations: [] } },
+    places: { home: { id: "home", name: "Home", fields: {} } },
+    routes: {},
+    grids: {},
+    maps: {},
+    rules: {},
+    actions: {},
+    checks: {},
+    calendar: {
+      system: "gregorian",
+      epoch: "2026-01-01T00:00",
+      timeZone: "America/New_York",
+      dayParts: [
+        { id: "night", label: "Night", start: "00:00" },
+        { id: "morning", label: "Morning", start: "06:00" },
+        { id: "afternoon", label: "Afternoon", start: "12:00" },
+        { id: "evening", label: "Evening", start: "18:00" },
+      ],
+      holidays: [],
+    },
+    schedules: {},
+    tracks: {},
+    tables: {},
+    realism: {
+      preset: "story",
+      levels: { money: 1, gear: 1, vehicles: 1, castlife: 1, relationships: 1, space: 2, calendar: 2, weather: 1, sheets: 1 },
+      tierCaps: { principal: {}, supporting: {}, background: {} },
+    },
+    time: {
+      sceneTicks: { conversation: 2, action: 1, exploration: 10, downtime: 30 },
+      interrupts: { invitation: "stop", bill: "note", decline: "stop", incident: "stop", quest: "stop", rule: "note", arrival: "stop", overdue: "note", needs: "ignore", weather: "ignore" },
+      speedThrough: { sleep: { mode: "offer", thresholdMinutes: 30 } },
+      montage: "key",
+      unitCap: { agentDays: 600, events: 5000 },
+    },
+    sections: {},
+    steps: {},
+    suppressed: [],
+    lore: {},
+    loreIndex: { terms: {}, topics: {} },
+    seedMode: "fresh",
+    lenientPricing: false,
+    currency: { ...DEFAULT_CURRENCY },
+    pov: "you",
+    tiers: defaultTiers(),
+    classifications: {},
+    start: { place: "home", at: "2026-01-01T08:00" },
+  };
+}
+
+/**
+ * A world made from nothing, as Build and the command line make one: the minimal world with every pack's
+ * default table copied in and pinned at its revision, as the starter templates carry them, so it
+ * prices, pays and dresses as a world made from a template does.
+ */
+export function newBlankWorld(id: WorldId, name: string, registry: Pick<Registry, "tables">): WorldDoc {
+  const world = blankWorld(id, name);
+  const tables: Record<string, DataTable> = {};
+  for (const [tid, def] of registry.tables) if (def.defaults) tables[tid] = structuredClone(def.defaults);
+  return { ...world, tables, pins: { ...world.pins, tables: Object.fromEntries(Object.entries(tables).map(([tid, t]) => [tid, t.revision])) } };
+}
+
+/** A document that has the shape of `lre-world-v1` (enough to load and lint it). */
+export function isWorldDoc(v: unknown): v is WorldDoc {
+  return isRecord(v) && v.format === WORLD_FORMAT && typeof v.id === "string" && isRecord(v.entities) && isRecord(v.places) && typeof v.pov === "string";
+}
+
+/** Collections every document has, each an object keyed by id. */
+const COLLECTIONS = ["packs", "kinds", "relations", "entities", "places", "routes", "grids", "rules", "actions", "checks", "schedules", "tracks", "tables", "sections", "steps"] as const;
+/**
+ * Collections checked only when present: those documents written before them lack, which
+ * `migrateWorld` adds (empty, or the default tiers), and routines, which a world may simply not have.
+ */
+const LATER_COLLECTIONS = ["maps", "lore", "classifications", "tiers", "routines"] as const;
+/** Parts every document has. */
+const PARTS = ["pins", "calendar", "realism", "time", "start"] as const;
+/**
+ * Parts a document may leave out: `migrateWorld` fills the currency (Modern US) and the lore lookup
+ * table (empty), and a world without a ruleset, map settings, minds config, lore pins, routine
+ * settings, section wording or narrator default plays by the defaults.
+ */
+const OPTIONAL_PARTS = ["currency", "loreIndex", "ruleset", "mapSettings", "minds", "lorePins", "routineSettings", "sectionTemplates", "narrator"] as const;
+
+/**
+ * Shape checks for an untrusted document, before `migrateWorld` and `lintWorld` read it: every
+ * collection an object of objects, every part an object, the scalar parts of the right kind. The
+ * published schema (`schemas/lre-world-v1.schema.json`) checks everything inside them.
+ */
+export function shapeIssues(doc: unknown): LintIssue[] {
+  const issues: LintIssue[] = [];
+  const err = (path: string, message: string): void => {
+    issues.push({ severity: "error", path, code: "shape", message });
+  };
+  if (!isRecord(doc)) return [{ severity: "error", path: "", code: "shape", message: say("lint_not_a_json_object") }];
+  const collection = (key: string): void => {
+    const value = doc[key];
+    if (!isRecord(value)) return err(key, say("lint_key_must_be_an_object", { key: key }));
+    for (const [id, item] of Object.entries(value)) if (!isRecord(item)) err(`${key}.${id}`, say("lint_each_of_key_must_be_an_object", { key: key }));
+  };
+  if (doc.format !== WORLD_FORMAT) err("format", say("lint_format_must_be_world_format", { worldFormat: WORLD_FORMAT }));
+  if (typeof doc.id !== "string" || doc.id === "") err("id", say("lint_the_world_needs_an_id"));
+  if (typeof doc.name !== "string") err("name", say("lint_the_world_needs_a_name"));
+  if (doc.engineVersion !== undefined && typeof doc.engineVersion !== "string") err("engineVersion", say("lint_engineversion_must_be_text"));
+  if (typeof doc.pov !== "string") err("pov", say("lint_the_world_needs_a_pov_entity_id"));
+  for (const key of COLLECTIONS) collection(key);
+  for (const key of LATER_COLLECTIONS) if (doc[key] !== undefined) collection(key);
+  for (const key of PARTS) if (!isRecord(doc[key])) err(key, say("lint_key_must_be_an_object", { key: key }));
+  for (const key of OPTIONAL_PARTS) if (doc[key] !== undefined && !isRecord(doc[key])) err(key, say("lint_key_must_be_an_object", { key: key }));
+  if (!Array.isArray(doc.suppressed)) err("suppressed", say("lint_suppressed_must_be_a_list"));
+  if (doc.seedMode !== "fresh" && doc.seedMode !== "same_roll") err("seedMode", say("lint_seedmode_must_be_fresh_or_same_roll"));
+  if (typeof doc.lenientPricing !== "boolean") err("lenientPricing", say("lint_lenientpricing_must_be_true_or_false"));
+  if (doc.spawnTier !== undefined && typeof doc.spawnTier !== "string") err("spawnTier", say("lint_spawntier_must_be_a_tier_id"));
+  if (doc.spawnCap !== undefined && typeof doc.spawnCap !== "number") err("spawnCap", say("lint_spawncap_must_be_a_number"));
+  for (const key of ["placeCap", "placesPerTurn"] as const) if (doc[key] !== undefined && typeof doc[key] !== "number") err(key, say("lint_key_must_be_a_number", { key: key }));
+  // The world's own life states, when it has any: an object of objects, as a collection is.
+  if (doc.lifeStates !== undefined) collection("lifeStates");
+  return issues;
+}
+
+function isCurrency(v: unknown): v is WorldCurrency {
+  return isRecord(v) && typeof v.code === "string" && typeof v.symbol === "string" && typeof v.minorUnit === "string" && typeof v.decimals === "number" && typeof v.format === "string";
+}
+
+/**
+ * The money display as a write sends it, its five fields checked; null where one is missing or of the wrong kind. Every other key it holds
+ * (a starter's id, label, base unit, denominations and note) goes with them as sent, since the document keeps them though nothing reads them.
+ */
+export function currencyOf(v: unknown): WorldCurrency | null {
+  if (!isCurrency(v)) return null;
+  const held = Object.fromEntries(Object.entries(v).filter(([key]) => safeKey(key)));
+  return { ...held, code: v.code, symbol: v.symbol, minorUnit: v.minorUnit, decimals: v.decimals, format: v.format };
+}
+
+/** Step purposes earlier builds had: `select` (lore selection) and `contradiction` (the check of a reply against the engine's facts, retired when the story and the user's directives came to win, DESIGN D36). */
+const RETIRED_PURPOSES: readonly string[] = ["select", "contradiction"];
+
+/**
+ * Brings an older `lre-world-v1` document up to this engine: documents written before `currency`,
+ * `lore`, `loreIndex`, `classifications`, `maps` or `tiers` existed (and templates without them) get
+ * Modern US money, no lore, an empty lookup table (a malformed one keeps its well-formed half), no
+ * classifications, no maps and the three default tiers, whose ids are the band ids their entities
+ * already name; a POV still on the legacy `pov` tier moves to the lead tier (the POV is `pov`, never
+ * capped whatever its tier); step templates for a retired purpose (`RETIRED_PURPOSES`) are dropped,
+ * and so is a retired purpose a secret lore entry's audience or the step lore pins name, which
+ * nothing reads or edits any more; a template's retired signal reads as the one that stands for it
+ * (`classifier` as `typed_input`); and the economy pack's old `unpricedCapCents` becomes
+ * `unpricedCap` (the same minor units; a set `unpricedCap` wins). A world
+ * without a `ruleset` keeps none: every part of one is optional, and nothing reads a missing one;
+ * one without a `spawnCap` keeps none too and plays at the default 24. Lore entries need nothing
+ * else: their new fields are optional, and one without a source was authored. Last, the maps
+ * compile into the places, grids and routes they own (`compileMaps`). Revisions are immutable, so
+ * this runs whenever one is read. Returns the same object when nothing changes.
+ */
+export function migrateWorld(stored: WorldDoc): WorldDoc {
+  const doc = migrateMoney(stored);
+  const currency: unknown = doc.currency;
+  const lore: unknown = doc.lore;
+  const loreIndex: unknown = doc.loreIndex;
+  const indexed = isRecord(loreIndex) && isRecord(loreIndex.terms) && isRecord(loreIndex.topics);
+  const classifications: unknown = doc.classifications;
+  const maps: unknown = doc.maps;
+  const steps: unknown = doc.steps;
+  const hasTiers = isRecord(doc.tiers);
+  const tiers = hasTiers ? doc.tiers : defaultTiers();
+  const retiredPurpose = (purpose: unknown): boolean => typeof purpose === "string" && RETIRED_PURPOSES.includes(purpose);
+  const retired = isRecord(steps) ? Object.entries(steps).flatMap(([id, t]) => (isRecord(t) && retiredPurpose(t.purpose) ? [id] : [])) : [];
+  const resignaled = isRecord(steps) ? Object.entries(steps).flatMap(([id, t]) => (isRecord(t) && !retiredPurpose(t.purpose) && Array.isArray(t.signals) && hasRetiredSignal(t.signals.filter((s): s is string => typeof s === "string")) ? [id] : [])) : [];
+  const readers = isRecord(lore) ? Object.entries(lore).flatMap(([id, l]) => (isRecord(l) && Array.isArray(l.audience) && l.audience.some(retiredPurpose) ? [id] : [])) : [];
+  const lorePins: unknown = doc.lorePins;
+  const pinned = isRecord(lorePins) && isRecord(lorePins.steps) && Object.keys(lorePins.steps).some(retiredPurpose);
+  const pov = hasOwn(doc.entities, doc.pov) ? doc.entities[doc.pov] : undefined;
+  const legacyPov = pov?.tier === "pov" && !tierOf({ tiers }, "pov");
+  const economy: unknown = isRecord(doc.packs) ? doc.packs.economy : undefined;
+  const config = isRecord(economy) && isRecord(economy.config) ? economy.config : null;
+  const oldCap = config !== null && "unpricedCapCents" in config;
+  if (isCurrency(currency) && isRecord(lore) && indexed && isRecord(classifications) && isRecord(maps) && hasTiers && retired.length === 0 && resignaled.length === 0 && readers.length === 0 && !pinned && !legacyPov && !oldCap) return compileMaps(doc);
+  const out: WorldDoc = { ...doc, currency: isCurrency(currency) ? currency : { ...DEFAULT_CURRENCY }, lore: isRecord(lore) ? doc.lore : {}, classifications: isRecord(classifications) ? doc.classifications : {}, maps: isRecord(maps) ? doc.maps : {}, tiers };
+  if (!indexed) out.loreIndex = { terms: isRecord(loreIndex) && isRecord(loreIndex.terms) ? doc.loreIndex.terms : {}, topics: isRecord(loreIndex) && isRecord(loreIndex.topics) ? doc.loreIndex.topics : {} };
+  if (retired.length > 0 || resignaled.length > 0) {
+    out.steps = { ...doc.steps };
+    for (const id of retired) delete out.steps[id];
+    for (const id of resignaled) {
+      const t = out.steps[id];
+      if (t) out.steps[id] = { ...t, signals: currentSignals(t.signals) };
+    }
+  }
+  if (readers.length > 0) {
+    out.lore = { ...out.lore };
+    for (const id of readers) {
+      const l = out.lore[id];
+      if (l) out.lore[id] = { ...l, audience: (l.audience ?? []).filter((p) => !retiredPurpose(p)) };
+    }
+  }
+  if (pinned && doc.lorePins) out.lorePins = { ...doc.lorePins, steps: Object.fromEntries(Object.entries(doc.lorePins.steps).filter(([p]) => !retiredPurpose(p))) };
+  if (pov && legacyPov) out.entities = { ...doc.entities, [doc.pov]: { ...pov, tier: leadTierOf(out) } };
+  const pack = out.packs.economy;
+  if (oldCap && config !== null && pack) {
+    const { unpricedCapCents: cents, ...rest } = config;
+    out.packs = { ...out.packs, economy: { ...pack, config: { ...rest, ...(typeof cents === "number" && rest.unpricedCap === undefined ? { unpricedCap: cents } : {}) } } };
+  }
+  return compileMaps(out);
+}
+
+/** Sections the turn itself fills, besides the packs' renderers: the Outcome, the Montage, the Outline, Scene's elapsed time and the minds. */
+const TURN_FED_SECTIONS: Record<string, true> = { outcome: true, montage: true, outline: true, scene: true, [MINDS_SLOT]: true };
+
+/** What an action about a door or a container says it does, in its label, description or ways of saying it. */
+const LOCK_WORDS = /\b(?:open|unlock\w*|unbolt|unseal|lock(?:ed|s)?|doors?|gates?|hatch|trapdoor|safe|vault|chest|strongbox|lockbox|locker|cabinet|trunk|drawer|case|box)\b/i;
+
+/** A requirement that the actor carry something, with what it names: a key's shape when that is a thing's id, not a param. */
+const CARRIES = /\bcarries\(\s*(?:self|actor|pov)\s*,\s*'?([A-Za-z_][A-Za-z0-9_]*)'?\s*\)/;
+
+/**
+ * A requirement that reads like a lock but isn't marked hard (DESIGN §11): on an action about a door
+ * or a container, one that the actor carries one named thing, or that the story has come somewhere
+ * (`stage`, `flag`, `since`) reading one of the action's params. A typed attempt that misses a plain
+ * requirement plays as plain roleplay, so such a lock opens to anyone who types it. A suggestion
+ * only: the author knows what is locked, and a `not …` guard (a step not taken yet) is no lock. A
+ * story step that reads none of the params hides its action until the story gets there
+ * (`storyLocked`), so it is never suggested: a hard lock would list the action, locked, and tell the
+ * player the step exists.
+ */
+function softLocks(id: string, action: ActionDef): LintIssue[] {
+  if (!LOCK_WORDS.test([action.label, action.description ?? "", ...(action.lexicon ?? [])].join(" "))) return [];
+  return action.requires.flatMap((req, i): LintIssue[] => {
+    const expr = requirementExpr(req);
+    const key = CARRIES.exec(expr)?.[1];
+    const keyed = key !== undefined && !hasOwn(action.params, key);
+    const story = readsStory(expr);
+    const hides = story && identifiers(expr).every((name) => !hasOwn(action.params, name));
+    if (isHardLock(req) || /^\s*not\b/.test(expr) || hides || !(story || keyed)) return [];
+    return [{ severity: "info", path: `actions.${id}.requires.${i}`, code: "soft_lock", message: say("lint_action_reads_like_a_lock_but_this", { action: action.label }) }];
+  });
+}
+
+/** Structural checks every world must pass, plus the registry's lint rules. */
+export function lintWorld(world: WorldDoc, registry: Registry): LintIssue[] {
+  const issues: LintIssue[] = [];
+  const err = (path: string, code: string, message: string): void => {
+    issues.push({ severity: "error", path, code, message });
+  };
+  if (world.format !== WORLD_FORMAT) err("format", "format", say("lint_format_must_be_world_format", { worldFormat: WORLD_FORMAT }));
+  if (!world.entities[world.pov]) err("pov", "missing_pov", say("lint_the_pov_entity_pov_does_not_exist", { pov: world.pov }));
+  if (!world.places[world.start.place]) err("start.place", "missing_place", say("lint_the_start_place_place_does_not_exist", { place: world.start.place }));
+  const c = world.currency;
+  if (!Number.isInteger(c.decimals) || c.decimals < 0 || c.decimals > 6) err("currency.decimals", "currency", say("lint_decimals_must_be_a_whole_number_from"));
+  if (c.format.trim() === "") err("currency.format", "currency", say("lint_the_currency_needs_a_display_format"));
+  // A name that is no time zone is one the clock cannot tell the time in, wherever the calendar or a place gives it.
+  if (typeof world.calendar.timeZone === "string" && !timeZoneExists(world.calendar.timeZone)) err("calendar.timeZone", "time_zone", say("lint_the_time_zone_zone_is_not_a_time_zone", { zone: world.calendar.timeZone }));
+  for (const [id, e] of Object.entries(world.entities)) {
+    if (e.id !== id) err(`entities.${id}.id`, "id_mismatch", say("lint_the_id_must_match_its_key"));
+    if (!world.kinds[e.kind] && !registry.kinds.has(e.kind)) err(`entities.${id}.kind`, "unknown_kind", say("lint_unknown_kind_kind", { kind: e.kind }));
+  }
+  for (const [id, p] of Object.entries(world.places)) {
+    if (p.parent && !world.places[p.parent]) err(`places.${id}.parent`, "missing_place", say("lint_unknown_parent_place_parent", { parent: p.parent }));
+    if (typeof p.timeZone === "string" && p.timeZone !== "" && !timeZoneExists(p.timeZone)) err(`places.${id}.timeZone`, "time_zone", say("lint_the_time_zone_zone_is_not_a_time_zone", { zone: p.timeZone }));
+  }
+  for (const [id, r] of Object.entries(world.routes)) {
+    if (!world.places[r.from]) err(`routes.${id}.from`, "missing_place", say("lint_unknown_place_from", { from: r.from }));
+    if (!world.places[r.to]) err(`routes.${id}.to`, "missing_place", say("lint_unknown_place_from", { from: r.to }));
+  }
+  const warn = (path: string, code: string, message: string): void => {
+    issues.push({ severity: "warning", path, code, message });
+  };
+  // A real zone the clock holds no rules for is told as the world's own time (`placeOffset`), which nothing else shows: said here. A custom calendar has no zones.
+  if (world.calendar.system === "gregorian") {
+    const unheld = (path: string, zone: unknown): void => {
+      if (typeof zone === "string" && zone !== "" && timeZoneExists(zone) && !knownZone(zone)) warn(path, "time_zone_unheld", say("lint_the_clock_holds_no_rules_for_the_time_zone", { zone }));
+    };
+    unheld("calendar.timeZone", world.calendar.timeZone);
+    for (const [id, p] of Object.entries(world.places)) unheld(`places.${id}.timeZone`, p.timeZone);
+  }
+  for (const [id, a] of Object.entries(world.actions)) {
+    if (!a.check && Object.keys(a.outcomes).some((o) => o !== "default")) warn(`actions.${id}.check`, "no_check", say("lint_label_has_outcomes_other_than_default_but", { label: a.label }));
+    issues.push(...softLocks(id, a));
+  }
+  issues.push(...lintLore(world));
+  // Section templates wrap engine values: the only macro they may hold is the engine's `{{lines}}`;
+  // no escape sentinel or `<user>`-style shorthand either.
+  for (const [id, s] of Object.entries(world.sections)) {
+    if (macroHazards(s.template, ["{{lines}}"]).length > 0) err(`sections.${id}.template`, "section_macro", say("lint_label_may_use_only_lines_any_other", { label: s.label, lines: "{{lines}}" }));
+  }
+  // The world's wording of a built-in section: a text holding `{{lines}}` and no other macro, for a
+  // built-in section the world has without listing it (one it lists uses its own template).
+  const builtIn = new Set(builtInSectionsOf(world).map((s) => s.id));
+  for (const [id, text] of Object.entries(world.sectionTemplates ?? {})) {
+    const path = `sectionTemplates.${id}`;
+    const label = DEFAULT_SECTIONS[id]?.label ?? id;
+    if (typeof text !== "string") {
+      err(path, "section_template", say("lint_the_wording_of_label_must_be_text", { label: label }));
+      continue;
+    }
+    const problem = hasOwn(DEFAULT_SECTIONS, id) ? sectionTemplateProblem(text) : `there is no built-in section "${id}"`;
+    if (problem !== null) err(path, "section_template", `"${label}": ${problem}`);
+    if (macroHazards(text, ["{{lines}}"]).length > 0) err(path, "section_macro", say("lint_label_may_use_only_lines_any_other", { label, lines: "{{lines}}" }));
+    if (hasOwn(DEFAULT_SECTIONS, id) && !builtIn.has(id)) warn(path, "section_template_unused", say("lint_label_is_the_worlds_own_section_so", { label: label }));
+  }
+  // A section only the engine's renderers (its own slot's, or its `include`'s) or the turn itself
+  // fill: one neither feeds is skipped every turn, without a word (DESIGN §6, §6.11).
+  const sources = new Set(registry.renderers.map((r) => sourceOf(r)));
+  for (const [id, s] of Object.entries(world.sections)) {
+    const feed = readSectionFeed(Object.fromEntries(SECTION_FEED_KEYS.flatMap((k) => (s[k] !== undefined ? [[k, s[k]]] : []))));
+    if (!feed) {
+      err(`sections.${id}`, "section_feed", say("lint_s_enabled_is_on_or_off_maxtokens", { s: s.label }));
+      continue;
+    }
+    for (const source of feed.include ?? []) if (!sources.has(source)) warn(`sections.${id}.include`, "section_source", say("lint_s_includes_source_which_no_pack_renders", { s: s.label, source: source }));
+    const fed = feed.include ? feed.include.some((source) => sources.has(source)) : registry.renderers.some((r) => r.slot === id);
+    if (!hasOwn(TURN_FED_SECTIONS, id) && !fed) warn(`sections.${id}`, "section_unfed", say("lint_s_has_nothing_to_fill_it_no", { s: s.label, id: id, if_include: !!(feed.include) }));
+  }
+  // World step templates (DESIGN §5.2): an output their purpose uses, known signals, engine placeholders
+  // (with those only some steps are given), and some text. A blank minds template is the minds lint's.
+  for (const [id, t] of Object.entries(world.steps)) {
+    if (t.id !== id) err(`steps.${id}.id`, "id_mismatch", say("lint_the_id_must_match_its_key"));
+    if (!(STEP_OUTPUTS[t.purpose] ?? []).includes(t.output)) warn(`steps.${id}.output`, "step_output", say("lint_a_purpose_template_cant_produce_output_it", { purpose: t.purpose, output: t.output }));
+    for (const s of t.signals) if (!knownSignal(s)) warn(`steps.${id}.signals`, "unknown_signal", say("lint_unknown_signal_s", { s: s }));
+    if (t.template.trim() === "" && !(MIND_PURPOSES as readonly string[]).includes(t.purpose)) warn(`steps.${id}.template`, "step_blank", say("lint_this_purpose_template_is_blank_it_takes", { purpose: t.purpose }));
+    const known: readonly string[] = [...STEP_PLACEHOLDERS, ...(PURPOSE_PLACEHOLDERS[t.purpose] ?? [])];
+    for (const m of t.template.matchAll(/\{\{\s*([a-zA-Z_]+)\s*\}\}/g)) if (!known.includes((m[1] ?? "").toLowerCase())) warn(`steps.${id}.template`, "unknown_placeholder", say("lint_open_name_close_isnt_an_engine_placeholder", { open: "{{", name: m[1] ?? "", close: "}}", purpose: t.purpose }));
+  }
+  issues.push(...lintStructure(world, registry));
+  for (const rule of registry.lints) issues.push(...rule.check(world, registry));
+  return issues;
+}
+
+/** Every host macro hazard a world carries in lore content and templates, by path (an import lists them for review). */
+export function macrosIn(world: WorldDoc): { path: string; macro: string }[] {
+  const out: { path: string; macro: string }[] = [];
+  const scan = (path: string, text: string): void => {
+    for (const macro of macroHazards(text, ["{{lines}}"])) out.push({ path, macro });
+  };
+  for (const [id, l] of Object.entries(world.lore)) scan(`lore.${id}.content`, l.content);
+  for (const [id, s] of Object.entries(world.sections)) scan(`sections.${id}.template`, s.template);
+  for (const [id, text] of Object.entries(world.sectionTemplates ?? {})) if (typeof text === "string") scan(`sectionTemplates.${id}`, text);
+  for (const [id, t] of Object.entries(world.steps)) scan(`steps.${id}.template`, t.template);
+  return out;
+}
+
+// ---------------------------------------------------------------- Playtest and Check world
+
+export interface PlaytestTurn {
+  user: string;
+  reply: string;
+  notes: string[];
+  /**
+   * A Check world day's time per simulated process, by its id, in ms (`AdvanceResult.processMs`):
+   * wall clock, so it is shown beside the day and never in its notes, reply or events, which read
+   * the same on every run. Absent for a Playtest turn, and for a day that ran no timelapse.
+   */
+  processMs?: Record<string, number>;
+}
+
+export interface PlaytestStep {
+  turn: PlaytestTurn;
+  state: WorldState;
+  /** The events that applied, in order: the plan's, then the post pass's (a dropped one left out). */
+  events: LedgerEvent[];
+}
+
+/** What a Check world day found, as its notes word each: the events it dropped, what failed (the day's simulation, a section), and the leaks. */
+export interface DayFindings {
+  dropped: string[];
+  failed: string[];
+  leaks: string[];
+}
+
+/** Applies events in order, keeping each that validates: those that applied, and the dropped ones' reasons. */
+function applyAll(registry: Registry, world: WorldDoc, state: WorldState, events: readonly LedgerEvent[]): { applied: LedgerEvent[]; dropped: string[] } {
+  const applied: LedgerEvent[] = [];
+  const dropped: string[] = [];
+  for (const e of events) {
+    const ctx = registry.context(world, state);
+    const rejection = validateEvent(registry, e, ctx);
+    if (rejection) {
+      dropped.push(`dropped ${e.type}: ${rejection.reason}`);
+      continue;
+    }
+    applyEvent(registry, e, state, ctx);
+    applied.push(e);
+  }
+  return { applied, dropped };
+}
+
+/** A Check world day's plan: the engine's (`planTurn`) holds its timelapse, whose result says how long each process took; another pipeline's may not. */
+export type CheckPlan = TurnPlan & { timelapse?: TimelapseOutcome | null };
+
+/** A pipeline Check world runs on, whose plans may hold their timelapse (`CheckPlan`). */
+export interface CheckPipeline extends TurnPipeline {
+  plan(input: TurnPlanInput): CheckPlan;
+}
+
+/** How long each process of a plan's timelapse took (`AdvanceResult.processMs`); nothing for a plan that ran none, or a pipeline that doesn't say. */
+function processMsOf(plan: CheckPlan): Record<string, number> | undefined {
+  const ms = plan.timelapse?.result.processMs;
+  return ms && Object.keys(ms).length > 0 ? { ...ms } : undefined;
+}
+
+export function playtestStart(registry: Registry, world: WorldDoc, revision: string): WorldState {
+  return initialState(world, revision, registry);
+}
+
+/**
+ * One Playtest turn on `state`: engine-only (no model calls, narrator or extraction). The typed text
+ * becomes an action by its lexicon and the names it says (`typedIntent`), and the reply is what the
+ * player would see of the turn.
+ */
+export function playtestTurn(registry: Registry, pipeline: TurnPipeline, world: WorldDoc, state: WorldState, user: string, runSeed: string, index: number): PlaytestStep {
+  const next = structuredClone(state);
+  const intent = typedIntent(registry, world, next, user);
+  const plan = pipeline.plan({ registry, world, state: next, runSeed, seed: `${runSeed}:playtest:${index}`, kind: "normal", userTexts: [user], intent });
+  const planned = applyAll(registry, world, next, plan.events);
+  const post = pipeline.post({ registry, world, state: next, runSeed, seed: `${runSeed}:playtest:${index}:post`, appliedMinutes: plan.elapsedMinutes, extracted: [] });
+  const posted = applyAll(registry, world, next, post);
+  const lines = playerLines(registry, world, next, world.pov, [...plan.events, ...post], 40);
+  const action = intent?.action ? [`read as ${registry.actions.get(intent.action)?.label ?? world.actions[intent.action]?.label ?? intent.action}`] : ["not an action"];
+  return { turn: { user, reply: lines.length > 0 ? lines.join("\n") : "(nothing changed)", notes: [`+${plan.elapsedMinutes} min`, ...action, ...planned.dropped, ...posted.dropped] }, state: next, events: [...planned.applied, ...posted.applied] };
+}
+
+/** Check world's timelapse length per step: one day. */
+export const CHECK_DAY_MINUTES = 24 * 60;
+
+/**
+ * One Check world day: a one-day timelapse with every interrupt class at `note`, so processes,
+ * agents, tracks and rules all run. Reports dropped events, failures and narrator-facing leaks; the
+ * transcript is the author's view of the day: every event, unmet people's and secrets included,
+ * worded with names like Playtest's (no ids or bookkeeping), and with `clock` (the host's wall
+ * clock: the engine reads none of its own) each process's time beside it (`PlaytestTurn.processMs`).
+ * `intent` is the day's timelapse; a sandbox's advance gives each day its own target. `leaks: false`
+ * leaves the sections unread (a sandbox's advance reads them at each month's end), so no leak or
+ * section failure is reported.
+ */
+export function checkWorldDay(registry: Registry, pipeline: CheckPipeline, world: WorldDoc, state: WorldState, runSeed: string, day: number, intent: InterpretOutput, options: { leaks?: boolean; clock?: () => number } = {}): PlaytestStep & { findings: DayFindings } {
+  const next = structuredClone(state);
+  const label = `Day ${day + 1}`;
+  const notes: string[] = [];
+  const findings: DayFindings = { dropped: [], failed: [], leaks: [] };
+  let events: LedgerEvent[] = [];
+  let applied: LedgerEvent[] = [];
+  let processMs: Record<string, number> | undefined;
+  const note = (kind: keyof DayFindings, text: string): void => {
+    findings[kind].push(text);
+    notes.push(text);
+  };
+  try {
+    const plan = timedProcesses(options.clock, () => pipeline.plan({ registry, world, state: next, runSeed, seed: `${runSeed}:check:${day}`, kind: "normal", userTexts: [`(Timelapse: ${label})`], intent }));
+    processMs = processMsOf(plan);
+    const planned = applyAll(registry, world, next, plan.events);
+    for (const text of planned.dropped) note("dropped", text);
+    const post = pipeline.post({ registry, world, state: next, runSeed, seed: `${runSeed}:check:${day}:post`, appliedMinutes: plan.elapsedMinutes, extracted: [] });
+    const posted = applyAll(registry, world, next, post);
+    for (const text of posted.dropped) note("dropped", text);
+    events = [...plan.events, ...post];
+    applied = [...planned.applied, ...posted.applied];
+    notes.unshift(`+${plan.elapsedMinutes} min, ${events.length} events`);
+  } catch (error) {
+    note("failed", `failed: ${error instanceof Error ? error.message : String(error)}`);
+    return { turn: { user: label, reply: "(the simulation failed)", notes }, state, events: [], findings };
+  }
+  if (options.leaks !== false) {
+    const secrets = unrevealedSecrets(registry, world, next);
+    const ctx = registry.context(world, next);
+    for (const r of registry.renderers) {
+      try {
+        for (const line of r.render(ctx)) for (const leak of findLeaks(line, secrets)) note("leaks", `leak in ${r.slot}: "${leak}"`);
+      } catch (error) {
+        note("failed", `section ${r.slot} failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+  const lines = authorLines(registry, world, next, events, 40);
+  return { turn: { user: label, reply: lines.length > 0 ? lines.join("\n") : "(nothing happened)", notes, ...(processMs ? { processMs } : {}) }, state: next, events: applied, findings };
+}
+
+/**
+ * The Sheet Designer's preview (DESIGN §11, §13): a world's designed sheet as an entity (the POV by
+ * default) has it when a chat starts, so derived fields, pools and progressions read their
+ * authored values. Null when the world designs no sheet; nothing is recorded.
+ */
+export function previewSheet(registry: Registry, world: WorldDoc, entity: EntityId = world.pov): SheetSectionView[] | null {
+  return buildEntitySheet(registry.context(world, initialState(world, "preview", registry)), entity);
+}
+
+/** Stamps the engine version the document was last written by. */
+export function stamped(world: WorldDoc): WorldDoc {
+  return { ...world, engineVersion: ENGINE_VERSION };
+}

@@ -1,0 +1,52 @@
+# Imports of fenced files by files that stay, and imports of LumiAH, that wait for the package that
+# ends them (PlanSwap-4: the fence, and the fix of its landing review). Read by fence.ts; checked by
+# fence.test.ts. A fenced file is one fates.tsv removes, or one it moves in part (today's protocol and
+# settings registry): of those, only the names their pieces do not allow are listed.
+#
+# Each line names the importer, what it imports (a path, or a LumiAH module), the names it takes today
+# (* for the whole module), the package that ends the line, and why. "no package yet" marks a line no
+# planner's package ends yet; the fix's report lists each for the planner.
+#
+# The list only shrinks, by its lines and their names, never by a count: a line, or a name of a line,
+# that the committed list does not hold fails. A package that moves code takes out, in the commit that
+# removes an import, that import's line or its names, and adds none; a line whose import is gone fails
+# until it goes.
+#
+# importer	what it imports	names	package	why
+dev/preview/fixtures.ts	src/shared/protocol.ts	AssistantProposalOp, AssistantView, ExtractionModeView, TraceRow, WorkspaceFileView	PlanSwap-7	the preview's harness entry (planner's ruling)
+dev/preview/main.ts	src/shared/protocol.ts	FrontendToBackend	PlanSwap-7	the preview's harness entry (planner's ruling)
+dev/preview/mock-backend.ts	src/shared/protocol.ts	AGENT_API, AssistantProposal, AssistantProposalOp, AssistantRun, AssistantView, DeltaOp, FrontendToBackend, JobUpdate, PresetCard, ResultBodies, TraceRow, WorkspaceFileView	PlanSwap-7	the preview's harness entry (planner's ruling)
+dev/preview/ui/mock-build.ts	src/shared/protocol.ts	DraftChanged, ErrorMessage, FrontendToBackend, ResultMessage	PlanSwap-9	the old preview (planner's ruling)
+dev/preview/ui/mock-play.ts	src/shared/protocol.ts	FrontendToBackend	PlanSwap-9	the old preview (planner's ruling)
+scripts/perf/performance.ts	src/shared/protocol.ts	FrontendToBackend, PROTOCOL_VERSION	PlanSwap-7	performance.ts's other imports (planner's ruling)
+src/cli/connection.ts	src/shared/protocol.ts	AGENT_API, ENGINE_EXTENSION, ErrorCode, FrontendToBackend, PROTOCOL_VERSION, ResultBodies	PlanOps-16	the command line's old road (PlanSwap-13 item 4)
+src/cli/coverage.ts	src/shared/protocol.ts	FrontendToBackend	PlanOps-16	the command line's old road (PlanSwap-13 item 4)
+src/cli/live.ts	src/shared/protocol.ts	ResultBodies	PlanOps-16	the command line's old road (PlanSwap-13 item 4)
+src/cli/serve.ts	src/shared/protocol.ts	ENGINE_EXTENSION, ResultBodies	PlanOps-16	the command line's old road (PlanSwap-13 item 4)
+src/cli/tools-build.ts	src/shared/protocol.ts	ResultBodies	PlanOps-16	the command line's old road (PlanSwap-13 item 4)
+src/cli/tools-config.ts	src/shared/protocol.ts	ResultBodies	PlanOps-16	the command line's old road (PlanSwap-13 item 4)
+src/cli/tools-play.ts	src/shared/protocol.ts	EDIT_OPS_MAX, ResultBodies	PlanOps-16	the command line's old road (PlanSwap-13 item 4)
+src/cli/version.ts	src/shared/protocol.ts	AGENT_API	PlanOps-16	the command line's old road (PlanSwap-13 item 4)
+src/frontend/app.ts	src/shared/protocol.ts	ResultBodies	PlanSwap-13	PlanSwap-13 rewrites every kept import of the two files: nothing kept imports either once it lands (its item 4 and Done when)
+src/frontend/build/held.tsx	src/shared/protocol.ts	ErrorMessage, PROTOCOL_VERSION	PlanSwap-13	PlanSwap-13 rewrites every kept import of the two files: nothing kept imports either once it lands (its item 4 and Done when)
+src/frontend/build/things.tsx	src/shared/protocol.ts	ResultBodies	PlanSwap-13	PlanSwap-13 rewrites every kept import of the two files: nothing kept imports either once it lands (its item 4 and Done when)
+src/frontend/gm/editor.ts	src/shared/protocol.ts	ResultBodies	PlanSwap-13	PlanSwap-13 rewrites every kept import of the two files: nothing kept imports either once it lands (its item 4 and Done when)
+src/frontend/gm/things.tsx	src/shared/protocol.ts	ResultBodies	PlanSwap-13	PlanSwap-13 rewrites every kept import of the two files: nothing kept imports either once it lands (its item 4 and Done when)
+src/frontend/registry.ts	src/shared/protocol.ts	ErrorMessage, FrontendToBackend, ResultMessage	PlanSwap-13	PlanSwap-13 rewrites every kept import of the two files: nothing kept imports either once it lands (its item 4 and Done when)
+src/frontend/review-card.tsx	src/shared/protocol.ts	ResultBodies	PlanSwap-13	PlanSwap-13 rewrites every kept import of the two files: nothing kept imports either once it lands (its item 4 and Done when)
+src/packs/gear/ui/belongings.tsx	src/shared/protocol.ts	FIX_THINGS_MAX	PlanChatUI-P2	FIX_THINGS_MAX's reader (PlanSwap-10 item 2)
+src/play/service.ts	src/shared/protocol.ts	ErrorCode	PlanChatUI-P5	the panels' old road (PlanSwap-13 item 4)
+src/shared/host.ts	src/shared/protocol.ts	BackendToFrontend	PlanSwap-13	the world store's ResultBodies, the host port's send (PlanSwap-13 items 2 and 4)
+src/ui/kept/app.ts	src/shared/protocol.ts	ErrorMessage	PlanSwap-9	the kept UI's old link client (PlanSwap-9 item 1)
+test/backend/step-template-checks.test.ts	src/shared/protocol.ts	EDIT_OPS_MAX	PlanSwap-17	PlanSwap-17 rewrites every kept import of the two files: nothing kept imports either once it lands (its item 4 and Done when)
+test/cli/entry.test.ts	src/shared/protocol.ts	AGENT_API	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/cli/fake-lumiverse.ts	src/shared/protocol.ts	AGENT_API, WorldChatInfo	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/frontend/draft-reload.test.ts	src/shared/protocol.ts	FrontendToBackend, PROTOCOL_VERSION	PlanSwap-9	a test of the old frontend (planner's ruling)
+test/play/actions.test.ts	src/shared/protocol.ts	FIX_THINGS_MAX	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/play/bed.ts	src/shared/protocol.ts	ErrorMessage, ResultBodies, ResultMessage	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/support/fake-host.ts	src/shared/protocol.ts	BackendToFrontend	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/support/money-chat.ts	src/shared/protocol.ts	BackendToFrontend	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/support/pages.ts	src/shared/protocol.ts	BackendToFrontend, FrontendToBackend	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/support/rig.ts	src/shared/protocol.ts	BackendToFrontend, FrontendToBackend, PROTOCOL_VERSION	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/ui/kept/play/bed.ts	src/shared/protocol.ts	FrontendToBackend	PlanSwap-7	the kept tests outside test/backend (planner's ruling)
+test/ui/kept/play/recorded.ts	src/shared/protocol.ts	ErrorMessage	PlanSwap-7	the kept tests outside test/backend (planner's ruling)

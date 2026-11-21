@@ -1,0 +1,118 @@
+import { describe, expect, test } from "bun:test";
+import { fieldEditorFor } from "../../src/frontend/build/schema-form";
+import type { UiPackDef } from "../../src/frontend/registry";
+import { buildCatalog } from "../../src/frontend/ui-registry";
+import type { WorldDoc } from "../../src/shared/world";
+
+const Empty = () => null;
+
+describe("UI registry", () => {
+  test("panels come out in order, ties broken by id; editors, chips and sheets are looked up by key", () => {
+    const packs: UiPackDef[] = [
+      {
+        id: "economy",
+        register(r) {
+          r.panel({ id: "economy.money", label: "Money", order: 30, home: "me", component: Empty });
+          r.editor({ collection: "tables", label: "Tables", component: Empty });
+          r.chip("price", Empty);
+          r.sheet("account", Empty);
+        },
+      },
+      {
+        id: "core",
+        register(r) {
+          r.panel({ id: "core.scene", label: "Scene", order: 10, home: "now", component: Empty });
+          r.panel({ id: "core.journal", label: "Journal", order: 30, home: "story", component: Empty });
+        },
+      },
+    ];
+    const catalog = buildCatalog(packs);
+    expect(catalog.panels.map((p) => p.id)).toEqual(["core.scene", "core.journal", "economy.money"]);
+    expect(catalog.panels.map((p) => p.home)).toEqual(["now", "story", "me"]);
+    expect(catalog.editors.get("tables")?.label).toBe("Tables");
+    expect(catalog.chips.has("price")).toBe(true);
+    expect(catalog.sheets.has("account")).toBe(true);
+    expect(catalog.sheets.has("person")).toBe(false);
+    expect(catalog.packs).toEqual(["economy", "core"]);
+  });
+
+  test("glances come out in order, ties broken by id, whichever pack registered them", () => {
+    const glance = (id: string, order: number) => ({ id, order, panel: "x.p", component: Empty });
+    const catalog = buildCatalog([
+      {
+        id: "a",
+        register(r) {
+          r.glance(glance("story.step", 20));
+          r.glance(glance("calendar.next", 10));
+        },
+      },
+      {
+        id: "b",
+        register(r) {
+          r.glance(glance("economy.due", 20));
+          r.glance(glance("vehicles.due", 5));
+        },
+      },
+    ]);
+    expect(catalog.glances.map((g) => g.id)).toEqual(["vehicles.due", "calendar.next", "economy.due", "story.step"]);
+  });
+
+  test("a second registration of the same panel, editor, chip kind, sheet kind, glance, organization tab or pack throws", () => {
+    const panel = (id: string): UiPackDef => ({ id, register: (r) => r.panel({ id: "x.p", label: "P", order: 1, home: "now", component: Empty }) });
+    expect(() => buildCatalog([panel("a"), panel("b")])).toThrow("Panel x.p");
+    const editor = (id: string): UiPackDef => ({ id, register: (r) => r.editor({ collection: "kinds", label: "K", component: Empty }) });
+    expect(() => buildCatalog([editor("a"), editor("b")])).toThrow("kinds");
+    const chip = (id: string): UiPackDef => ({ id, register: (r) => r.chip("roll", Empty) });
+    expect(() => buildCatalog([chip("a"), chip("b")])).toThrow("roll");
+    const preview = (id: string): UiPackDef => ({ id, register: (r) => r.preview("maps", Empty) });
+    expect(() => buildCatalog([preview("a"), preview("b")])).toThrow("maps");
+    const field = (id: string): UiPackDef => ({ id, register: (r) => r.field({ kind: "person", field: "flows", component: Empty }) });
+    expect(() => buildCatalog([field("a"), field("b")])).toThrow("person.flows");
+    const sheet = (id: string): UiPackDef => ({ id, register: (r) => r.sheet("person", Empty) });
+    expect(() => buildCatalog([sheet("a"), sheet("b")])).toThrow("A sheet for person (pack b)");
+    const glance = (id: string): UiPackDef => ({ id, register: (r) => r.glance({ id: "x.g", order: 1, panel: "x.p", component: Empty }) });
+    expect(() => buildCatalog([glance("a"), glance("b")])).toThrow("Glance x.g (pack b)");
+    const orgTab = (id: string): UiPackDef => ({ id, register: (r) => r.orgTab({ id: "x.money", label: "Money", order: 40, section: "money", component: Empty }) });
+    expect(() => buildCatalog([orgTab("a"), orgTab("b")])).toThrow("An organization tab x.money (pack b)");
+    expect(() => buildCatalog([{ id: "a", register: () => {} }, { id: "a", register: () => {} }])).toThrow("registered twice");
+  });
+
+  test("the packs' organization tabs and parts come out in order, ties broken by id, whichever pack registered them", () => {
+    const catalog = buildCatalog([
+      {
+        id: "economy",
+        register(r) {
+          r.orgTab({ id: "economy.taxes", label: "Taxes", order: 70, section: "taxes", component: Empty });
+          r.orgTab({ id: "economy.money", label: "Money", order: 40, section: "money", component: Empty });
+        },
+      },
+      { id: "orgs", register: (r) => r.orgTab({ id: "orgs.property", label: "Property", order: 50, section: "property", component: Empty }) },
+      { id: "aaa", register: (r) => r.orgTab({ id: "aaa.payroll", label: "Payroll", order: 40, section: "payroll", within: "people", component: Empty }) },
+    ]);
+    expect(catalog.orgTabs.map((def) => [def.id, def.within ?? null])).toEqual([
+      ["aaa.payroll", "people"],
+      ["economy.money", null],
+      ["orgs.property", null],
+      ["economy.taxes", null],
+    ]);
+  });
+
+  test("an entity's structured field gets the editor registered on the nearest kind up its chain", () => {
+    const parent = () => null;
+    const child = () => null;
+    const catalog = buildCatalog([
+      {
+        id: "economy",
+        register(r) {
+          r.field({ kind: "person", field: "flows", component: parent });
+          r.field({ kind: "shopkeeper", field: "flows", component: child });
+        },
+      },
+    ]);
+    const doc = { kinds: { person: { id: "person", label: "Person", fields: {} }, shopkeeper: { id: "shopkeeper", label: "Shopkeeper", extends: "person", fields: {} }, baker: { id: "baker", label: "Baker", extends: "shopkeeper", fields: {} }, crate: { id: "crate", label: "Crate", fields: {} } } } as unknown as WorldDoc;
+    expect(fieldEditorFor(catalog.fields, doc, "person", "flows")?.component).toBe(parent);
+    expect(fieldEditorFor(catalog.fields, doc, "baker", "flows")?.component).toBe(child);
+    expect(fieldEditorFor(catalog.fields, doc, "crate", "flows")).toBeUndefined();
+    expect(fieldEditorFor(catalog.fields, doc, "person", "bills")).toBeUndefined();
+  });
+});

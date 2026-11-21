@@ -1,0 +1,124 @@
+// The UiRegistry implementation (ARCHITECTURE §5). Each pack's ui registers its panels, Build
+// editors, config fields, chip renderers, detail sheets, Now glances, editors for its kinds'
+// structured fields, tabs of an organization's page and parts of the place and person sheets; a duplicate
+// registration is a pack conflict and throws, so two packs can never silently shadow each other.
+
+import type { ComponentType } from "preact";
+import type { PackId } from "../shared/ids";
+import type { WorldCollection } from "../shared/world";
+import type { ChipKind } from "../shared/state-view";
+import type { SheetKind } from "./app";
+import type { ChipProps, EditorDef, FieldEditorDef, GlanceDef, OrgTabDef, PackConfigProps, PanelDef, PersonPartDef, PlaceFieldDef, PlacePartDef, PreviewProps, SheetProps, UiPackDef, UiRegistry } from "./registry";
+
+export interface UiCatalog {
+  /** Panels in `order`, ties by id. */
+  panels: readonly PanelDef[];
+  editors: ReadonlyMap<WorldCollection, EditorDef>;
+  /** A pack's config fields, by pack id. */
+  configs: ReadonlyMap<PackId, ComponentType<PackConfigProps>>;
+  chips: ReadonlyMap<ChipKind, ComponentType<ChipProps>>;
+  /** How a job's review draws a proposed value, by collection. */
+  previews: ReadonlyMap<WorldCollection, ComponentType<PreviewProps>>;
+  /** Build's editors for structured fields, by kind and field. */
+  fields: readonly FieldEditorDef[];
+  /** Build's editors for place fields, in registration order. */
+  placeFields: readonly PlaceFieldDef[];
+  /** The detail sheet for each kind of thing that has one. */
+  sheets: ReadonlyMap<SheetKind, ComponentType<SheetProps>>;
+  /** Now's glances in `order`, ties by id. */
+  glances: readonly GlanceDef[];
+  /** The packs' tabs and parts of an organization's page in `order`, ties by id. */
+  orgTabs: readonly OrgTabDef[];
+  /** The packs' parts of Play's place sheet in `order`, ties by id. */
+  placeParts: readonly PlacePartDef[];
+  /** The packs' parts of Play's person sheet in `order`, ties by id. */
+  personParts: readonly PersonPartDef[];
+  packs: readonly string[];
+}
+
+export function buildCatalog(packs: readonly UiPackDef[]): UiCatalog {
+  const panels = new Map<string, PanelDef>();
+  const editors = new Map<WorldCollection, EditorDef>();
+  const configs = new Map<PackId, ComponentType<PackConfigProps>>();
+  const chips = new Map<ChipKind, ComponentType<ChipProps>>();
+  const previews = new Map<WorldCollection, ComponentType<PreviewProps>>();
+  const fields = new Map<string, FieldEditorDef>();
+  const placeFields = new Map<string, PlaceFieldDef>();
+  const sheets = new Map<SheetKind, ComponentType<SheetProps>>();
+  const glances = new Map<string, GlanceDef>();
+  const orgTabs = new Map<string, OrgTabDef>();
+  const placeParts = new Map<string, PlacePartDef>();
+  const personParts = new Map<string, PersonPartDef>();
+  const ids = new Set<string>();
+  for (const pack of packs) {
+    if (ids.has(pack.id)) throw new Error(`UI pack ${pack.id} is registered twice`);
+    ids.add(pack.id);
+    const registry: UiRegistry = {
+      panel(def) {
+        if (panels.has(def.id)) throw new Error(`Panel ${def.id} (pack ${pack.id}) is already registered`);
+        panels.set(def.id, def);
+      },
+      editor(def) {
+        if (editors.has(def.collection)) throw new Error(`An editor for ${def.collection} (pack ${pack.id}) is already registered`);
+        editors.set(def.collection, def);
+      },
+      config(component) {
+        if (configs.has(pack.id)) throw new Error(`Config fields for pack ${pack.id} are already registered`);
+        configs.set(pack.id, component);
+      },
+      chip(kind, component) {
+        if (chips.has(kind)) throw new Error(`A chip renderer for ${kind} (pack ${pack.id}) is already registered`);
+        chips.set(kind, component);
+      },
+      preview(collection, component) {
+        if (previews.has(collection)) throw new Error(`A preview for ${collection} (pack ${pack.id}) is already registered`);
+        previews.set(collection, component);
+      },
+      field(def) {
+        const key = `${def.kind}.${def.field}`;
+        if (fields.has(key)) throw new Error(`An editor for the field ${key} (pack ${pack.id}) is already registered`);
+        fields.set(key, def);
+      },
+      placeField(def) {
+        if (placeFields.has(def.field)) throw new Error(`An editor for the place field ${def.field} (pack ${pack.id}) is already registered`);
+        placeFields.set(def.field, def);
+      },
+      sheet(kind, component) {
+        if (sheets.has(kind)) throw new Error(`A sheet for ${kind} (pack ${pack.id}) is already registered`);
+        sheets.set(kind, component);
+      },
+      glance(def) {
+        if (glances.has(def.id)) throw new Error(`Glance ${def.id} (pack ${pack.id}) is already registered`);
+        glances.set(def.id, def);
+      },
+      orgTab(def) {
+        if (orgTabs.has(def.id)) throw new Error(`An organization tab ${def.id} (pack ${pack.id}) is already registered`);
+        orgTabs.set(def.id, def);
+      },
+      placePart(def) {
+        if (placeParts.has(def.id)) throw new Error(`A place sheet part ${def.id} (pack ${pack.id}) is already registered`);
+        placeParts.set(def.id, def);
+      },
+      personPart(def) {
+        if (personParts.has(def.id)) throw new Error(`A person sheet part ${def.id} (pack ${pack.id}) is already registered`);
+        personParts.set(def.id, def);
+      },
+    };
+    pack.register(registry);
+  }
+  return {
+    panels: [...panels.values()].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
+    editors,
+    configs,
+    chips,
+    previews,
+    fields: [...fields.values()],
+    placeFields: [...placeFields.values()],
+    sheets,
+    glances: [...glances.values()].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
+    orgTabs: [...orgTabs.values()].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
+    placeParts: [...placeParts.values()].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
+    personParts: [...personParts.values()].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
+    packs: [...ids],
+  };
+}

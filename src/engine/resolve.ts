@@ -1,0 +1,626 @@
+// Action resolution (DESIGN §3 Actions, §11): parameters, requirements, then the check, then the
+// outcome's effects, then the duration and any activity the action starts. The check is the one
+// check mechanism (engine/checks): the palette's odds (`actionOdds`) and the roll read the same
+// ready check, so shown odds are the real odds. Outcome effects see the roll as `roll.*`. The
+// adjudication policy (engine/adjudication) decides whether the check rolls at all, what the
+// player's judged approach adds, and who settles it; the palette shows the same verdict.
+
+import type { JsonObject, JsonValue } from "../shared/json";
+import type { ActionId, EntityId, PlaceId } from "../shared/ids";
+import type { LedgerEvent } from "../shared/ledger";
+import { heldBy } from "../shared/finance";
+import { D20_PACK } from "../shared/d20";
+import { isHardLock, requirementExpr, requirementWhy, spanRecords, type ActionDef, type CheckDef, type EffectSpec, type Expr, type ParamDef, type Requirement, type WorldDoc } from "../shared/world";
+import { tableRowKey } from "../shared/tables";
+import { plainRolling } from "../shared/adjudication";
+import { reachOf } from "./access";
+import { approachShift, closeCall, fightRound, judgedOutcome, oddsSignature, outcomeChoices, passOutcome, policyFor, ratingOf, tryKey, verdictOf, type Adjudged, type Judgement, type Verdict } from "./adjudication";
+import { checkCounts, checkOdds, checkOf, oddsOf, readyCheck, rollCheck, rollVars, type CheckRoll } from "./checks";
+import { ENGINE_EVENTS } from "./engine-pack";
+import { EXTERNAL_ACCOUNT_PREFIX } from "./events";
+import { applyEffects } from "./effects";
+import { identifiers, type EnvVars, type ExprEnv, type Value } from "./expr";
+import { materializeAll } from "./materialize";
+import type { ReadContext, Rejection } from "./registry";
+import type { Registry } from "./registry-impl";
+import type { Rng } from "./rng";
+import { evalExpr, isGone, kindIs, placeOfEntity, scopeEnv, toValue, truthy } from "./scope";
+import { selectorMatches } from "./selector";
+import type { EntityState, WorldState } from "./state";
+import { passMemo } from "./read-pass";
+import { Working } from "./working";
+import { canSeeEntity, canSeePlace } from "./visibility";
+import { povMayKnow } from "./player-events";
+import { acts } from "./life";
+import { together } from "./presence";
+import { labelOf, optionalService, own } from "./pack-kit";
+import type { ToldAction } from "./action-words";
+import type { Needs } from "./steps";
+import { say } from "../shared/lines";
+import { missingWords } from "./param-words";
+
+export interface ActionRequest {
+  action: ActionId | ActionDef;
+  /** Defaults to the POV. */
+  actor?: EntityId;
+  params?: JsonObject;
+}
+
+export interface CheckResult extends CheckRoll {
+  check: CheckDef;
+  /** The notation rolled: advantage applied, an opponent's roll subtracted. */
+  notation: string;
+  modifier: number;
+  advantage: -1 | 0 | 1;
+  dc: number | null;
+  /** Exact probability of each outcome, as shown. */
+  odds: Record<string, number>;
+}
+
+/** The player character's own thing a claim brought from elsewhere (ITEMS-SPEC §4.5): where it was (null: nowhere, lost), and the minutes on foot when it was fetched from close by. */
+export interface Brought {
+  place: PlaceId | null;
+  minutes?: number;
+}
+
+export interface Resolution {
+  action: ActionId;
+  actor: EntityId;
+  ok: boolean;
+  /**
+   * Why the action could not run: a bad parameter or the requirement that didn't hold, `hard` when it
+   * is its author's hard lock (DESIGN §11), which alone vetoes what the player typed.
+   */
+  failed: Failure | null;
+  check: CheckResult | null;
+  outcome: string | null;
+  /** Everything this resolution applied: materialization first, then effects, then the activity. */
+  events: LedgerEvent[];
+  rejected: { effect: EffectSpec; rejection: Rejection }[];
+  /** Minutes the action takes. */
+  duration: number;
+  activity: { type: string; until: number } | null;
+  observable: string | null;
+  /** How the adjudication policy decided the check; null without a check or under a plain-rolling policy. */
+  adjudged: Adjudged | null;
+  /** With `advise` (`ResolveOptions`): each requirement the action did not meet, which it went on past; none otherwise. */
+  advised?: Failure[];
+  /**
+   * The thing the player said they had, made real for this action as one of a turn's (DESIGN §9.4
+   * player claims; set by the plan): its entity and name, and what its Undo takes back: its making,
+   * the action's own events and the rules they fired. Money's `cents`: the cash it added, which its
+   * entity (the carried cash account) holds. `brought`: the player character's own thing came from
+   * elsewhere rather than being made (ITEMS-SPEC §4.5).
+   */
+  claimed?: { entity: EntityId; name: string; events: LedgerEvent[]; cents?: number; brought?: Brought };
+  /** The action as the narrator is told it (`toldAction`): set by the turn's plan once the turn has played, never recorded. */
+  told?: ToldAction;
+  /**
+   * The player's typed action plays as plain roleplay (DESIGN §11): the engine couldn't play it as
+   * things stand, for a requirement that isn't a hard lock or a payment the money can't cover. Set by
+   * the turn's plan, never recorded; one picked in the engine's own controls, and anyone else's, is
+   * held to its requirements and its payments.
+   */
+  roleplay?: true;
+}
+
+export function findAction(reg: Registry, world: WorldDoc, id: ActionId): ActionDef | undefined {
+  return own(world.actions, id) ?? reg.actions.get(id);
+}
+
+/**
+ * The outside account a ref param pays when it names nothing that fits (`ParamDef.outside`, DESIGN
+ * §9.4 typed money): the account its key names, or the id it gives; null for a param that pays none.
+ * The typed read puts it in the param's place (`paidOutside`), and the action binds it as given.
+ */
+export function outsideOf(def: ParamDef | undefined): string | null {
+  const key = def?.type === "ref" ? (def.outside ?? "") : "";
+  if (key === "") return null;
+  return key.startsWith(EXTERNAL_ACCOUNT_PREFIX) ? key : `${EXTERNAL_ACCOUNT_PREFIX}${key}`;
+}
+
+interface Prepared {
+  action: ActionDef;
+  actor: EntityId;
+  bindings: Record<string, EntityId>;
+  vars: EnvVars;
+  params: Record<string, Value>;
+}
+
+function prepare(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, req: ActionRequest): Prepared | Rejection {
+  const action = typeof req.action === "string" ? findAction(reg, world, req.action) : req.action;
+  if (!action) return { code: "unknown_action", reason: say("why_no_action_action", { action: String(req.action) }) };
+  const actor = req.actor ?? world.pov;
+  if (!own(state.entities, actor)) return { code: "missing_actor", reason: say("why_no_entity_who", { who: labelOf({ world, state }, actor) }) };
+  const bindings: Record<string, EntityId> = { self: actor, actor };
+  const params: Record<string, Value> = {};
+  const given = req.params ?? {};
+  // Said to a person in words: the parameter by its label and, where it takes one of a list, the names of the list (`param-words.ts`).
+  const missing = missingWords(reg.context(world, state), action, given, actor);
+  if (missing !== null) return { code: "missing_param", reason: missing };
+  for (const [name, def] of Object.entries(action.params)) {
+    const raw: JsonValue | undefined = own(given, name);
+    if (raw === undefined || raw === null || raw === "") continue;
+    if (def.type === "ref") {
+      const id = String(raw);
+      // The outside account a param pays for a receiver the story hasn't established, as the read put it (`outsideOf`).
+      if (id === outsideOf(def)) {
+        bindings[name] = id;
+        params[name] = id;
+        continue;
+      }
+      const target = own(state.entities, id);
+      if (!target) {
+        if (own(world.places, id)) {
+          params[name] = id;
+          continue;
+        }
+        return { code: "bad_param", reason: say("why_no_entity_who", { who: labelOf({ world, state }, id) }) };
+      }
+      if (def.ref && !kindIs(reg, world, target.kind, def.ref)) return { code: "bad_param", reason: say("why_name_is_not_ana_def", { name: target.name, def: (reg.kinds.get(def.ref)?.label ?? own(world.kinds, def.ref)?.label ?? def.ref).toLowerCase(), def2: /^[aeiou]/i.test(def.ref) }) };
+      if (def.of && !selectorMatches(reg, world, state, def.of, id)) return { code: "bad_param", reason: say("why_name_cant_be_the_g_of_action", { name: target.name, g: (def.label ?? name).replace(/_/g, " ").toLowerCase(), action: action.label }) };
+      bindings[name] = id;
+      params[name] = id;
+      continue;
+    }
+    // A list of refs (Go's `with`): the ones who may come along (`companionCandidates`: in the actor's
+    // scene, seen by it, acting), kept as their ids joined by commas, the one scalar form an effect's
+    // argument can carry. Anyone else simply doesn't come, and isn't named in a refusal, since the
+    // actor may not know of them.
+    if (def.type === "list" && def.ref) {
+      const may = new Set(companionCandidates(reg, world, state, action, name, actor));
+      const ids = (Array.isArray(raw) ? raw : String(raw).split(",")).map((x) => String(x).trim()).filter((x) => may.has(x));
+      if (ids.length > 0) params[name] = [...new Set(ids)].join(",");
+      continue;
+    }
+    // A text param naming a table row (a skill, a save) takes the row's id or its label, and keeps the id.
+    if (def.type === "text" && def.table !== undefined) {
+      const key = typeof raw === "string" ? tableRowKey(own(world.tables, def.table), raw) : null;
+      if (key === null) return { code: "bad_param", reason: say("why_raw_isnt_one_of_the_name_s", { raw: String(raw), name: (def.label ?? name).toLowerCase() }) };
+      params[name] = key;
+      continue;
+    }
+    if ((def.type === "number" || def.type === "money" || def.type === "duration") && typeof raw !== "number") return { code: "bad_param", reason: say("why_name_must_be_a_number", { name: name }) };
+    const v = toValue(raw);
+    if (v === undefined) return { code: "bad_param", reason: say("why_name_must_be_a_scalar", { name: name }) };
+    params[name] = v;
+  }
+  // Acting for an organization (`ParamDef.acting`, ORG-SPEC §3.6): the organization the param names
+  // is who acts, so `self` is it in requirements and outcomes, while `actor` stays whoever does it.
+  const acting = Object.entries(action.params).find(([name, def]) => def.acting !== undefined && def.type === "ref" && bindings[name] !== undefined);
+  if (acting) bindings.self = bindings[acting[0]] ?? actor;
+  // Ref params resolve through their bindings (`target.cash`); only scalars are top-level names. An
+  // absent optional param reads 0 by its bare name and null as `params.<name>`, so an outcome can
+  // tell "not given" from a given 0.
+  const scalars = Object.fromEntries(Object.entries(params).filter(([name]) => !Object.prototype.hasOwnProperty.call(bindings, name)));
+  const absent = Object.fromEntries(Object.keys(action.params).filter((name) => !(name in params)).map((name): [string, Value] => [name, null]));
+  const vars: Record<string, Value | EnvVars> = { ...scalars, params: { ...absent, ...params } };
+  return { action, actor, bindings, vars, params };
+}
+
+/** Why an action can't run: a rejection, or a requirement that didn't hold, as its formula (`hard`: its author's hard lock; `words`: its own words for the player, from its `why`). */
+export type Failure = { code: string; reason: string; requirement?: Expr; hard?: true; words?: string };
+
+/** A requirement that didn't hold, with its own words when its `why` gives some. */
+function unmet(req: Requirement, env: ExprEnv, hard: boolean): Failure {
+  const expr = requirementExpr(req);
+  const why = requirementWhy(req);
+  const said = why === null ? null : evalExpr(why, env, "");
+  const words = typeof said === "string" && said.trim() !== "" ? { words: said.trim() } : {};
+  return { code: "requirement", reason: say("why_requires_expr", { expr: expr }), requirement: expr, ...(hard ? { hard: true as const } : {}), ...words };
+}
+
+/**
+ * The requirement that keeps the action from running (DESIGN §11): a hard lock that doesn't hold
+ * before any plain one, since it alone vetoes a typed action; null when every one holds.
+ */
+function firstUnmet(action: ActionDef, env: ExprEnv): Failure | null {
+  let plain: Requirement | null = null;
+  for (const req of action.requires) {
+    if (truthy(evalExpr(requirementExpr(req), env, false))) continue;
+    if (isHardLock(req)) return unmet(req, env, true);
+    plain ??= req;
+  }
+  return plain === null ? null : unmet(plain, env, false);
+}
+
+/** Every requirement of the action that does not hold, in its order. */
+function allUnmet(action: ActionDef, env: ExprEnv): Failure[] {
+  return action.requires.flatMap((req) => (truthy(evalExpr(requirementExpr(req), env, false)) ? [] : [unmet(req, env, isHardLock(req))]));
+}
+
+/**
+ * What keeps the action the player's words named (`needs`) from holding one that plays in its place
+ * (DESIGN §9.4): the first of its requirements on the picks it was given that doesn't hold, a hard
+ * lock first; its requirements on anything else (the money it never was) are left out. The picks the
+ * two share are the playing action's `params`, as it plays now. Null when they all hold, or the
+ * action is gone.
+ */
+export function unmetNeeds(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, needs: Needs, params: JsonObject): Failure | null {
+  const named = findAction(reg, world, needs.action);
+  if (!named) return null;
+  const picks: JsonObject = { ...needs.params };
+  for (const [name, from] of Object.entries(needs.shared)) {
+    const value = params[from];
+    if (value !== undefined) picks[name] = value;
+  }
+  const given = (name: string): boolean => Object.prototype.hasOwnProperty.call(picks, name);
+  const reads = (req: Expr): string[] => identifiers(req).filter((name) => Object.prototype.hasOwnProperty.call(named.params, name));
+  const action: ActionDef = { ...named, params: Object.fromEntries(Object.entries(named.params).filter(([name]) => given(name))), requires: named.requires.filter((req) => reads(requirementExpr(req)).every(given)) };
+  const p = prepare(reg, world, state, { action, params: picks });
+  return "code" in p ? p : firstUnmet(action, scopeEnv({ reg, ctx: reg.context(world, state), bindings: p.bindings, vars: p.vars }));
+}
+
+/**
+ * Whether the player's action plays as plain roleplay (DESIGN §11, `Resolution.roleplay`): what they
+ * typed is their will, so the engine plays none of it, the narrator hears nothing of it and the rest
+ * of the message goes on.
+ */
+export function playsAsRoleplay(res: Pick<Resolution, "roleplay">): boolean {
+  return res.roleplay === true;
+}
+
+/** Whether a resolution failed on a requirement that isn't its author's hard lock: a typed action that does plays as plain roleplay. */
+export function missedPlainRequirement(res: Pick<Resolution, "ok" | "failed">): boolean {
+  return !res.ok && res.failed?.code === "requirement" && res.failed.hard !== true;
+}
+
+/** One roll's own odds in an action of several: each attack of a full attack, each one who makes a save. */
+export interface OddsLine {
+  /** The attack's number. */
+  n?: number;
+  /** Who makes the save. */
+  who?: EntityId;
+  modifier: number;
+  /** The difficulty or defence it is read against. */
+  against: number;
+  chances: Record<string, number>;
+  /** An attack's chance of a threat: a natural die in its range that hits, before it is confirmed. */
+  threat?: number;
+}
+
+/** The odds a pack works out for an action of its own that rolls in its own procedure, from that procedure's numbers (`d20.odds`). */
+export interface PackOdds {
+  chances: Record<string, number>;
+  modifier: number;
+  notation: string;
+  dc: number | null;
+  opponent: EntityId | null;
+  lines?: OddsLine[];
+  /** The chances with a point spent on the roll, where the doer could spend one. */
+  spent?: Record<string, number>;
+}
+
+export interface Availability {
+  available: boolean;
+  failed: Failure | null;
+  odds: Record<string, number> | null;
+  modifier: number;
+  /** How the check would roll (its notation, advantage, DC and opponent), when the action has one. */
+  check: { notation: string; advantage: -1 | 0 | 1; dc: number | null; opponent: EntityId | null } | null;
+  duration: number;
+  /** What the adjudication policy makes of the check before it is taken (no roll, too hard, the story decides). */
+  verdict: Verdict | null;
+  /** Each roll's own odds, where the action makes several. */
+  lines?: readonly OddsLine[];
+  /** The chances with a point spent on the roll (an action point), where the doer could spend one. */
+  spent?: Record<string, number>;
+  /** What the odds need that the call does not give (a difficulty, a target), in words. */
+  missing?: string;
+}
+
+/**
+ * What a combat action costs its actor now, as events, or why it can't be taken (the combat pack,
+ * DESIGN §11): its fight's state, the actor's turn and economy. Nothing for any other action.
+ */
+function combatSpend(ctx: ReadContext, actor: EntityId, action: ActionDef): LedgerEvent[] | Rejection {
+  return action.combat ? (optionalService(ctx, "combat.spend")?.(ctx, actor, action) ?? { code: "no_combat", reason: say("why_this_world_has_no_combat") }) : [];
+}
+
+/** What the palette shows: availability, exact odds and duration, against the current state. */
+export function actionOdds(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, req: ActionRequest): Availability {
+  const p = prepare(reg, world, state, req);
+  if ("code" in p) return { available: false, failed: p, odds: null, modifier: 0, check: null, duration: 0, verdict: null };
+  const ctx = reg.context(world, state);
+  const env = scopeEnv({ reg, ctx, bindings: p.bindings, vars: p.vars });
+  const unmet = firstUnmet(p.action, env);
+  const def = checkOf(world, p.action.check);
+  const ready = def ? readyCheck(reg, ctx, def, p.bindings, p.vars) : null;
+  const usable = ready && !("code" in ready) ? ready : null;
+  const counts = usable ? checkCounts(usable) : null;
+  const odds = counts ? oddsOf(counts) : null;
+  // An action of the tabletop rules rolls in its own procedure: its odds are that procedure's numbers, counted by the pack.
+  const theirs = !def && p.action.pack === D20_PACK ? (optionalService(ctx, "d20.odds")?.(ctx, p.action.id, p.actor, p.params) ?? null) : null;
+  const packed = theirs !== null && "chances" in theirs ? theirs : null;
+  const spend = combatSpend(ctx, p.actor, p.action);
+  const refused = Array.isArray(spend) ? null : spend;
+  return {
+    available: unmet === null && refused === null && usable === ready,
+    failed: unmet ?? refused ?? (ready && "code" in ready ? ready : null),
+    odds: packed?.chances ?? odds,
+    modifier: packed?.modifier ?? usable?.modifier ?? 0,
+    check: packed ? { notation: packed.notation, advantage: 0, dc: packed.dc, opponent: packed.opponent } : usable ? { notation: usable.notation, advantage: usable.advantage, dc: usable.dc, opponent: usable.opponent } : null,
+    duration: Math.max(0, Math.round(Number(evalExpr(p.action.duration, env, 0)) || 0)),
+    verdict: usable && counts ? verdictOf(policyFor(world, state, p.action, p.actor), { registry: reg, world, state, action: p.action, actor: p.actor, params: p.params, ready: usable, counts }) : null,
+    ...(packed?.lines ? { lines: packed.lines } : {}),
+    ...(packed?.spent ? { spent: packed.spent } : {}),
+    ...(theirs !== null && "missing" in theirs ? { missing: theirs.missing } : {}),
+  };
+}
+
+export interface ResolveOptions {
+  /** Enables in-turn materialization of the actor and entity parameters (DESIGN §9.2). */
+  runSeed?: string;
+  /** The turn's recorded `judge` answer (DESIGN §11): the approach's rating, and the story's odds under narrative authority. */
+  judgement?: Judgement | null;
+  /** The action the player's words named, when this one plays in its place: its needs hold this one too (`unmetNeeds`). */
+  needs?: Needs;
+  /**
+   * The world's rules advise rather than refuse (plan §6.1; his own tap, PlanTurnKinds-21): each requirement the action does not meet
+   * is given back in `advised`, and the action is applied all the same; so is a combat action that is not its doer's to take now (it
+   * spends nothing), and its effects run as ruled (`EffectScope.ruled`), so a power its doer lacks is not enforced again by them.
+   */
+  advise?: true;
+  /**
+   * The outcome the GM ruled (plan §6.5: the world's actions are what the GM rules by): taken as it is, so the check is not rolled and
+   * no attempt is recorded for it; the outcome's effects read `roll` as a check that did not roll.
+   */
+  outcome?: string;
+}
+
+/**
+ * Resolves an action into the working state. Materialization of the participants is recorded ahead
+ * of the effects; a failed requirement applies nothing else.
+ */
+export function resolveAction(reg: Registry, w: Working, req: ActionRequest, rng: Rng, opts: ResolveOptions = {}): Resolution {
+  const start = w.events.length;
+  const actionId = typeof req.action === "string" ? req.action : req.action.id;
+  const p = prepare(reg, w.world, w.state, req);
+  const base: Resolution = {
+    action: actionId,
+    actor: req.actor ?? w.world.pov,
+    ok: false,
+    failed: null,
+    check: null,
+    outcome: null,
+    events: [],
+    rejected: [],
+    duration: 0,
+    activity: null,
+    observable: null,
+    adjudged: null,
+  };
+  if ("code" in p) return { ...base, failed: p };
+
+  if (opts.runSeed !== undefined) {
+    const participants = [p.actor, ...Object.values(p.bindings)].filter((id, i, all) => all.indexOf(id) === i);
+    for (const id of participants) materializeAll(reg, w, id, opts.runSeed);
+  }
+
+  const env = scopeEnv({ reg, ctx: w.ctx, bindings: p.bindings, vars: p.vars });
+  const itself = firstUnmet(p.action, env);
+  const named = opts.needs ? unmetNeeds(reg, w.world, w.state, opts.needs, req.params ?? {}) : null;
+  // A hard lock vetoes first, whichever action's it is.
+  const unmetHere = itself?.hard ? itself : named?.hard ? named : (itself ?? named);
+  const advised = opts.advise === true && unmetHere !== null ? allUnmet(p.action, env) : [];
+  if (unmetHere !== null && opts.advise !== true) return { ...base, actor: p.actor, failed: unmetHere, events: w.events.slice(start) };
+
+  // The plan is read from the state before the action: its duration and activity span.
+  const duration = Math.max(0, Math.round(Number(evalExpr(p.action.duration, env, 0)) || 0));
+  let activity: Resolution["activity"] = null;
+  if (p.action.activity) {
+    const until = Number(evalExpr(p.action.activity.until, env, w.state.clock + duration));
+    activity = { type: p.action.activity.type, until: Math.max(w.state.clock, Math.round(Number.isFinite(until) ? until : w.state.clock + duration)) };
+  }
+
+  const checkDef = checkOf(w.world, p.action.check);
+  const ready = checkDef ? readyCheck(reg, w.ctx, checkDef, p.bindings, p.vars) : null;
+  // An outcome ruled is not rolled for, so a check that cannot be read keeps nothing from it.
+  if (ready && "code" in ready && opts.outcome === undefined) return { ...base, actor: p.actor, failed: ready, events: w.events.slice(start) };
+  // A combat action spends its cost before it rolls, so a miss uses it up too. Advised, one not its doer's to take now is told and spends nothing.
+  const spend = combatSpend(w.ctx, p.actor, p.action);
+  if (!Array.isArray(spend) && opts.advise === true) advised.push({ code: spend.code, reason: spend.reason });
+  const refused = Array.isArray(spend) ? (spend.map((ev) => w.apply(ev)).find((r) => r !== null) ?? null) : opts.advise === true ? null : spend;
+  if (refused) return { ...base, actor: p.actor, failed: refused, events: w.events.slice(start) };
+  let check: CheckResult | null = null;
+  let outcome: string;
+  let vars = p.vars;
+  let adjudged: Adjudged | null = null;
+  if (opts.outcome !== undefined) {
+    outcome = opts.outcome;
+    const read = ready && !("code" in ready) ? ready : null;
+    vars = { ...p.vars, roll: { natural: null, total: null, modifier: read?.modifier ?? 0, dc: read?.dc ?? null, margin: null, outcome } };
+  } else if (checkDef && ready && !("code" in ready)) {
+    const counts = checkCounts(ready);
+    const odds = oddsOf(counts);
+    const policy = policyFor(w.world, w.state, p.action, p.actor);
+    const verdict = verdictOf(policy, { registry: reg, world: w.world, state: w.state, action: p.action, actor: p.actor, params: p.params, ready, counts });
+    const judgement = opts.judgement ?? null;
+    const place = placeOfEntity(w.state, p.actor);
+    let close: Adjudged["close"] = null;
+    // Under narrative authority the story picks the outcome from the judge's odds. Without them (the
+    // judge off, out of calls or failed, and always for an NPC, which no judge reads) the dice decide,
+    // as the palette's odds showed: an unjudged risky check never just succeeds.
+    const story = verdict.why === "story" ? judgedOutcome(judgement, outcomeChoices(p.action, Object.keys(odds)), rng.fork("judge")) : null;
+    const rolls = verdict.roll || (verdict.why === "story" && story === null);
+    const why = rolls ? null : verdict.why;
+    if (rolls) {
+      // The judged approach shifts only a roll the policy asked for (the verdict above read the check
+      // as the palette showed it); a story check the dice took over rolls plainly.
+      const shift = verdict.roll ? approachShift(policy, judgement) : null;
+      const shifted = shift ? readyCheck(reg, w.ctx, checkDef, p.bindings, p.vars, shift) : ready;
+      const rolling = "code" in shifted ? ready : shifted;
+      const rolled = rollCheck(rolling, rng.fork("check"));
+      check = { ...rolled, check: checkDef, notation: rolling.notation, modifier: rolling.modifier, advantage: rolling.advantage, dc: rolling.dc, odds: rolling === ready ? odds : checkOdds(rolling) };
+      outcome = rolled.outcome;
+      vars = { ...p.vars, roll: rollVars(rolling, rolled) };
+      if (policy.authority === "hybrid") close = closeCall(rolling, rolled, rolled.outcome, policy.closeBy);
+    } else {
+      outcome = story ?? verdict.outcome ?? passOutcome(p.action, ready, counts, verdict.pass);
+      vars = { ...p.vars, roll: { natural: null, total: null, modifier: ready.modifier, dc: ready.dc, margin: null, outcome } };
+    }
+    if (!plainRolling(policy)) {
+      const approach = judgement && (policy.authority === "narrative" ? why === "story" : verdict.roll && policy.description.weight !== "none") ? { rating: ratingOf(policy, judgement), max: policy.description.max, reason: judgement.reason } : null;
+      adjudged = { rolled: rolls, why, chance: verdict.chance, pass: verdict.pass, authority: policy.authority, retry: policy.retry, approach, close };
+      // A refused retry is no new attempt: the wait a retry rule counts runs from the failed roll.
+      const tracked = policy.retry !== "free" && verdict.pass.length > 0 && verdict.why !== "retry";
+      const round = tracked ? fightRound(w.ctx) : null;
+      w.apply({
+        type: ENGINE_EVENTS.adjudged,
+        data: {
+          actor: p.actor,
+          action: p.action.id,
+          check: checkDef.id ?? "",
+          outcome,
+          rolled: rolls,
+          ...(why ? { why } : {}),
+          ...(approach ? { rating: approach.rating, max: approach.max, reason: approach.reason.slice(0, 240) } : {}),
+          ...(close ? { close: close.outcome } : {}),
+          ...(tracked ? { key: tryKey(p.actor, p.action.id, p.params), place, failed: !verdict.pass.includes(outcome), odds: oddsSignature(ready), ...(round !== null ? { round } : {}) } : {}),
+        },
+      });
+    }
+  } else {
+    outcome = Object.prototype.hasOwnProperty.call(p.action.outcomes, "default") ? "default" : (Object.keys(p.action.outcomes)[0] ?? "default");
+  }
+
+  const effects = own(p.action.outcomes, outcome) ?? [];
+  const result = applyEffects(reg, w, effects, { bindings: p.bindings, vars, params: p.params, rng: rng.fork("effects"), ...(opts.advise === true ? { ruled: true as const } : {}) });
+
+  if (activity) {
+    w.apply({ type: "set", entity: p.actor, field: "activity", value: activity.type });
+    w.apply({ type: "set", entity: p.actor, field: "activity_until", value: activity.until });
+    // What it was given for and where it began: another activity, or a move, ends it (`activitySpanEnd`).
+    w.applyAll(spanRecords(p.actor, own(w.state.entities, p.actor)?.fields));
+  }
+  return {
+    ...base,
+    actor: p.actor,
+    ok: true,
+    check,
+    outcome,
+    events: w.events.slice(start),
+    rejected: result.rejected,
+    ...(advised.length > 0 ? { advised } : {}),
+    duration,
+    activity,
+    observable: p.action.observable ?? null,
+    adjudged,
+  };
+}
+
+/** Convenience for callers without a working state: resolves against a copy of `state`. */
+export function resolveOn(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, req: ActionRequest, rng: Rng, opts: ResolveOptions = {}): { resolution: Resolution; state: WorldState } {
+  const w = new Working(reg, world, state);
+  const resolution = resolveAction(reg, w, req, rng, opts);
+  return { resolution, state: w.state };
+}
+
+/**
+ * What can fill a ref parameter. A `place` ref offers the places the actor may see (`placeCandidates`);
+ * any other ref offers entities of the right kind that the param's selector (`of`) matches and the
+ * actor may see, at the actor's place or held by the actor, and for a `nearby` param also what is a
+ * short walk away (`reachOf`: the same site, within the world's fetch minutes on foot). With `most`,
+ * only the first so many of those (the palette shows no more), so no more are looked at.
+ */
+export function paramCandidates(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, action: ActionDef, param: string, actor: EntityId = world.pov, most = Number.POSITIVE_INFINITY): EntityId[] {
+  const def = own(action.params, param);
+  if (!def || def.type !== "ref") return [];
+  if (def.ref === "place") return placeCandidates(reg, world, state, actor);
+  const filters = candidateFilters(action, param);
+  const ctx = filters.length > 0 || def.nearby === true ? reg.context(world, state) : null;
+  const fits = (id: EntityId, e: EntityState): boolean =>
+    (!def.ref || kindIs(reg, world, e.kind, def.ref)) && (!def.of || selectorMatches(reg, world, state, def.of, id)) && (!ctx || filters.length === 0 || filters.every((f) => truthy(evalExpr(f, scopeEnv({ reg, ctx, bindings: { self: actor, [param]: id } }), false))));
+  const out: EntityId[] = [];
+  if (def.nearby !== true) {
+    for (const id of nearActor(reg, world, state, actor)) {
+      if (out.length >= most) break;
+      const e = own(state.entities, id);
+      if (e !== undefined && fits(id, e)) out.push(id);
+    }
+    return out;
+  }
+  const here = placeOfEntity(state, actor);
+  for (const id of Object.keys(state.entities).sort()) {
+    if (out.length >= most) break;
+    if (id === actor) continue;
+    const e = own(state.entities, id);
+    if (!e || isGone(state, id)) continue;
+    if (placeOfEntity(state, id) !== here && !e.relations.some((r) => r.to === actor) && !heldBy(state.entities, id, actor) && !(ctx && reachOf(ctx, actor, id).reach === "nearby")) continue;
+    if (!canSeeEntity(reg, world, state, actor, id) || !fits(id, e)) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * The entities a ref param may name without walking for them, in id order: not the actor, not gone, at the actor's place, tied to the
+ * actor or held by it, and seen by it. One walk of the entities for a read pass, which the palette asks for every action's params.
+ */
+function nearActor(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, actor: EntityId): EntityId[] {
+  return passMemo([state, state.entities, world, reg], `resolve.near\u0000${actor}`, () => {
+    const here = placeOfEntity(state, actor);
+    return Object.keys(state.entities)
+      .sort()
+      .filter((id) => {
+        const e = own(state.entities, id);
+        return id !== actor && !!e && !isGone(state, id) && (placeOfEntity(state, id) === here || e.relations.some((r) => r.to === actor) || heldBy(state.entities, id, actor)) && canSeeEntity(reg, world, state, actor, id);
+      });
+  });
+}
+
+/**
+ * Who may come along on a list-of-refs param (Go's `with`): people of its kind in the actor's scene
+ * (`together`, so a room's people and its building's alike) whom it can see and who act, in id
+ * order; for the player character, only those it may be told of (`povMayKnow`), so a stranger in a
+ * room inside its place, whom Scene → Present withholds, is never named. The palette's With
+ * picker, interpret's catalog and Go itself take the same people.
+ */
+export function companionCandidates(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, action: ActionDef, param: string, actor: EntityId = world.pov): EntityId[] {
+  const def = own(action.params, param);
+  if (!def || def.type !== "list" || def.ref === undefined) return [];
+  const ref = def.ref;
+  const here = placeOfEntity(state, actor);
+  return Object.keys(state.entities)
+    .sort()
+    .filter((id) => {
+      const e = own(state.entities, id);
+      return !!e && id !== actor && kindIs(reg, world, e.kind, ref) && (!def.of || selectorMatches(reg, world, state, def.of, id)) && !isGone(state, id) && acts(world, state, id) && together(world, here, placeOfEntity(state, id)) && canSeeEntity(reg, world, state, actor, id) && (actor !== world.pov || povMayKnow(reg, world, state, id));
+    });
+}
+
+/** The places the actor may see besides its own, nearest first (joined to here by a route, or here's parent or a child), then by name. */
+export function placeCandidates(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, actor: EntityId = world.pov): string[] {
+  const here = placeOfEntity(state, actor);
+  const near = new Set(Object.values(world.routes).flatMap((r) => (r.from === here ? [r.to] : r.to === here && r.bidirectional ? [r.from] : [])));
+  const parent = here ? own(world.places, here)?.parent : undefined;
+  if (parent) near.add(parent);
+  for (const p of Object.values(world.places)) if (here && p.parent === here) near.add(p.id);
+  const name = (id: string): string => own(world.places, id)?.name ?? id;
+  return Object.keys(world.places)
+    .filter((id) => id !== here && canSeePlace(reg, world, state, actor, id))
+    .sort((a, b) => Number(near.has(b)) - Number(near.has(a)) || name(a).localeCompare(name(b)));
+}
+
+const EXPR_WORDS = new Set(["and", "or", "not", "true", "false", "null", "self"]);
+
+/**
+ * The action's requirements about the candidate alone: they read only the candidate (its fields,
+ * or calls on it like `invited(host)` or `carries(self, item)`) and `self`. A candidate failing one
+ * can never fill the param, so it isn't offered (Accept invitation offers only the hosts who
+ * invited you). Requirements that read anything else (`at(to, here)`) stay availability, and so
+ * does a hard lock, so a typed attempt on a candidate it shuts out reads as the action and fails.
+ */
+function candidateFilters(action: ActionDef, param: string): Expr[] {
+  const named = new RegExp(`(?<![\\w.])${param.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+  return action.requires.flatMap((req) => (isHardLock(req) ? [] : [requirementExpr(req)])).filter((req) => {
+    const bare = req.replace(/'[^']*'|"[^"]*"/g, "''");
+    if (!named.test(bare)) return false;
+    for (const m of bare.matchAll(/(\.?)\b([A-Za-z_][A-Za-z0-9_]*)\b(\s*\()?/g)) {
+      const [, dot, name, call] = m;
+      if (call || dot === ".") continue;
+      if (name !== param && !EXPR_WORDS.has(name ?? "")) return false;
+    }
+    return true;
+  });
+}

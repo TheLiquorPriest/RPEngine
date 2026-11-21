@@ -1,0 +1,524 @@
+// The economy's events and the state they fold into (DESIGN §25.4, §25.6): the transaction
+// journal per account (with monthly totals by category, its latest interest and the
+// average-daily-balance accrual, which on a card without statements keeps what it owed when its
+// interest period began and what was paid toward it since),
+// private notes, statement cycles and delinquency, flow runs, holds and settlement, opened
+// accounts and statuses, credit history and scores, card spending, price modifiers and level-1
+// anchors. The events of chats recorded before the rebuild (`anchor`, `txn`, `note`, `modifier`,
+// `statement`, `card_paid`, `decline`) fold here unchanged.
+
+import { say } from "../../../shared/lines";
+import { isRecord, type JsonObject, type JsonValue } from "../../../shared/json";
+import type { EntityId } from "../../../shared/ids";
+import type { PackEvent } from "../../../shared/ledger";
+import { ACCOUNT_STATUSES, DELINQUENCY_STAGES, FINANCE_EVENTS, isCredit, type AccountStatus, type CreditEntry, type CycleState, type DelinquencyStage, type FlowRunState, type JournalEntry } from "../../../shared/finance";
+import { formatMoney } from "../../../shared/world";
+import { calendarOf, dateAt } from "../../../engine/calendar";
+import { EXTERNAL_ACCOUNT_PREFIX } from "../../../engine/events";
+import { bumping, unlisting } from "../../../engine/engine-pack";
+import { mutableSlice, newestOf, numOf, objOf, own, sliceOf, sliceRecord, strOf } from "../../../engine/pack-kit";
+import type { EventTypeDef, ReadContext, Rejection } from "../../../engine/registry";
+import type { WorldState } from "../../../engine/state";
+import { availableOf, balance, classOf, holdersOf } from "./model";
+
+/** Journal lines kept per account, notes per party, months of totals per account, credit entries and scores per person. */
+export const JOURNAL_CAP = 40;
+export const NOTES_CAP = 12;
+const MONTHS_KEPT = 13;
+const CREDIT_CAP = 60;
+const SCORES_KEPT = 24;
+const STATEMENTS_KEPT = 6;
+
+/** What isn't a payment between two sides (an account's opening, a correction, a loss): its journal lines name no other side. */
+export const UNSIDED_KINDS: ReadonlySet<string> = new Set(["opening", "adjustment"]);
+
+export function reject(code: string, reason: string): Rejection {
+  return { code, reason };
+}
+
+export function str(e: PackEvent, k: string): string {
+  return typeof e.data[k] === "string" ? (e.data[k] as string) : "";
+}
+
+/** A month's key in the economy's totals: `YYYY-MM` in the world's calendar. */
+export function monthKey(ctx: Pick<ReadContext, "world">, at: number): string {
+  const d = dateAt(calendarOf(ctx.world), at);
+  return `${String(d.year).padStart(4, "0")}-${String(d.month).padStart(2, "0")}`;
+}
+
+// ---------------------------------------------------------------- reads of the folded state
+
+export function journalOf(state: Readonly<WorldState>, account: EntityId): JournalEntry[] {
+  const raw = own(objOf(sliceOf(state, "economy").journal), account);
+  return Array.isArray(raw) ? raw.map((x) => objOf(x) as unknown as JournalEntry) : [];
+}
+
+export function cycleOf(state: Readonly<WorldState>, account: EntityId): CycleState | null {
+  const raw = objOf(own(objOf(sliceOf(state, "economy").cycles), account));
+  if (Object.keys(raw).length === 0) return null;
+  return {
+    closing: numOf(raw.closing),
+    interest: numOf(raw.interest),
+    fees: numOf(raw.fees),
+    minimum: numOf(raw.minimum),
+    due: numOf(raw.due),
+    paid: numOf(raw.paid),
+    at: numOf(raw.at),
+    apr: numOf(raw.apr),
+    stage: (DELINQUENCY_STAGES as readonly string[]).includes(strOf(raw.stage)) ? (strOf(raw.stage) as DelinquencyStage) : "current",
+    grace: raw.grace !== false,
+    past_due: numOf(raw.past_due),
+    lates: numOf(raw.lates),
+    penalty: raw.penalty === true,
+    ...(typeof raw.months_left === "number" ? { months_left: raw.months_left } : {}),
+    streak: numOf(raw.streak),
+    ontime: numOf(raw.ontime),
+    late30: numOf(raw.late30),
+    late60: numOf(raw.late60),
+    late90: numOf(raw.late90),
+  };
+}
+
+export function flowRunOf(state: Readonly<WorldState>, flow: string): FlowRunState {
+  const raw = objOf(own(objOf(sliceOf(state, "economy").flows), flow));
+  const retry = objOf(raw.retry);
+  return {
+    done: numOf(raw.done),
+    missed: numOf(raw.missed),
+    ...(typeof raw.last === "number" ? { last: raw.last } : {}),
+    ...(typeof retry.at === "number" ? { retry: { at: retry.at, left: numOf(retry.left), cents: numOf(retry.cents) } } : {}),
+    ...(numOf(raw.deferred) > 0 ? { deferred: numOf(raw.deferred) } : {}),
+    ...(raw.ended === true ? { ended: true } : {}),
+  };
+}
+
+/** Whether an account's opening balance has posted: recorded as opened, or (an account an older chat holds) its opener's money is open. */
+export function isOpened(state: Readonly<WorldState>, account: EntityId, opener: EntityId | null): boolean {
+  if (own(objOf(sliceOf(state, "economy").opened), account) === true) return true;
+  return opener !== null && Object.prototype.hasOwnProperty.call(state.materialized, `${opener}:money`);
+}
+
+/**
+ * The average daily balance accrual of an account: since when, the last change, and balance ×
+ * minutes so far; with a credit account's purchases (for rewards), cash advances (for their own
+ * interest) and payments since its statement, and, on a card without statements, what it owed when
+ * the period began (`owed`, absent on a first period).
+ */
+export function accrualOf(state: Readonly<WorldState>, account: EntityId): { from: number; at: number; sum: number; spent: number; advanced: number; advancedAt: number; paid: number; owed?: number } | null {
+  const raw = objOf(own(objOf(sliceOf(state, "economy").adb), account));
+  return typeof raw.from === "number" ? { from: raw.from, at: numOf(raw.at, raw.from), sum: numOf(raw.sum), spent: numOf(raw.spent), advanced: numOf(raw.advanced), advancedAt: numOf(raw.advanced_at), paid: numOf(raw.paid), ...(typeof raw.owed === "number" ? { owed: raw.owed } : {}) } : null;
+}
+
+/** The latest interest an account earned or charged (`economy.txn` lines of kind `interest`, those at one instant summed): its amount from the holder's side, and when. */
+export function lastInterestOf(state: Readonly<WorldState>, account: EntityId): { cents: number; at: number } | null {
+  const raw = objOf(own(objOf(sliceOf(state, "economy").interest), account));
+  return typeof raw.at === "number" ? { cents: numOf(raw.cents), at: raw.at } : null;
+}
+
+/** What an account's interest came to in a calendar year, from the monthly totals: earned (money in) or charged (money out). */
+export function interestInYear(state: Readonly<WorldState>, account: EntityId, year: number, way: "in" | "out"): number {
+  const months = objOf(own(objOf(sliceOf(state, "economy").totals), account));
+  const prefix = `${String(year).padStart(4, "0")}-`;
+  return Object.entries(months).reduce((sum, [key, month]) => (key.startsWith(prefix) ? sum + numOf(objOf(objOf(month).interest)[way]) : sum), 0);
+}
+
+/** The average balance over `[from, now]`, from the accrual (the current balance when nothing accrued). */
+export function averageBalance(state: Readonly<WorldState>, account: EntityId, now: number): number {
+  const a = accrualOf(state, account);
+  const b = balance(state, account);
+  if (!a || now <= a.from) return b;
+  return (a.sum + b * Math.max(0, now - a.at)) / (now - a.from);
+}
+
+export function spendOf(state: Readonly<WorldState>, card: EntityId, day: number): { purchase: number; atm: number } {
+  const raw = objOf(own(objOf(sliceOf(state, "economy").spend), card));
+  return numOf(raw.day, NaN) === day ? { purchase: numOf(raw.purchase), atm: numOf(raw.atm) } : { purchase: 0, atm: 0 };
+}
+
+// ---------------------------------------------------------------- reducers
+
+function pushCapped(list: JsonValue | undefined, entry: JsonValue, cap: number): JsonValue[] {
+  return [...(Array.isArray(list) ? list.slice(-(cap - 1)) : []), entry];
+}
+
+/**
+ * A posting's side as a journal line names it: an account in the world as the party holding it, an
+ * outside account of someone in the world as them, and anyone else as the posting named them.
+ */
+function partyOfSide(state: Readonly<WorldState>, side: string): string {
+  if (own(state.entities, side)?.kind === "account") return holdersOf(state, side).find((h) => own(state.entities, h)) ?? side;
+  const bare = side.startsWith(EXTERNAL_ACCOUNT_PREFIX) ? side.slice(EXTERNAL_ACCOUNT_PREFIX.length) : "";
+  return bare !== "" && own(state.entities, bare) ? bare : side;
+}
+
+/** Files one journal line, naming `other` as its other side, its month's total, an interest line as the account's latest interest, and the average-daily-balance accrual. */
+function fileLine(state: WorldState, ctx: ReadContext, account: EntityId, amount: number, at: number, data: JsonObject, other: string, seq: number): void {
+  const journal = sliceRecord(state, "economy", "journal");
+  const status = data.status === "pending" ? "pending" : "posted";
+  const entry: JsonObject = { id: `j${seq}`, at, account, cents: amount, memo: strOf(data.memo), status };
+  for (const k of ["kind", "category", "card", "flow"] as const) if (typeof data[k] === "string" && data[k] !== "") entry[k] = data[k];
+  // Who made it for the organization it was made as (`by`, `as`: ORG-SPEC §3.6), on that organization's own lines; a recorded posting names neither.
+  if (typeof data.by === "string" && data.by !== "" && typeof data.as === "string" && holdersOf(state, account).includes(data.as)) entry.by = data.by;
+  if (other !== "") entry.counterparty = other;
+  if (status === "pending" && typeof data.settles === "number") entry.settles = data.settles;
+  journal[account] = pushCapped(journal[account], entry, JOURNAL_CAP);
+
+  const totals = sliceRecord(state, "economy", "totals");
+  const months = objOf(totals[account]);
+  const key = monthKey(ctx, at);
+  const month = objOf(months[key]);
+  const category = strOf(data.category) || "other";
+  const cell = objOf(month[category]);
+  month[category] = { in: numOf(cell.in) + Math.max(0, amount), out: numOf(cell.out) + Math.max(0, -amount) };
+  months[key] = month;
+  for (const old of Object.keys(months).sort().slice(0, -MONTHS_KEPT)) delete months[old];
+  totals[account] = months;
+
+  if (data.kind === "interest") {
+    const latest = sliceRecord(state, "economy", "interest");
+    const before = objOf(latest[account]);
+    latest[account] = { cents: (numOf(before.at, NaN) === at ? numOf(before.cents) : 0) + amount, at };
+  }
+}
+
+function accrue(state: WorldState, account: EntityId, amount: number, at: number, use: "purchase" | "advance" | null): void {
+  const adb = sliceRecord(state, "economy", "adb");
+  const cur = objOf(adb[account]);
+  const before = balance(state, account) - amount;
+  const spent = use === "purchase" ? -amount : 0;
+  // Cash advances, and each one's amount times the minutes into the period it was drawn, so its interest runs from that day.
+  const drawn = use === "advance" ? -amount : 0;
+  const since = typeof cur.from === "number" ? cur.from : at;
+  const advanced = numOf(cur.advanced) + drawn;
+  const advances: JsonObject = advanced !== 0 ? { advanced, advanced_at: numOf(cur.advanced_at) + drawn * (at - since) } : {};
+  if (typeof cur.from !== "number") {
+    adb[account] = { from: at, at, sum: 0, spent, ...advances };
+    return;
+  }
+  const last = numOf(cur.at, cur.from);
+  const dt = Math.max(0, at - last);
+  // A card without statements keeps, through its period, what it owed when the period began and what was paid toward it since.
+  const period: JsonObject = { ...(typeof cur.paid === "number" ? { paid: cur.paid } : {}), ...(typeof cur.owed === "number" ? { owed: cur.owed } : {}) };
+  adb[account] = { from: cur.from, at: Math.max(last, at), sum: numOf(cur.sum) + before * dt, spent: numOf(cur.spent) + spent, ...advances, ...period };
+}
+
+function isCreditAccount(ctx: ReadContext, account: EntityId): boolean {
+  const c = classOf(ctx, account);
+  return c !== null && isCredit(c);
+}
+
+/** What a delinquency stage, an account's status and a credit history entry say, as the Journal words them (the lines `word_stage_*`, `word_status_*`, `word_credit_*`); an id the lines lack reads as the id in words. */
+const wordOf = (family: string, id: string): string => say(`word_${family}_${id}`) || id.replace(/_/g, " ");
+
+/** Whose a person's line is: the person it is for, or another's (the lines `word_whose_you` and `word_whose`). */
+function whoseFor(ctx: ReadContext, viewer: EntityId | undefined, person: string): string {
+  return viewer === person ? say("word_whose_you") : say("word_whose", { name: own(ctx.state.entities, person)?.name ?? person });
+}
+
+export const EVENTS: EventTypeDef<PackEvent>[] = [
+  {
+    // A worth the economy fixed for someone it keeps no accounts for. One with no band takes the fixed worth off (an Undo of the
+    // first one), so the worth is read from the person's band again.
+    type: FINANCE_EVENTS.anchor,
+    validate: (e, ctx) => (own(ctx.state.entities, str(e, "entity")) && (str(e, "band") === "" || (typeof e.data.typical === "number" && typeof e.data.base === "number")) ? null : reject("bad_event", say("why_anchor_needs_entity_typical_and_base"))),
+    apply: (e, state) => {
+      const anchors = sliceRecord(state, "economy", "anchors");
+      if (str(e, "band") === "") delete anchors[str(e, "entity")];
+      else anchors[str(e, "entity")] = { band: str(e, "band"), typical: numOf(e.data.typical), base: numOf(e.data.base) };
+    },
+    describe: (e) => (str(e, "band") === "" ? say("money_worth_free", { entity: str(e, "entity") }) : say("money_worth_band", { entity: str(e, "entity"), band: str(e, "band") })),
+    // An anchor is an assignment: in a record only the last per entity matters.
+    coarsen: { key: (e) => str(e, "entity"), merge: (_a, b) => b },
+  },
+  {
+    // A posting's journal lines, one per account in the world it touches, filed with the account.
+    type: FINANCE_EVENTS.txn,
+    validate: () => null,
+    apply: (e, state, ctx) => {
+      const lines = Array.isArray(e.data.lines) ? e.data.lines.map((l) => objOf(l)) : [];
+      const at = typeof e.data.at === "number" ? e.data.at : state.clock;
+      const s = mutableSlice(state, "economy");
+      let seq = numOf(s.seq);
+      const totals = new Map<string, number>();
+      for (const l of lines) {
+        const account = strOf(l.account);
+        if (!own(state.entities, account)) continue;
+        totals.set(account, (totals.get(account) ?? 0) + Math.round(numOf(l.amount)));
+      }
+      // Each line names the side opposite it: whoever the money went to, for money out, and whoever
+      // it came from, for money in. An event from before postings named their payer names only the
+      // payee: money in then names whoever in the world paid most of it, where the posting shows them.
+      const sided = !UNSIDED_KINDS.has(strOf(e.data.kind));
+      const payee = sided ? strOf(e.data.counterparty) : "";
+      const paidMost = [...totals].reduce<[string, number] | undefined>((top, l) => (l[1] < 0 && (top === undefined || l[1] < top[1]) ? l : top), undefined)?.[0];
+      const payer = sided ? strOf(e.data.payer) || (paidMost ?? payee) : "";
+      for (const [account, amount] of totals) {
+        seq += 1;
+        fileLine(state, ctx, account, amount, at, e.data, partyOfSide(state, amount < 0 ? payee : payer), seq);
+        // What a credit account's line was: a purchase earns rewards, a cash advance its own interest.
+        const use = !isCreditAccount(ctx, account) ? null : e.data.kind === "purchase" ? "purchase" : e.data.category === "cash_advance" && e.data.kind !== "fee" && amount < 0 ? "advance" : null;
+        accrue(state, account, amount, at, use);
+      }
+      mutableSlice(state, "economy").seq = seq;
+    },
+    describe: (e) => str(e, "memo"),
+  },
+  {
+    // Someone's payday, bill or decline note, kept for the GM view. It is secret, so it never becomes
+    // a player line, and it isn't a signal, so it never stops or joins the POV's timelapse.
+    type: FINANCE_EVENTS.note,
+    validate: (e, ctx) => (own(ctx.state.entities, str(e, "entity")) && str(e, "text") !== "" ? null : reject("bad_event", say("why_a_money_note_needs_a_party_and"))),
+    apply: (e, state) => {
+      const notes = sliceRecord(state, "economy", "notes");
+      notes[str(e, "entity")] = pushCapped(notes[str(e, "entity")], { at: typeof e.data.at === "number" ? e.data.at : state.clock, class: str(e, "class"), text: str(e, "text") }, NOTES_CAP);
+    },
+    describe: (e) => str(e, "text"),
+    // The note comes off the party's notes.
+    reverse: (e, _before, now) => {
+      const entity = str(e, "entity");
+      const entry = newestOf(own(objOf(sliceOf(now, "economy").notes), entity), (n) => isRecord(n) && n.text === str(e, "text") && n.class === str(e, "class") && (typeof e.data.at !== "number" || n.at === e.data.at));
+      return entry === undefined ? [] : [unlisting("economy", ["notes", entity], entry)];
+    },
+  },
+  {
+    // A price multiplier (festival, storm, scarcity) by category and place, until a time or until replaced.
+    type: FINANCE_EVENTS.modifier,
+    validate: (e) => (str(e, "id") !== "" && (e.data.mult === undefined || (typeof e.data.mult === "number" && e.data.mult > 0)) ? null : reject("bad_event", say("why_a_price_modifier_needs_an_id_and"))),
+    apply: (e, state) => {
+      const mods = sliceRecord(state, "economy", "modifiers");
+      if (typeof e.data.mult !== "number") delete mods[str(e, "id")];
+      else mods[str(e, "id")] = { scope: strOf(e.data.scope, "all"), place: strOf(e.data.place), mult: e.data.mult, ...(typeof e.data.until === "number" ? { until: e.data.until } : {}) };
+    },
+    describe: (e) => (typeof e.data.mult === "number" ? say("money_prices_mult", { mult: e.data.mult }) : say("money_prices_normal")),
+  },
+  {
+    // A credit account's statement closes: the cycle's whole state, and its accrual starts again.
+    type: FINANCE_EVENTS.statement,
+    validate: (e, ctx) => (isCreditAccount(ctx, str(e, "account")) ? null : reject("bad_event", say("why_statements_are_for_credit_accounts"))),
+    apply: (e, state) => {
+      const account = str(e, "account");
+      const at = typeof e.data.at === "number" ? e.data.at : state.clock;
+      const d = e.data;
+      const cycle: JsonObject = { closing: numOf(d.closing), interest: numOf(d.interest), fees: numOf(d.fees), minimum: numOf(d.minimum), due: numOf(d.due), paid: 0, at, apr: numOf(d.apr), stage: strOf(d.stage, "current"), grace: d.grace !== false, past_due: numOf(d.past_due), lates: numOf(d.lates), penalty: d.penalty === true };
+      for (const k of ["months_left", "streak", "ontime", "late30", "late60", "late90"] as const) if (typeof d[k] === "number") cycle[k] = d[k];
+      const cycles = sliceRecord(state, "economy", "cycles");
+      // The statement before stays in the account's history, as it ended.
+      if (cycles[account] !== undefined) {
+        const past = sliceRecord(state, "economy", "statements");
+        past[account] = pushCapped(past[account], cycles[account] as JsonValue, STATEMENTS_KEPT);
+      }
+      cycles[account] = cycle;
+      sliceRecord(state, "economy", "adb")[account] = { from: at, at, sum: 0, spent: 0 };
+    },
+    describe: (e, ctx) => say("money_statement_closed", { closing: formatMoney(numOf(e.data.closing), ctx.world.currency), minimum: formatMoney(numOf(e.data.minimum), ctx.world.currency) }),
+  },
+  {
+    // A payment toward a credit account's statement, or, on a card without statements, toward what it owed when its period began.
+    type: FINANCE_EVENTS.cardPaid,
+    validate: (e, ctx) => (isCreditAccount(ctx, str(e, "account")) ? null : reject("bad_event", say("why_statement_payments_are_for_credit_accounts"))),
+    apply: (e, state) => {
+      const cycles = sliceRecord(state, "economy", "cycles");
+      const account = str(e, "account");
+      const cur = objOf(cycles[account]);
+      if (Object.keys(cur).length > 0) cycles[account] = { ...cur, paid: numOf(cur.paid) + numOf(e.data.cents) };
+      const period = objOf(own(objOf(sliceOf(state, "economy").adb), account));
+      if (typeof period.owed === "number") sliceRecord(state, "economy", "adb")[account] = { ...period, paid: numOf(period.paid) + numOf(e.data.cents) };
+    },
+    describe: (e, ctx) => say("money_card_payment", { amount: formatMoney(numOf(e.data.cents), ctx.world.currency) }),
+    // What it counted as paid comes off the statement, and off the period's, where it counted.
+    reverse: (e, _before, now) => {
+      const account = str(e, "account");
+      const eco = sliceOf(now, "economy");
+      const cents = numOf(e.data.cents);
+      return [
+        ...(typeof objOf(own(objOf(eco.cycles), account)).paid === "number" ? [bumping("economy", ["cycles", account, "paid"], -cents)] : []),
+        ...(typeof objOf(own(objOf(eco.adb), account)).owed === "number" ? [bumping("economy", ["adb", account, "paid"], -cents)] : []),
+      ];
+    },
+  },
+  {
+    // A credit account moves to a delinquency stage, or back to current.
+    type: FINANCE_EVENTS.delinquency,
+    validate: (e, ctx) => (isCreditAccount(ctx, str(e, "account")) && (DELINQUENCY_STAGES as readonly string[]).includes(str(e, "stage")) ? null : reject("bad_event", say("why_a_delinquency_stage_needs_a_credit_account"))),
+    apply: (e, state) => {
+      const cycles = sliceRecord(state, "economy", "cycles");
+      const account = str(e, "account");
+      const cur = objOf(cycles[account]);
+      const next: JsonObject = { ...cur, stage: str(e, "stage"), past_due: numOf(e.data.past_due), lates: numOf(e.data.lates), penalty: e.data.penalty === true };
+      for (const k of ["streak", "ontime", "late30", "late60", "late90"] as const) if (typeof e.data[k] === "number") next[k] = e.data[k];
+      cycles[account] = next;
+    },
+    describe: (e, ctx) => say("money_stage", { account: own(ctx.state.entities, str(e, "account"))?.name ?? str(e, "account"), stage: wordOf("stage", str(e, "stage")) }),
+    coarsen: { key: (e) => str(e, "account"), merge: (_a, b) => b },
+  },
+  {
+    // What one occurrence of a flow did; carries the flow's whole run state after it.
+    type: FINANCE_EVENTS.flowRun,
+    validate: (e) => (str(e, "flow") !== "" && typeof e.data.state === "object" ? null : reject("bad_event", say("why_a_flow_run_needs_its_flow_and"))),
+    apply: (e, state) => {
+      sliceRecord(state, "economy", "flows")[str(e, "flow")] = objOf(e.data.state);
+    },
+    describe: (e) => say("money_flow_outcome", { flow: str(e, "label") || str(e, "flow"), outcome: str(e, "outcome") }),
+    coarsen: { key: (e) => str(e, "flow"), merge: (_a, b) => b },
+  },
+  {
+    // A standing payment renamed in play: the flow entity's name, which its journal lines and views show.
+    type: FINANCE_EVENTS.flowRenamed,
+    validate: (e, ctx) => {
+      const name = str(e, "name");
+      return own(ctx.state.entities, str(e, "flow"))?.kind === "flow" && name.trim() !== "" && name.length <= 80 ? null : reject("bad_event", say("why_a_rename_needs_a_standing_payment_and"));
+    },
+    apply: (e, state) => {
+      const flow = own(state.entities, str(e, "flow"));
+      if (flow) flow.name = str(e, "name");
+    },
+    describe: (e, _ctx, viewer) => (viewer ? "" : say("money_flow_renamed", { name: str(e, "name") })),
+    // Play's name, so an Upgrade that renames the flow too keeps the chat's.
+    touches: (e) => [{ entity: str(e, "flow"), aspect: "name" }],
+    coarsen: { key: (e) => str(e, "flow"), merge: (_a, b) => b },
+    // The flow gets the name it had before.
+    reverse: (e, before, now) => {
+      const flow = str(e, "flow");
+      if (own(now.entities, flow)?.name !== str(e, "name")) return "changed_since";
+      const was = own(before.entities, flow)?.name;
+      return was === undefined ? "not_reversible" : [{ type: FINANCE_EVENTS.flowRenamed, data: { flow, name: was } }];
+    },
+  },
+  {
+    // Money set aside on an account (a deposit not yet available, a card authorisation), or a hold let go.
+    type: FINANCE_EVENTS.hold,
+    validate: (e, ctx) => {
+      const account = str(e, "account");
+      if (!own(ctx.state.entities, account) || str(e, "id") === "") return reject("bad_event", say("why_a_hold_needs_an_account_and_an"));
+      if (e.data.release === true) return null;
+      const cents = numOf(e.data.cents);
+      if (!(cents > 0) || typeof e.data.until !== "number") return reject("bad_event", say("why_a_hold_needs_an_amount_and_an"));
+      return e.data.kind === "authorization" && availableOf(ctx, account) < cents ? reject("declined", say("why_account_cant_cover_currency", { account: own(ctx.state.entities, account)?.name ?? account, currency: formatMoney(cents, ctx.world.currency) })) : null;
+    },
+    apply: (e, state) => {
+      const holds = sliceRecord(state, "economy", "holds");
+      const account = str(e, "account");
+      const mine = objOf(holds[account]);
+      for (const [id, h] of Object.entries(mine)) if (numOf(objOf(h).until) <= state.clock) delete mine[id];
+      if (e.data.release === true) delete mine[str(e, "id")];
+      else mine[str(e, "id")] = { cents: Math.round(numOf(e.data.cents)), until: numOf(e.data.until), kind: e.data.kind === "authorization" ? "authorization" : "deposit", memo: str(e, "memo") };
+      holds[account] = mine;
+    },
+    describe: (e, ctx) => (e.data.release === true ? say("money_hold_released") : say("money_hold", { amount: formatMoney(numOf(e.data.cents), ctx.world.currency) })),
+  },
+  {
+    // An account's pending journal lines up to a time post.
+    type: FINANCE_EVENTS.settle,
+    validate: (e, ctx) => (own(ctx.state.entities, str(e, "account")) && typeof e.data.upto === "number" ? null : reject("bad_event", say("why_settling_needs_an_account_and_a_time"))),
+    apply: (e, state) => {
+      const journal = sliceRecord(state, "economy", "journal");
+      const account = str(e, "account");
+      const upto = numOf(e.data.upto);
+      const list = Array.isArray(journal[account]) ? journal[account] : [];
+      journal[account] = list.map((x) => {
+        const o = objOf(x);
+        if (o.status !== "pending" || numOf(o.settles) > upto) return x;
+        const { settles: _settles, ...rest } = o;
+        return { ...rest, status: "posted" };
+      });
+    },
+    describe: () => say("money_card_posted"),
+    coarsen: { key: (e) => str(e, "account"), merge: (_a, b) => b },
+  },
+  {
+    // Something enters a person's credit history.
+    type: FINANCE_EVENTS.credit,
+    validate: (e, ctx) => (own(ctx.state.entities, str(e, "person")) && str(e, "kind") !== "" ? null : reject("bad_event", say("why_a_credit_entry_needs_a_person_and"))),
+    apply: (e, state) => {
+      const credit = sliceRecord(state, "economy", "credit");
+      const person = str(e, "person");
+      const cur = objOf(credit[person]);
+      const { person: _person, ...entry } = e.data;
+      credit[person] = { ...cur, entries: pushCapped(cur.entries, { ...entry, at: typeof e.data.at === "number" ? e.data.at : state.clock }, CREDIT_CAP) };
+    },
+    // A credit report is its person's alone: the player reads their own, never anyone else's.
+    describe: (e, ctx, viewer) => (viewer !== undefined && viewer !== str(e, "person") ? "" : say("money_credit_report", { whose: whoseFor(ctx, viewer, str(e, "person")), kind: wordOf("credit", str(e, "kind")) })),
+    // The entry comes off the person's credit history.
+    reverse: (e, _before, now) => {
+      const person = str(e, "person");
+      const entry = newestOf(objOf(own(objOf(sliceOf(now, "economy").credit), person)).entries, (n) => isRecord(n) && n.kind === e.data.kind && n.account === e.data.account && n.note === e.data.note && (typeof e.data.at !== "number" || n.at === e.data.at));
+      return entry === undefined ? [] : [unlisting("economy", ["credit", person, "entries"], entry)];
+    },
+  },
+  {
+    // A person's monthly score.
+    type: FINANCE_EVENTS.score,
+    validate: (e, ctx) => (own(ctx.state.entities, str(e, "person")) && typeof e.data.score === "number" ? null : reject("bad_event", say("why_a_score_needs_a_person_and_a"))),
+    apply: (e, state) => {
+      const credit = sliceRecord(state, "economy", "credit");
+      const person = str(e, "person");
+      const cur = objOf(credit[person]);
+      const at = typeof e.data.at === "number" ? e.data.at : state.clock;
+      credit[person] = { ...cur, score: numOf(e.data.score), factors: objOf(e.data.factors), at, history: pushCapped(cur.history, { at, score: numOf(e.data.score) }, SCORES_KEPT) };
+    },
+    describe: (e, ctx, viewer) => (viewer !== undefined && viewer !== str(e, "person") ? "" : say("money_credit_score", { whose: whoseFor(ctx, viewer, str(e, "person")), score: numOf(e.data.score) })),
+  },
+  {
+    // A card's spending today: its new totals (an assignment, so a record keeps only the last).
+    type: FINANCE_EVENTS.spend,
+    validate: (e, ctx) => (own(ctx.state.entities, str(e, "card")) && typeof e.data.day === "number" ? null : reject("bad_event", say("why_card_spending_needs_a_card_and_a"))),
+    apply: (e, state) => {
+      sliceRecord(state, "economy", "spend")[str(e, "card")] = { day: numOf(e.data.day), purchase: numOf(e.data.purchase), atm: numOf(e.data.atm) };
+    },
+    describe: () => say("money_card_spending"),
+    coarsen: { key: (e) => str(e, "card"), merge: (_a, b) => b },
+  },
+  {
+    // Accounts whose opening balances have posted. Each opens once. With `close`, opened accounts close again (an Undo of what
+    // opened them), so they open again when their opening balances next post.
+    type: FINANCE_EVENTS.open,
+    validate: (e, ctx) => {
+      const list = Array.isArray(e.data.accounts) ? e.data.accounts : [];
+      const opened = objOf(sliceOf(ctx.state, "economy").opened);
+      const closing = e.data.close === true;
+      for (const a of list) {
+        if (typeof a !== "string" || !own(ctx.state.entities, a)) return reject("bad_event", say("why_only_accounts_open"));
+        if (!closing && own(opened, a) === true) return reject("opened", say("why_name_is_already_open", { name: own(ctx.state.entities, a)?.name ?? a }));
+        if (closing && own(opened, a) !== true) return reject("not_opened", say("why_name_is_not_open", { name: own(ctx.state.entities, a)?.name ?? a }));
+      }
+      return list.length > 0 ? null : reject("bad_event", say("why_nothing_to_open"));
+    },
+    apply: (e, state) => {
+      const opened = sliceRecord(state, "economy", "opened");
+      for (const a of Array.isArray(e.data.accounts) ? e.data.accounts : []) {
+        if (typeof a !== "string") continue;
+        if (e.data.close === true) delete opened[a];
+        else opened[a] = true;
+      }
+    },
+    describe: (e) => say(e.data.close === true ? "money_accounts_closed" : "money_accounts_opened"),
+    // Opened accounts close again, closed ones open again (an Undo of either).
+    reverse: (e, _before, now) => {
+      const opened = objOf(sliceOf(now, "economy").opened);
+      const closing = e.data.close === true;
+      const accounts = (Array.isArray(e.data.accounts) ? e.data.accounts : []).filter((a): a is string => typeof a === "string" && (own(opened, a) === true) !== closing);
+      return accounts.length > 0 ? [{ type: FINANCE_EVENTS.open, data: { accounts, ...(closing ? {} : { close: true }) } }] : [];
+    },
+  },
+  {
+    type: FINANCE_EVENTS.status,
+    validate: (e, ctx) => (own(ctx.state.entities, str(e, "account"))?.kind === "account" && (ACCOUNT_STATUSES as readonly string[]).includes(str(e, "status")) ? null : reject("bad_event", say("why_a_status_needs_an_account_and_a"))),
+    apply: (e, state) => {
+      sliceRecord(state, "economy", "status")[str(e, "account")] = str(e, "status") as AccountStatus;
+    },
+    describe: (e, ctx) => say("money_status", { account: own(ctx.state.entities, str(e, "account"))?.name ?? str(e, "account"), status: wordOf("status", str(e, "status")) }),
+    coarsen: { key: (e) => str(e, "account"), merge: (_a, b) => b },
+  },
+  {
+    // An interest period ends: the account's average daily balance starts again, and a card without statements keeps what it owed then.
+    type: FINANCE_EVENTS.accrue,
+    validate: (e, ctx) => (own(ctx.state.entities, str(e, "account")) && typeof e.data.at === "number" && (e.data.owed === undefined || (typeof e.data.owed === "number" && Number.isFinite(e.data.owed))) ? null : reject("bad_event", say("why_an_accrual_needs_an_account_and_a"))),
+    apply: (e, state) => {
+      const at = numOf(e.data.at);
+      sliceRecord(state, "economy", "adb")[str(e, "account")] = { from: at, at, sum: 0, spent: 0, ...(typeof e.data.owed === "number" ? { owed: e.data.owed } : {}) };
+    },
+    describe: () => say("money_interest_period"),
+  },
+  // A decline recorded by an older build: it moves nothing.
+  { type: FINANCE_EVENTS.decline, validate: () => null, apply: () => undefined, describe: (e) => say("money_declined", { memo: str(e, "memo"), reason: str(e, "reason") }) },
+];

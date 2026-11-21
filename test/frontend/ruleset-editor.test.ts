@@ -1,0 +1,124 @@
+import { describe, expect, test } from "bun:test";
+import { moved, parseThresholds, progressionFields, rowChoices, sectionId, tableThresholds, tidyRuleset } from "../../src/frontend/build/ruleset-editor";
+import { sheetPreviewRequest } from "../../src/frontend/requests";
+import { floorNote } from "../../src/frontend/build/world-policies";
+import { DOMAIN_LABEL } from "../../src/shared/ids";
+import { previewSheet } from "../../src/engine/authoring";
+import { createRegistry } from "../../src/engine/registry-impl";
+import { thresholdsOf } from "../../src/engine/ruleset";
+import { ALL_PACKS } from "../../src/packs/index";
+import type { RulesetDef, WorldDoc } from "../../src/shared/world";
+import { baseWorld } from "../packs/support";
+
+/** A world whose POV is a hero: an inherited field, a derived one and a pool. */
+function heroWorld(): WorldDoc {
+  const world = baseWorld();
+  world.kinds.hero = {
+    id: "hero",
+    label: "Hero",
+    extends: "person",
+    fields: {
+      might: { type: "number", label: "Might", default: 14 },
+      might_mod: { type: "number", label: "Might mod", derived: "floor((self.might - 10) / 2)" },
+      hp: { type: "number", label: "Hit points", pool: { max: "10 + self.might_mod" } },
+      xp: { type: "number", default: 350 },
+      level: { type: "number", default: 1 },
+    },
+  };
+  const pov = world.entities[world.pov];
+  if (pov) pov.kind = "hero";
+  return world;
+}
+
+describe("Sheet Designer helpers", () => {
+  test("moving a row or section swaps it with its neighbour and stops at either end", () => {
+    expect(moved(["a", "b", "c"], 1, -1)).toEqual(["b", "a", "c"]);
+    expect(moved(["a", "b", "c"], 1, 1)).toEqual(["a", "c", "b"]);
+    expect(moved(["a", "b", "c"], 0, -1)).toEqual(["a", "b", "c"]);
+    expect(moved(["a", "b", "c"], 2, 1)).toEqual(["a", "b", "c"]);
+  });
+
+  test("a new section's id comes from its label and never repeats one already taken", () => {
+    expect(sectionId("Skills & Feats", [])).toBe("skills_feats");
+    expect(sectionId("Skills", ["skills"])).toBe("skills_2");
+    expect(sectionId("Skills", ["skills", "skills_2"])).toBe("skills_3");
+    expect(sectionId("!!!", [])).toBe("section");
+  });
+
+  test("rows offer the POV kind's own, inherited and derived fields, its pools, and the progressions as edited", () => {
+    const choices = rowChoices(heroWorld(), { character: { label: "Level", xpField: "xp", levelField: "level", thresholds: [0, 300] } });
+    const fields = choices.fields.map((c) => c.value);
+    expect(fields).toContain("might");
+    expect(fields).toContain("might_mod");
+    expect(fields).toContain("skill");
+    expect(choices.fields.find((c) => c.value === "might_mod")?.label).toContain("derived");
+    expect(choices.pools.map((c) => c.value)).toEqual(["hp"]);
+    expect(choices.progressions.map((c) => c.value)).toEqual(["character"]);
+  });
+
+  test("an emptied sheet, progression or floor set saves as no such part, and other ruleset keys are kept", () => {
+    const ruleset = { sheet: { sections: [] }, progression: {}, minLevels: {}, adjudication: { mode: "check" } } as unknown as RulesetDef;
+    expect(tidyRuleset(ruleset)).toEqual({ adjudication: { mode: "check" } });
+    expect(tidyRuleset({ sheet: { sections: [] } })).toEqual({});
+  });
+
+  test("the live preview asks for the edited ruleset on the draft, and the engine builds the POV's sheet from it", () => {
+    const world = heroWorld();
+    const ruleset: RulesetDef = {
+      progression: { character: { label: "Level", xpField: "xp", levelField: "level", thresholds: [0, 300, 900] } },
+      sheet: { sections: [{ id: "vitals", label: "Vitals", rows: [{ pool: "hp" }, { progression: "character" }, { field: "might_mod" }, { formula: "self.might * 2", label: "Twice might" }] }] },
+    };
+    const request = sheetPreviewRequest(world.id, tidyRuleset(ruleset));
+    expect(request).toEqual({ type: "lre.world", op: "sheet", worldId: world.id, ruleset: tidyRuleset(ruleset) });
+    expect(sheetPreviewRequest(world.id, {}, "dev")).toMatchObject({ entity: "dev" });
+    const sheet = previewSheet(createRegistry(ALL_PACKS), { ...world, ruleset: request.op === "sheet" ? (request.ruleset as unknown as RulesetDef) : undefined });
+    expect(sheet?.[0]?.rows.map((r) => [r.label, r.value])).toEqual([
+      ["Hit points", "12 / 12"],
+      ["Level", "1"],
+      ["Might mod", "2"],
+      ["Twice might", "28"],
+    ]);
+  });
+});
+
+describe("progression editor helpers", () => {
+  test("XP and level pickers offer only number fields the engine can set, of the kind with its inherited fields", () => {
+    const world = heroWorld();
+    const ids = progressionFields(world, "hero").map((c) => c.value);
+    expect(ids).toEqual(expect.arrayContaining(["might", "xp", "level", "hp", "skill", "stress"]));
+    expect(ids).not.toContain("might_mod");
+    expect(ids).not.toContain("activity");
+    // With no kind named, any kind's number fields, each once.
+    const any = progressionFields(world, undefined).map((c) => c.value);
+    expect(any).toContain("xp");
+    expect(new Set(any).size).toBe(any.length);
+  });
+
+  test("thresholds read as numbers separated by commas or spaces, and anything else is refused", () => {
+    expect(parseThresholds("0, 300, 900")).toEqual([0, 300, 900]);
+    expect(parseThresholds("0 300\n900;2700")).toEqual([0, 300, 900, 2700]);
+    expect(parseThresholds("")).toEqual([]);
+    expect(parseThresholds("0, three")).toBeNull();
+  });
+
+  test("switching thresholds from a table to a list keeps the column's numbers in row order, as the engine reads them", () => {
+    const world = heroWorld();
+    world.tables.levels = { id: "levels", pack: "sheets", schema: "lre-table/levels/v1", revision: "r1", label: "Levels", columns: { xp: { type: "int" }, title: { type: "text" } }, rows: { l1: { xp: 0, title: "Novice" }, l2: { xp: 300, title: "Adept" }, l3: { xp: "?", title: "Odd" }, l4: { xp: 900, title: "Master" } } };
+    const ref = { table: "levels", column: "xp" };
+    expect(tableThresholds(world, ref)).toEqual([0, 300, 900]);
+    expect(tableThresholds(world, ref)).toEqual(thresholdsOf(world, { label: "Level", xpField: "xp", levelField: "level", thresholds: ref }));
+    expect(tableThresholds(world, { table: "missing", column: "xp" })).toEqual([]);
+    expect(tableThresholds(world, { table: "levels", column: "__proto__" })).toEqual([]);
+  });
+});
+
+describe("realism floors", () => {
+  test("a world whose ruleset sets no floor above 0 says nothing; otherwise each floored domain is named with its level", () => {
+    expect(floorNote({})).toBeNull();
+    expect(floorNote({ sheets: 0 })).toBeNull();
+    const note = floorNote({ sheets: 3, money: 2 }) ?? "";
+    expect(note).toContain(`${DOMAIN_LABEL.sheets} 3`);
+    expect(note).toContain(`${DOMAIN_LABEL.money} 2`);
+    expect(note).not.toContain(DOMAIN_LABEL.gear);
+  });
+});

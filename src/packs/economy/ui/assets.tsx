@@ -1,0 +1,713 @@
+// Money → Assets (DESIGN §27, ORG-SPEC §5.1): what the party's worth is made of; its investments,
+// holdings with their value, cost and gain (lots and realised gains in the full books), how their
+// prices have done, options, where distributions go, and the stock market where the world keeps its
+// history; the property it owns, with its value, equity, mortgage, leases and running costs, and
+// what's for sale; its stakes in organizations, which open their Ownership in Orgs; and its
+// vehicles, in the Garage. Each holding and property opens its own page, and each control there
+// its own page with Back and one button. The player buys and sells, exercises options, routes
+// distributions, lets and sells property and buys what's for sale, each an in-world action offered
+// only where the feature runs for them; the GM sets prices, routes and every declared field.
+
+import type { ComponentChildren } from "preact";
+import { useState } from "preact/hooks";
+import { ROLE_RIGHTS, type DistributionRoute, type FinanceView, type HoldingView, type IndexView, type LeaseView, type PerformanceView, type PropertyView } from "../../../shared/finance";
+import { formatMoney, type WorldCurrency } from "../../../shared/world";
+import { Badge, Button, Empty, IdText, List, ListRow, Section } from "../../../frontend/components";
+import { humanize } from "../../../frontend/format";
+import { FlowListRow } from "./flows";
+import { ActionPage, AmountField, AmountPage, amountProblem, ChoiceField, NumberField, SelectField, TextField, ToggleField, type ChoiceOption } from "./forms";
+import type { HubControls, SectionProps, SegmentProps } from "./hub";
+import { endableLeases, holdingControls, investmentBlocks, knownPeople, mortgageTermChoices, moveSources, overviewBlocks, propertyControls, ROUTE_ELSEWHERE, routePick, stakesOf, transferTargets, type HoldingControl, type PropertyControl } from "./layout";
+import { FieldsPage } from "./lines";
+import { actionPage, Controls, detailPage, Hero, MoneyPage, Note, type HubNav, type HubPage, type HubPages } from "./nav";
+import { amountOf, exerciseAction, leaseEndAction, leaseStartAction, newIdFor, propertyBuyAction, propertyMakeOps, propertySellAction, propertySpawnOps, routeAction, routeOps, setPriceOps, tradeAction, type RouteTarget, type TradeForm } from "./requests";
+
+/** A gain or a loss with its sign: "+$12.00", "-$3.50". */
+function signed(cents: number, currency: WorldCurrency): string {
+  return `${cents > 0 ? "+" : ""}${formatMoney(cents, currency)}`;
+}
+
+/**
+ * A row naming an account (a holding's, a mortgage), which opens that account's page when it's
+ * one of the party's; another owner's account is named in words and opens nothing.
+ */
+function AccountRow(props: { view: FinanceView; nav: HubNav; id: string; title: string; subtitle?: string; value?: ComponentChildren; valueTone?: "pos" | "neg" | "warn" | "muted" }) {
+  const account = props.view.accounts.find((a) => a.id === props.id);
+  const nav = props.nav;
+  return <ListRow icon="bank" title={props.title} subtitle={props.subtitle === "" ? undefined : props.subtitle} value={props.value ?? account?.name ?? "Another account"} valueTone={props.valueTone} chevron={account !== undefined} onClick={account ? () => nav.open(detailPage("account", account.id)) : undefined} />;
+}
+
+// ---------------------------------------------------------------- where payouts go
+
+/** Where distributions can go: the usual place (the account's cash, else the deposit account), reinvested (holdings only), one of the party's accounts, and another owner's account when that's the one in force (shown, never picked). */
+function routeChoices(view: FinanceView, reinvest: boolean, pick: string): ChoiceOption[] {
+  return [
+    { value: " ", label: "The usual place", detail: "Its account's cash, else the deposit account" },
+    ...(reinvest ? [{ value: "reinvest", label: "Reinvested" }] : []),
+    ...view.accounts.filter((a) => a.role !== null && ROLE_RIGHTS[a.role].sees).map((a) => ({ value: a.id, label: a.name })),
+    ...(pick === ROUTE_ELSEWHERE ? [{ value: ROUTE_ELSEWHERE, label: "Another owner's account", detail: "Where it goes now; you can't pick it" }] : []),
+  ];
+}
+
+/**
+ * Where a holding's dividends, a property's rent or a business share's profit go now (`routePick`),
+ * as a row that opens its page: routing is the player's action from Money 3, and the GM's edit for
+ * the party at any level; on an organization's own money it's only said.
+ */
+export function RouteRow(props: { view: FinanceView; controls: HubControls; nav: HubNav; route: DistributionRoute | null; reinvest: boolean; label: string; page: HubPage }) {
+  const { view, controls } = props;
+  if (controls.mode === "player" && view.level < 3) return null;
+  const pick = routePick(props.route);
+  const shown = routeChoices(view, props.reinvest, pick).find((c) => c.value === pick)?.label ?? view.accounts.find((a) => a.id === pick)?.name ?? "Not set";
+  const opens = controls.mode !== "read";
+  return (
+    <Section flush>
+      <List>
+        <ListRow icon="route" title={props.label} value={shown} chevron={opens} onClick={opens ? () => props.nav.open(props.page) : undefined} />
+      </List>
+    </Section>
+  );
+}
+
+/** Where a holding's payouts, a property's rent or a share of a business's profit go: the player's action, or the GM's `economy.route` for the party. The usual place travels as "". */
+export function RoutePage(props: { view: FinanceView; controls: HubControls; nav: HubNav; target: RouteTarget; route: DistributionRoute | null; reinvest: boolean; label: string; subtitle: string }) {
+  const { view, controls } = props;
+  const pick = routePick(props.route);
+  const [picked, setPicked] = useState(pick);
+  if (controls.mode === "read" || (controls.mode === "player" && view.level < 3)) return null;
+  const to = picked.trim();
+  const problem = picked === "" ? "Pick where it goes." : picked === ROUTE_ELSEWHERE ? "It goes to another owner's account now: pick where it goes instead." : picked === pick ? "That's where it goes now: pick another place." : null;
+  const body = routeAction(props.target, to);
+  return (
+    <ActionPage nav={props.nav} controls={controls} name="route" title={props.label} subtitle={props.subtitle} go="Save" problem={problem} action={body} submit={(tell) => (controls.mode === "player" ? controls.act(body, tell) : controls.edit(routeOps(props.target, view.party, to)))}>
+      <ChoiceField label={props.label} value={picked} options={routeChoices(view, props.reinvest, pick)} onChange={setPicked} />
+    </ActionPage>
+  );
+}
+
+// ---------------------------------------------------------------- investments
+
+const HOLDING_CONTROL: Readonly<Record<HoldingControl, string>> = { buy: "Buy more", sell: "Sell", exercise: "Exercise" };
+
+/** A holding by its asset: "Acme Corp (ACME)". */
+function holdingName(h: HoldingView): string {
+  return `${h.asset.label}${h.asset.symbol ? ` (${h.asset.symbol})` : ""}`;
+}
+
+/** Whether the GM may set the price of a holding's asset: an option follows its underlying, and property and stakes have their own values. */
+function priced(h: HoldingView): boolean {
+  return h.asset.class !== "option" && h.asset.class !== "property" && h.asset.class !== "business_stake";
+}
+
+/** Whether the player may buy something new: where investments run and the market offers something they don't hold. */
+function canBuyNew(view: FinanceView, controls: HubControls): boolean {
+  return controls.mode === "player" && view.features.includes("investments") && (view.investments?.market ?? []).length > 0;
+}
+
+// ---------------------------------------------------------------- how prices have done
+
+/** A sparkline's box, in its own units: it stretches to the width it is given, and the line keeps clear of its top and bottom edges. */
+const SPARK_WIDTH = 100;
+const SPARK_HEIGHT = 32;
+const SPARK_EDGE = 2;
+
+/** Values oldest first as a line across its box, scaled to their own range, in the gain's colour when it ended higher than it began and the loss's when lower. Nothing for fewer than two. */
+export function Sparkline(props: { values: readonly number[]; label: string }) {
+  const { values } = props;
+  if (values.length < 2) return null;
+  const lo = Math.min(...values);
+  const span = Math.max(...values) - lo || 1;
+  const points = values.map((v, i) => `${((i / (values.length - 1)) * SPARK_WIDTH).toFixed(2)},${(SPARK_HEIGHT - SPARK_EDGE - ((v - lo) / span) * (SPARK_HEIGHT - 2 * SPARK_EDGE)).toFixed(2)}`).join(" ");
+  const first = values[0] ?? 0;
+  const last = values[values.length - 1] ?? 0;
+  return (
+    <svg class="lre-money-spark" data-tone={last > first ? "pos" : last < first ? "neg" : undefined} viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`} preserveAspectRatio="none" role="img" aria-label={props.label}>
+      <polyline points={points} />
+    </svg>
+  );
+}
+
+/** A change in percent to a tenth, with its sign: "+4.2%", "-3.1%". */
+function changeText(pct: number): string {
+  const r = Math.round(pct * 10) / 10;
+  return `${r > 0 ? "+" : ""}${r.toFixed(1)}%`;
+}
+
+function changeTone(pct: number): "pos" | "neg" | undefined {
+  const r = Math.round(pct * 10) / 10;
+  return r > 0 ? "pos" : r < 0 ? "neg" : undefined;
+}
+
+/** The changes a performance shows: this month, this year and over twelve months, each where it's known. */
+function ChangeRows(props: { month: number | null; year: number | null; twelve: number | null; through: string | null }) {
+  const rows: [string, number | null, string | undefined][] = [
+    ["This month", props.month, undefined],
+    ["This year", props.year, undefined],
+    ["12 months", props.twelve, props.through ? `to the end of ${props.through}` : undefined],
+  ];
+  return (
+    <List>
+      {rows.map(([title, pct, subtitle]) => (pct !== null ? <ListRow key={title} title={title} subtitle={subtitle} value={changeText(pct)} valueTone={changeTone(pct)} /> : null))}
+    </List>
+  );
+}
+
+/**
+ * The stock market where the world keeps its history (DESIGN §27.11): its last thirteen month-ends
+ * and today as a line, how it has done this month, this year and over twelve months, and where its
+ * moves come from: the market as it was, or outside the history's months a walk of its own.
+ */
+export function MarketSection(props: { index: IndexView }) {
+  const m = props.index;
+  const first = m.points[0]?.at ?? "";
+  const last = m.points[m.points.length - 1]?.at ?? "";
+  return (
+    <Section title="The market" flush>
+      <div data-lre-money-market={m.history ? "history" : "walk"}>
+        <div class="lre-money-spark-wrap">
+          <Sparkline values={m.points.map((p) => p.level)} label={`The stock market from ${first} to ${last}`} />
+        </div>
+        <ChangeRows month={m.month} year={m.year} twelve={m.twelve} through={m.points[m.points.length - 2]?.at ?? null} />
+        <div class="lre-money-spark-note">
+          <Note>{m.history ? `It moves as the stock market did: ${m.source}, month-end closes ${m.from} to ${m.to}.` : `Outside ${m.from} to ${m.to} the market walks at random, with the swings it had then (${m.source}).`}</Note>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+/** How a holding's price has done (DESIGN §27.11): its kept month-end closes and today as a line, and its changes, each where the close it starts from was kept. */
+export function PerformanceSection(props: { performance: PerformanceView }) {
+  const p = props.performance;
+  const first = p.points[0]?.at ?? "";
+  const last = p.points[p.points.length - 1]?.at ?? "";
+  const known = p.month !== null || p.year !== null || p.twelve !== null;
+  return (
+    <Section title="Performance" flush>
+      <div data-lre-holding-performance>
+        {p.points.length > 1 ? (
+          <div class="lre-money-spark-wrap">
+            <Sparkline values={p.points.map((x) => x.price)} label={`Its price from ${first} to ${last}`} />
+          </div>
+        ) : null}
+        {known ? (
+          <ChangeRows month={p.month} year={p.year} twelve={p.twelve} through={p.points[p.points.length - 2]?.at ?? null} />
+        ) : (
+          <div class="lre-money-spark-note">
+            <Note>How it has done shows once the market has closed a month with it.</Note>
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+/** Assets' investments: what they're worth, cost and gain (realised gains and the tax on them in the full books), Buy something new, the holdings (each opening its page), and the market. */
+function Investments(props: SectionProps) {
+  const { view, controls, nav } = props;
+  const inv = view.investments;
+  if (!inv) return null;
+  const fmt = (cents: number): string => formatMoney(cents, controls.currency);
+  const blocks = investmentBlocks(view);
+  return (
+    <div class="lre-stack" data-lre-money-investments>
+      <Section title="Investments" flush>
+        <List>
+          <ListRow icon="layers" title="Worth now" value={fmt(inv.value)} />
+          <ListRow title="Cost" value={fmt(inv.cost)} />
+          <ListRow title="Gain not yet taken" value={signed(inv.unrealised, controls.currency)} valueTone={inv.unrealised < 0 ? "neg" : "pos"} />
+          <ListRow title="Gain taken" subtitle={blocks.gains && inv.realisedShort !== undefined && inv.realisedLong !== undefined ? `${fmt(inv.realisedShort)} short term · ${fmt(inv.realisedLong)} long term` : undefined} value={fmt(inv.realised)} />
+          {blocks.income && inv.income !== undefined ? <ListRow title="Paid out this year" value={fmt(inv.income)} valueTone="pos" /> : null}
+          {blocks.gains && inv.taxDue ? <ListRow title="Tax on gains" subtitle={`due ${inv.taxDue.at}`} value={fmt(inv.taxDue.cents)} valueTone="warn" /> : null}
+        </List>
+      </Section>
+      {canBuyNew(view, controls) ? (
+        <Button variant="primary" icon="plus" block onClick={() => nav.open(actionPage("investments", "buy"))}>
+          Buy something new
+        </Button>
+      ) : null}
+      <Section title="Holdings" flush>
+        {inv.holdings.length === 0 ? (
+          <Empty icon="layers">Nothing held.</Empty>
+        ) : (
+          <List>
+            {inv.holdings.map((h) => (
+              <ListRow key={h.id} title={holdingName(h)} subtitle={`${humanize(h.asset.class)} · ${h.qty} × ${fmt(h.price)} · ${signed(h.gain, controls.currency)}`} id={h.id} value={fmt(h.value)} chevron onClick={() => nav.open(detailPage("holding", h.id))} />
+            ))}
+          </List>
+        )}
+      </Section>
+      {inv.index ? <MarketSection index={inv.index} /> : null}
+    </div>
+  );
+}
+
+/** One holding: its value at the price now, cost and gain, how its price has done, its lots in the full books, an option's terms, where its payouts go, and the controls its mode allows. */
+function HoldingPage(props: SectionProps & { holding: HoldingView }) {
+  const { view, controls, nav, holding: h } = props;
+  const fmt = (cents: number): string => formatMoney(cents, controls.currency);
+  const blocks = investmentBlocks(view);
+  const can = controls.mode === "player" ? holdingControls(view, h) : [];
+  const money = <Badge tone={h.option?.inTheMoney ? "pos" : "neutral"}>{h.option?.inTheMoney ? "In the money" : "Out of the money"}</Badge>;
+  return (
+    <MoneyPage nav={nav} name="holding" title={holdingName(h)} subtitle={humanize(h.asset.class)}>
+      <IdText id={h.id} />
+      <Hero label="Worth now" value={fmt(h.value)} sub={`${h.qty} × ${fmt(h.price)}`} badges={h.option ? money : undefined} />
+      {can.length > 0 ? (
+        <Controls name={h.id}>
+          {can.map((c) => (
+            <Button key={c} variant={c === "exercise" ? "primary" : "secondary"} icon={c === "buy" ? "plus" : c === "sell" ? "minus" : "check"} onClick={() => nav.open(actionPage("holding", h.id, c))}>
+              {HOLDING_CONTROL[c]}
+            </Button>
+          ))}
+        </Controls>
+      ) : null}
+      {controls.mode === "gm" ? (
+        <Controls name={h.id}>
+          {priced(h) ? (
+            <Button icon="edit" onClick={() => nav.open(actionPage("holding", h.id, "price"))}>
+              Set its price
+            </Button>
+          ) : null}
+          <Button icon="list" onClick={() => nav.open(actionPage("holding", h.id, "fields"))}>
+            Holding fields
+          </Button>
+        </Controls>
+      ) : null}
+      <Section flush>
+        <List>
+          {h.account === null ? <ListRow icon="bank" title="Held in" value="Held directly" /> : <AccountRow view={view} nav={nav} id={h.account} title="Held in" />}
+          <ListRow title="Cost" value={fmt(h.cost)} />
+          <ListRow title="Gain" value={signed(h.gain, controls.currency)} valueTone={h.gain < 0 ? "neg" : "pos"} />
+          {h.option ? <ListRow title={`${humanize(h.option.right)} on ${h.option.underlying} at ${fmt(h.option.strike)}`} subtitle={`expires ${h.option.expiry}`} /> : null}
+        </List>
+      </Section>
+      {h.performance ? <PerformanceSection performance={h.performance} /> : null}
+      {!h.option ? <RouteRow view={view} controls={controls} nav={nav} route={h.route} reinvest label="Distributions go to" page={actionPage("holding", h.id, "route")} /> : null}
+      {blocks.lots && h.lots.length > 0 ? (
+        <Section title="Lots" flush>
+          <List>
+            {h.lots.map((l, i) => (
+              <ListRow key={`${l.at}:${i}`} title={`${l.qty} bought ${l.at}`} subtitle={`cost ${fmt(l.cost)} · ${l.term} term`} value={signed(l.gain, controls.currency)} valueTone={l.gain < 0 ? "neg" : "pos"} />
+            ))}
+          </List>
+        </Section>
+      ) : null}
+    </MoneyPage>
+  );
+}
+
+/** A buy or a sale: of a holding, or (a buy) of an asset on the market, as units or an amount, an option with its strike and expiry. */
+function TradePage(props: SectionProps & { side: "buy" | "sell"; holding?: HoldingView }) {
+  const { view, controls, nav, holding } = props;
+  const inv = view.investments;
+  const market = inv?.market ?? [];
+  const accounts = (inv?.accounts ?? []).map((id) => ({ value: id, label: view.accounts.find((a) => a.id === id)?.name ?? "Another account" }));
+  const [form, setForm] = useState<TradeForm>({ side: props.side, holding: holding?.id ?? "", asset: holding?.asset.id ?? market[0]?.asset ?? "", account: accounts[0]?.value ?? "", qty: null, amount: "", from: "", to: "", option: null });
+  if (controls.mode !== "player") return null;
+  const result = tradeAction(form, controls.currency);
+  const price = holding?.price ?? market.find((m) => m.asset === form.asset)?.price ?? null;
+  // A buy pays from the holding's account when it holds cash; a brokerage that doesn't needs another account named.
+  const sources = moveSources(view).map((a) => ({ value: a.id, label: `${a.name} (${formatMoney(a.available ?? a.cents, controls.currency)})` }));
+  const targets = transferTargets(view, "").map((a) => ({ value: a.id, label: a.name }));
+  const buy = form.side === "buy";
+  return (
+    <ActionPage nav={nav} controls={controls} name={`trade-${form.side}`} title={holding ? HOLDING_CONTROL[form.side] : "Buy something new"} subtitle={holding ? holdingName(holding) : undefined} go={buy ? "Buy" : "Sell"} problem={typeof result === "string" ? result : null} action={typeof result === "string" ? null : result} submit={(tell) => (typeof result === "string" ? Promise.resolve(false) : controls.act(result, tell))}>
+      {!holding ? (
+        <>
+          <SelectField label="What" value={form.asset} empty="Choose" options={market.map((m) => ({ value: m.asset, label: `${m.label}${m.symbol ? ` (${m.symbol})` : ""} · ${formatMoney(m.price, controls.currency)}` }))} onChange={(asset) => setForm({ ...form, asset })} />
+          <SelectField label="Held in" value={form.account} empty="Held directly" options={accounts} onChange={(account) => setForm({ ...form, account })} />
+          {view.features.includes("options") ? <ToggleField label="An option on it" checked={form.option !== null} onChange={(on) => setForm({ ...form, option: on ? { right: "call", strike: "", expiry: "" } : null })} /> : null}
+          {form.option ? (
+            <>
+              <SelectField label="Right" value={form.option.right} options={[{ value: "call", label: "Call (the right to buy)" }, { value: "put", label: "Put (the right to sell)" }]} onChange={(right) => form.option && setForm({ ...form, option: { ...form.option, right: right === "put" ? "put" : "call" } })} />
+              <AmountField label="Strike" value={form.option.strike} currency={controls.currency} onInput={(strike) => form.option && setForm({ ...form, option: { ...form.option, strike } })} />
+              <TextField label="Expires" type="date" value={form.option.expiry} onInput={(expiry) => form.option && setForm({ ...form, option: { ...form.option, expiry } })} />
+            </>
+          ) : null}
+        </>
+      ) : null}
+      {price !== null ? (
+        <Section flush>
+          <List>
+            <ListRow title="Price now" value={formatMoney(price, controls.currency)} />
+          </List>
+        </Section>
+      ) : null}
+      <NumberField label={form.option || holding?.option ? "Contracts" : "Units"} value={form.qty} min={0} onChange={(qty) => setForm({ ...form, qty })} />
+      <AmountField label={buy ? "Or spend" : "Or raise"} value={form.amount} currency={controls.currency} onInput={(amount) => setForm({ ...form, amount })} invalid={form.amount.trim() !== "" && amountOf(form.amount, controls.currency) === null} placeholder={buy ? undefined : "Empty: sell it all"} />
+      {buy ? <SelectField label="Pay from" value={form.from} empty="Its own account, else your usual one" options={sources} onChange={(from) => setForm({ ...form, from })} /> : <SelectField label="The money goes to" value={form.to} empty="Its own account, else your usual one" options={targets} onChange={(to) => setForm({ ...form, to })} />}
+    </ActionPage>
+  );
+}
+
+/** Exercising contracts: how many (all of them unless said), and the account a call's strike comes from or a put's goes to. */
+function ExercisePage(props: SectionProps & { holding: HoldingView }) {
+  const { view, controls, nav, holding: h } = props;
+  const [qty, setQty] = useState<number | null>(null);
+  const [account, setAccount] = useState("");
+  if (controls.mode !== "player") return null;
+  const call = h.option?.right !== "put";
+  const choices = (call ? moveSources(view) : transferTargets(view, "")).map((a) => ({ value: a.id, label: a.name }));
+  const body = exerciseAction(h.id, qty, account === "" ? {} : call ? { from: account } : { to: account });
+  return (
+    <ActionPage nav={nav} controls={controls} name="exercise" title="Exercise" subtitle={holdingName(h)} go="Exercise" action={body} submit={(tell) => controls.act(body, tell)}>
+      <NumberField label={`Contracts (of ${h.qty}; empty: all)`} value={qty} min={1} max={h.qty} onChange={setQty} />
+      <SelectField label={call ? "Pay the strike from" : "The strike goes to"} value={account} empty="Its own account, else your usual one" options={choices} onChange={setAccount} />
+    </ActionPage>
+  );
+}
+
+// ---------------------------------------------------------------- properties
+
+const PROPERTY_CONTROL: Readonly<Record<PropertyControl, string>> = { let: "Let it", sell: "Sell", buy: "Buy" };
+
+/** A property's tag: the viewing party's share of it ("yours" to the player, "theirs" to the GM), or that it's for sale. */
+function ShareBadge(props: { property: PropertyView; controls: HubControls }) {
+  const p = props.property;
+  if (p.share <= 0) return <Badge tone="accent">For sale</Badge>;
+  return <Badge>{`${Math.round(p.share * 10) / 10}% ${props.controls.mode === "player" ? "yours" : "theirs"}`}</Badge>;
+}
+
+/** A property as a row: its name and place, its value and the party's share or that it's for sale; it opens the property's page. */
+function PropertyRow(props: { property: PropertyView; controls: HubControls; nav: HubNav }) {
+  const p = props.property;
+  return <ListRow title={p.name} subtitle={p.place && p.place !== p.name ? p.place : undefined} id={p.id} value={formatMoney(p.value, props.controls.currency)} badge={<ShareBadge property={p} controls={props.controls} />} chevron onClick={() => props.nav.open(detailPage("property", p.id))} />;
+}
+
+/**
+ * Assets: what the party's worth is made of, in the full books, at the top; its investments; the
+ * property it owns and what's for sale (the GM adds a property here); its stakes in organizations,
+ * each opening its Ownership in Orgs (on the World page, the stake's own page); and, in Play, its vehicles
+ * in the Garage, with what they're worth together (the net worth's vehicle lines) where it has any.
+ */
+export function AssetsSegment(props: SegmentProps) {
+  const { view, controls, nav } = props;
+  const fmt = (cents: number): string => formatMoney(cents, controls.currency);
+  const o = view.overview;
+  const owned = view.properties.filter((p) => p.share > 0);
+  const forSale = view.properties.filter((p) => p.share <= 0 && p.forSale !== null && p.forSale !== undefined);
+  const stakes = stakesOf(view);
+  const vehicles = o?.breakdown.filter((line) => line.vehicle === true) ?? [];
+  return (
+    <>
+      {overviewBlocks(view).breakdown && o && o.breakdown.length > 0 ? (
+        <Section title="What it's made of" flush>
+          <List>
+            {o.breakdown.map((b) => (
+              <ListRow key={b.label} title={b.label} value={fmt(b.cents)} valueTone={b.cents < 0 ? "neg" : undefined} />
+            ))}
+          </List>
+        </Section>
+      ) : null}
+      <Investments view={view} controls={controls} nav={nav} />
+      {controls.mode === "gm" ? (
+        <Button variant="primary" icon="plus" block onClick={() => nav.open(actionPage("properties", "new"))}>
+          Add a property
+        </Button>
+      ) : null}
+      {owned.length > 0 ? (
+        <Section title={controls.mode === "player" ? "Property you own" : "Property"} flush>
+          <List>
+            {owned.map((p) => (
+              <PropertyRow key={p.id} property={p} controls={controls} nav={nav} />
+            ))}
+          </List>
+        </Section>
+      ) : controls.mode === "gm" ? (
+        <Empty icon="home">No property.</Empty>
+      ) : null}
+      {forSale.length > 0 ? (
+        <Section title="For sale" flush>
+          <List>
+            {forSale.map((p) => (
+              <PropertyRow key={p.id} property={p} controls={controls} nav={nav} />
+            ))}
+          </List>
+        </Section>
+      ) : null}
+      {stakes.length > 0 ? (
+        <Section title="Stakes in organizations" flush>
+          <div data-lre-money-stakes>
+            <List>
+              {stakes.map((b) => {
+                const share = b.owners.find((x) => x.party === view.party)?.share ?? null;
+                // What the stake is worth is the net worth's line for it, where the books list one.
+                const worth = o?.breakdown.find((line) => line.label === b.name)?.cents ?? null;
+                return (
+                  <ListRow
+                    key={b.id}
+                    icon="briefcase"
+                    title={b.name}
+                    subtitle={[b.role ? humanize(b.role) : null, share !== null ? `${Math.round(share * 10) / 10}%` : null].filter((s) => s !== null).join(" · ")}
+                    id={b.id}
+                    value={worth !== null ? fmt(worth) : undefined}
+                    chevron
+                    onClick={() => (controls.mode === "gm" ? nav.open(detailPage("stake", b.id)) : nav.elsewhere({ org: b.id, tab: "economy.ownership" }))}
+                  />
+                );
+              })}
+            </List>
+          </div>
+        </Section>
+      ) : null}
+      {props.garage && controls.mode === "player" ? (
+        <Section flush>
+          <List>
+            <ListRow icon="car" title="Your vehicles" subtitle="In the Garage" value={vehicles.length > 0 ? fmt(vehicles.reduce((sum, line) => sum + line.cents, 0)) : undefined} chevron onClick={() => nav.elsewhere({ panel: "vehicles.garage" })} />
+          </List>
+        </Section>
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * The GM's new property for the party: its name and value, the party its whole owner, one edit. At
+ * a place (one no property stands at yet) it is that place made a property (`economy.property_make`),
+ * its name the place's unless another is given; at none, a property of its own.
+ */
+function NewPropertyPage(props: SectionProps) {
+  const { view, controls, nav } = props;
+  const [name, setName] = useState("");
+  const [value, setValue] = useState("");
+  const [place, setPlace] = useState("");
+  if (controls.mode !== "gm") return null;
+  const cents = amountOf(value, controls.currency);
+  const taken = new Set(controls.gm.entities.flatMap((e) => (e.kind === "property" && !e.gone && e.place !== null ? [e.place] : [])));
+  const places = controls.gm.places.filter((p) => !taken.has(p.id) || p.id === place).sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  const at = places.find((p) => p.id === place) ?? null;
+  const problem = name.trim() === "" && at === null ? "Give it a name, or pick the place it is." : amountProblem(value, controls.currency, "its value");
+  return (
+    <ActionPage nav={nav} controls={controls} name="property-new" title="Add a property" subtitle={view.name} go="Add the property" problem={problem} submit={() => (problem !== null || cents === null ? Promise.resolve(false) : controls.edit(at !== null ? propertyMakeOps(at.id, { name, value: cents, owner: view.party }) : propertySpawnOps(newIdFor("prop", name, new Set(controls.gm.entities.map((e) => e.id))), name.trim(), view.party, cents)))}>
+      <SelectField label="At" value={place} empty="No place" options={places.map((p) => ({ value: p.id, label: p.name }))} onChange={setPlace} />
+      <TextField label={at !== null ? "Name (empty: the place's)" : "Name"} value={name} onInput={setName} placeholder={at?.name ?? "The lake cabin"} />
+      <AmountField label="Value" value={value} currency={controls.currency} onInput={setValue} invalid={value.trim() !== "" && cents === null} />
+      <Note>{at !== null ? `${at.name} becomes a property, and ${view.name} owns it whole.` : `${view.name} owns it whole.`}</Note>
+    </ActionPage>
+  );
+}
+
+/** A lease as a row: the tenant, its term, the rent and whether it's let; `onOpen` when the player may end it. */
+function LeaseRow(props: { lease: LeaseView; currency: WorldCurrency; onOpen?(): void }) {
+  const l = props.lease;
+  return (
+    <ListRow
+      title={l.tenant || "No tenant"}
+      subtitle={[l.start ? `from ${l.start}` : null, l.end ? `to ${l.end}` : null].filter((s) => s !== null).join(" ") || undefined}
+      value={formatMoney(l.rent, props.currency)}
+      badge={<Badge tone={l.state === "vacant" ? "warn" : "neutral"}>{humanize(l.state)}</Badge>}
+      chevron={props.onOpen !== undefined}
+      onClick={props.onOpen}
+    />
+  );
+}
+
+/** One property: its value, share, equity, mortgage, leases and running costs, where its rent goes, and the controls its mode allows. */
+function PropertyPage(props: SectionProps & { property: PropertyView }) {
+  const { view, controls, nav, property: p } = props;
+  const fmt = (cents: number): string => formatMoney(cents, controls.currency);
+  const owns = p.share > 0;
+  const can = controls.mode === "player" ? propertyControls(view, p) : [];
+  const endable = controls.mode === "player" ? endableLeases(view, p) : [];
+  return (
+    <MoneyPage nav={nav} name="property" title={p.name} subtitle={p.place && p.place !== p.name ? p.place : undefined}>
+      <IdText id={p.id} />
+      <Hero label="Value" value={fmt(p.value)} sub={owns ? `Equity ${fmt(p.equity)}` : undefined} badges={<ShareBadge property={p} controls={controls} />} />
+      {can.length > 0 ? (
+        <Controls name={p.id}>
+          {can.map((c) => (
+            <Button key={c} variant={c === "buy" ? "primary" : "secondary"} icon={c === "let" ? "key" : c === "sell" ? "minus" : "plus"} onClick={() => nav.open(actionPage("property", p.id, c))}>
+              {PROPERTY_CONTROL[c]}
+            </Button>
+          ))}
+        </Controls>
+      ) : null}
+      {controls.mode === "gm" ? (
+        <Controls name={p.id}>
+          <Button icon="list" onClick={() => nav.open(actionPage("property", p.id, "fields"))}>
+            Property fields
+          </Button>
+        </Controls>
+      ) : null}
+      <Section flush>
+        <List>
+          {p.place ? <ListRow icon="pin" title="At" value={p.place} /> : null}
+          {p.forSale !== null && p.forSale !== undefined ? <ListRow icon="receipt" title="Asking" value={fmt(p.forSale)} /> : null}
+          {owns ? <ListRow icon="wallet" title="Equity" value={fmt(p.equity)} valueTone={p.equity < 0 ? "neg" : undefined} /> : null}
+          {p.mortgage ? <AccountRow view={view} nav={nav} id={p.mortgage.id} title="Mortgage" subtitle={[p.mortgage.name, p.mortgage.payment !== null ? `${fmt(p.mortgage.payment)} a month` : null, p.mortgage.monthsLeft !== null ? `${p.mortgage.monthsLeft} months left` : null].filter((s) => s !== null).join(" · ")} value={fmt(-Math.abs(p.mortgage.owed))} valueTone="neg" /> : null}
+        </List>
+      </Section>
+      {owns ? <RouteRow view={view} controls={controls} nav={nav} route={p.route} reinvest={false} label="Rent goes to" page={actionPage("property", p.id, "route")} /> : null}
+      {p.leases.length > 0 ? (
+        <Section title="Leases" flush>
+          <List>
+            {p.leases.map((l, i) => (
+              <LeaseRow key={l.flow || `vacant:${i}`} lease={l} currency={controls.currency} onOpen={endable.includes(l.flow) ? () => nav.open(actionPage("property", p.id, "end_lease", l.flow)) : undefined} />
+            ))}
+          </List>
+        </Section>
+      ) : null}
+      {p.costs.length > 0 ? (
+        <Section title="Running costs" flush>
+          <List>
+            {p.costs.map((f) => (
+              <FlowListRow key={f.id} flow={f} nav={nav} />
+            ))}
+          </List>
+        </Section>
+      ) : null}
+    </MoneyPage>
+  );
+}
+
+function LetPage(props: SectionProps & { property: PropertyView }) {
+  const { controls, nav, property: p } = props;
+  const [tenant, setTenant] = useState("");
+  const [rent, setRent] = useState("");
+  const [months, setMonths] = useState<number | null>(12);
+  const [day, setDay] = useState<number | null>(1);
+  const [unit, setUnit] = useState("");
+  if (controls.mode !== "player") return null;
+  const cents = amountOf(rent, controls.currency);
+  const problem = tenant === "" ? "Choose a tenant." : amountProblem(rent, controls.currency, "the rent a month");
+  const body = problem !== null || cents === null ? null : leaseStartAction(p.id, tenant, cents, { ...(months !== null ? { months } : {}), ...(day !== null ? { day } : {}), ...(unit.trim() !== "" ? { unit: unit.trim() } : {}) });
+  return (
+    <ActionPage nav={nav} controls={controls} name="property-let" title="Let it" subtitle={p.name} go="Start the lease" problem={problem} action={body} submit={(tell) => (body === null ? Promise.resolve(false) : controls.act(body, tell))}>
+      <SelectField label="Tenant" value={tenant} empty="Choose someone" options={knownPeople(controls.palette).map((k) => ({ value: k.id, label: k.label }))} onChange={setTenant} />
+      <AmountField label="Rent a month" value={rent} currency={controls.currency} onInput={setRent} invalid={rent.trim() !== "" && cents === null} />
+      <NumberField label="Months" value={months} min={1} onChange={setMonths} />
+      <NumberField label="Due on day (1–28)" value={day} min={1} max={28} onChange={setDay} />
+      <TextField label="Unit (if it has several)" value={unit} onInput={setUnit} />
+    </ActionPage>
+  );
+}
+
+function SellPropertyPage(props: SectionProps & { property: PropertyView }) {
+  const { controls, nav, property: p } = props;
+  const [price, setPrice] = useState(String(p.value / 10 ** controls.currency.decimals));
+  const [buyer, setBuyer] = useState("");
+  if (controls.mode !== "player") return null;
+  const cents = amountOf(price, controls.currency);
+  const body = cents === null ? null : propertySellAction(p.id, cents, buyer ? { buyer } : {});
+  return (
+    <ActionPage nav={nav} controls={controls} name="property-sell" title="Sell" subtitle={p.name} go="Sell" problem={amountProblem(price, controls.currency, "the price")} action={body} submit={(tell) => (body === null ? Promise.resolve(false) : controls.act(body, tell))}>
+      <AmountField label="Price" value={price} currency={controls.currency} onInput={setPrice} invalid={cents === null} />
+      <SelectField label="Buyer" value={buyer} empty="Whoever buys" options={knownPeople(controls.palette).map((k) => ({ value: k.id, label: k.label }))} onChange={setBuyer} />
+      <Note>A mortgage on it is paid off from the price first.</Note>
+    </ActionPage>
+  );
+}
+
+function BuyPropertyPage(props: SectionProps & { property: PropertyView }) {
+  const { view, controls, nav, property: p } = props;
+  const [price, setPrice] = useState(String((p.forSale ?? p.value) / 10 ** controls.currency.decimals));
+  const [down, setDown] = useState("");
+  // A purchase gets the usual term unless another is chosen.
+  const [term, setTerm] = useState(String((p.mortgageTerms?.find((t) => t.usual) ?? p.mortgageTerms?.[0])?.months ?? ""));
+  const [from, setFrom] = useState("");
+  // Moving in is the buyer's to say: off unless ticked.
+  const [live, setLive] = useState(false);
+  if (controls.mode !== "player") return null;
+  const cents = amountOf(price, controls.currency);
+  const downCents = down.trim() === "" ? null : amountOf(down, controls.currency);
+  const problem = amountProblem(price, controls.currency, "your offer") ?? amountProblem(down, controls.currency, "a down payment", false);
+  // Only what isn't paid down is a mortgage, and only a mortgage has a term.
+  const financed = cents !== null && downCents !== null && downCents < cents;
+  const terms = mortgageTermChoices(p);
+  const body = problem !== null || cents === null ? null : propertyBuyAction(p.id, cents, { ...(from ? { from } : {}), ...(downCents !== null ? { down: downCents } : {}), ...(financed && term !== "" ? { termMonths: Number(term) } : {}), ...(live ? { live: true } : {}) });
+  return (
+    <ActionPage nav={nav} controls={controls} name="property-buy" title="Buy" subtitle={p.name} go="Buy" problem={problem} action={body} submit={(tell) => (body === null ? Promise.resolve(false) : controls.act(body, tell))}>
+      <AmountField label="Offer" value={price} currency={controls.currency} onInput={setPrice} invalid={cents === null} />
+      <AmountField label="Down payment (empty: pay it all)" value={down} currency={controls.currency} onInput={setDown} invalid={down.trim() !== "" && downCents === null} />
+      {financed && terms.length > 0 ? <ChoiceField label="Mortgage over" value={term} options={terms} onChange={setTerm} /> : null}
+      <SelectField label="Paid from" value={from} empty="Your usual account" options={moveSources(view).map((a) => ({ value: a.id, label: a.name }))} onChange={setFrom} />
+      <ToggleField label="Live there" help={p.place ? `${p.place} is your home from today.` : "It is your home from today."} checked={live} onChange={setLive} />
+    </ActionPage>
+  );
+}
+
+/** Notice on a lease of a property the player lets: it ends today. */
+function EndLeasePage(props: SectionProps & { property: PropertyView; lease: LeaseView }) {
+  const { controls, nav, property: p, lease: l } = props;
+  if (controls.mode !== "player") return null;
+  return (
+    <ActionPage nav={nav} controls={controls} name="lease-end" title="End the lease" subtitle={p.name} go="End" danger action={leaseEndAction(l.flow)} submit={(tell) => controls.act(leaseEndAction(l.flow), tell)}>
+      <Section flush>
+        <List>
+          <LeaseRow lease={l} currency={controls.currency} />
+        </List>
+      </Section>
+      <Note>{`End ${l.tenant}'s lease?`}</Note>
+    </ActionPage>
+  );
+}
+
+// ---------------------------------------------------------------- pages
+
+/** A holding's pages: the holding and each control's page, each only where the mode and the view allow it. */
+function holdingPage(control: string | undefined, props: SectionProps, h: HoldingView) {
+  const { view, controls, nav } = props;
+  const can = controls.mode === "player" ? holdingControls(view, h) : [];
+  switch (control) {
+    case undefined:
+      return <HoldingPage {...props} holding={h} />;
+    case "fields":
+      return <FieldsPage nav={nav} controls={controls} name="holding-fields" title="Holding fields" subtitle={holdingName(h)} entity={h.id} />;
+    case "price":
+      return controls.mode === "gm" && priced(h) ? <AmountPage nav={nav} controls={controls} name="set-price" title="Set its price" subtitle={holdingName(h)} label={`Price per unit (now ${formatMoney(h.price, controls.currency)})`} go="Set the price" submit={(cents) => (cents === null ? Promise.resolve(false) : controls.edit(setPriceOps(h.asset.id, cents)))} /> : null;
+    case "route":
+      return h.option ? null : <RoutePage view={view} controls={controls} nav={nav} target={{ holding: h.id }} route={h.route} reinvest label="Distributions go to" subtitle={holdingName(h)} />;
+    case "buy":
+    case "sell":
+      return can.includes(control) ? <TradePage {...props} side={control} holding={h} /> : null;
+    case "exercise":
+      return can.includes(control) ? <ExercisePage {...props} holding={h} /> : null;
+    default:
+      return null;
+  }
+}
+
+/** A property's pages: the property, each control's page and a lease's notice, each only where the mode and the view allow it. */
+function propertyPage(control: string | undefined, inner: string | undefined, props: SectionProps, p: PropertyView) {
+  const { view, controls, nav } = props;
+  const can = controls.mode === "player" ? propertyControls(view, p) : [];
+  switch (control) {
+    case undefined:
+      return <PropertyPage {...props} property={p} />;
+    case "fields":
+      return <FieldsPage nav={nav} controls={controls} name="property-fields" title="Property fields" subtitle={p.name} entity={p.id} />;
+    case "route":
+      return p.share > 0 ? <RoutePage view={view} controls={controls} nav={nav} target={{ property: p.id }} route={p.route} reinvest={false} label="Rent goes to" subtitle={p.name} /> : null;
+    case "end_lease": {
+      const lease = p.leases.find((l) => l.flow === inner);
+      return lease && controls.mode === "player" && endableLeases(view, p).includes(lease.flow) ? <EndLeasePage {...props} property={p} lease={lease} /> : null;
+    }
+    case "let":
+      return can.includes(control) ? <LetPage {...props} property={p} /> : null;
+    case "sell":
+      return can.includes(control) ? <SellPropertyPage {...props} property={p} /> : null;
+    case "buy":
+      return can.includes(control) ? <BuyPropertyPage {...props} property={p} /> : null;
+    default:
+      return null;
+  }
+}
+
+/** Assets' pages: a new buy, the GM's new property, a holding, a property, and each control's page. What the view no longer holds, or the mode may not do, draws nothing (gone). */
+export const assetPages: HubPages = {
+  heads: ["investments", "holding", "properties", "property"],
+  render(page, props) {
+    const { view, controls } = props;
+    const [head, id, control, inner] = page.path;
+    if (head === "investments") return id === "buy" && canBuyNew(view, controls) ? <TradePage {...props} side="buy" /> : null;
+    if (head === "properties") return id === "new" && controls.mode === "gm" ? <NewPropertyPage {...props} /> : null;
+    if (id === undefined) return null;
+    if (head === "holding") {
+      const holding = view.investments?.holdings.find((h) => h.id === id);
+      return holding ? holdingPage(control, props, holding) : null;
+    }
+    const property = head === "property" ? view.properties.find((p) => p.id === id) : undefined;
+    return property ? propertyPage(control, inner, props, property) : null;
+  },
+};

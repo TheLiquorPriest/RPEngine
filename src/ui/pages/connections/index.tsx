@@ -1,0 +1,613 @@
+// Connections (plan §14): the models RPE's agents call, as RPH's model layer keeps them: the list, which
+// one is the default, adding one, changing one, removing one, and testing one. A key is typed once and
+// sent to RPE; RPE never sends one back, and this page shows only whether one is set. Each connection's
+// model shows its limits as RPH uses them and where each comes from, and whether it takes audio and video;
+// the form sets the user's own in their place. What the layer or the provider refuses is shown in its own words.
+
+import type { ComponentChildren } from "preact";
+import { useEffect, useRef, useState } from "preact/hooks";
+import type { ConnectionAuth, ConnectionShown, ConnectionsShown, ConnectionTested, Effort, ModelLimit, ModelLimits, ModelLimitsEntry, ProviderOffer, SaveConnection } from "../../../shared/api";
+import { useApp } from "../../app";
+import { Badge, Banner, Button, Empty, PageHeader } from "../../../frontend/components";
+import type { RpeClient } from "../../client";
+import type { PageEntry } from "../../page-entry";
+import { duration, errorWords, num } from "../../words";
+import { SettingName } from "../settings/names";
+import { NO_SIGNIN, SignInPanel, type SignInShown, signInCalls, signInSteps } from "./signin";
+import { FORM_WORDS, formKey, NO_TAG_STATE, type ReplyForm, startedState, TagCheckShown, type TagCheckState } from "./tags";
+import { WebSearchSection } from "./web";
+
+const FROM_WORDS: Readonly<Record<ModelLimit["from"], string>> = { user: "yours", pi: "as pi lists it", connection: "as its server reported" };
+
+/** What a model takes of a part a request may carry: audio, or video. */
+const MEDIA = ["audio", "video"] as const;
+const MEDIA_WORDS: Readonly<Record<(typeof MEDIA)[number], string>> = { audio: "Audio", video: "Video" };
+
+/** A model's limits as RPH uses them, and where each comes from, and whether it takes audio and video; or, where they could not be read, why, apart from a limit nobody knows. */
+export function limitsWords(limits: ModelLimits | null, problem: string | null = null): string {
+  if (problem !== null) return `Its limits could not be read: ${problem.replace(/\.$/, "")}`;
+  const one = (label: string, limit: ModelLimit | null | undefined): string => (limit === null || limit === undefined ? `${label}: not known` : `${label}: ${num(limit.tokens)} tokens, ${FROM_WORDS[limit.from]}`);
+  const media = MEDIA.map((part) => {
+    const said = limits?.[part];
+    return said === null || said === undefined ? `${MEDIA_WORDS[part]}: not said, so it is sent` : `${MEDIA_WORDS[part]}: ${said.takes ? "taken" : "not taken"}, ${FROM_WORDS[said.from]}`;
+  });
+  return [one("Context window", limits?.contextWindow), one("Longest reply", limits?.maxTokens), ...media].join(" · ");
+}
+
+/** Every effort a connection may think at, as RPH's contract names them. */
+export const EFFORTS: readonly Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+const AUTH_WORDS: Readonly<Record<ConnectionAuth, string>> = { key: "With a key", signin: "By signing in to the provider", none: "With no key" };
+
+/** How a connection signs its calls, and whether that is in place: never the key itself. */
+function keyWords(view: ConnectionShown): string {
+  if (view.auth === "none") return "Signs its calls with no key.";
+  if (view.auth === "signin") return view.signedIn === true ? "Signed in to its provider." : "Not signed in to its provider.";
+  if (view.key?.set !== true) return "No key is set.";
+  return view.key.waiting === true ? "A key is set, and waits until you allow the address it now goes to: its calls fail until then." : "A key is set.";
+}
+
+/**
+ * What saving the form sends: the connection whole, from what the form holds over the connection it
+ * changes (a save replaces a connection whole, so what the form does not show goes as it was), and its
+ * key: a key typed is sent, none typed keeps the one there is, and "take the key away" sends null.
+ */
+export function draftOf(form: Iterable<readonly [string, FormDataEntryValue]>, was: ConnectionShown | null): SaveConnection {
+  const field = new Map<string, string>();
+  for (const [name, value] of form) field.set(name, typeof value === "string" ? value.trim() : "");
+  const text = (name: string): string | null => {
+    const value = field.get(name) ?? "";
+    return value === "" ? null : value;
+  };
+  const effort = text("effort");
+  const retries = text("retries");
+  const connection = {
+    name: field.get("name") ?? "",
+    provider: field.get("provider") ?? "",
+    auth: (field.get("auth") ?? "key") as ConnectionAuth,
+    baseUrl: text("baseUrl"),
+    api: text("api"),
+    model: text("model"),
+    effort: EFFORTS.find((e) => e === effort) ?? null,
+    // The connection's own values, as the form shows them: a box left empty or unticked clears it, and the setting or the default holds.
+    serialTools: field.get("serialTools") === "on" ? true : null,
+    messageThreads: field.get("messageThreads") === "on" ? true : null,
+    retries: retries === null ? null : Number(retries),
+    limits: limitsOf(field, text("model"), was),
+  };
+  const key = field.get("key") ?? "";
+  return { connection, ...(field.get("dropKey") === "on" ? { key: null } : key === "" ? {} : { key }) };
+}
+
+/**
+ * The user's own limits as the form leaves them: those of the connection's model as typed (a field left
+ * empty sets none), those of its other models as they were; null when none is set.
+ */
+function limitsOf(field: ReadonlyMap<string, string>, model: string | null, was: ConnectionShown | null): Record<string, ModelLimitsEntry> | null {
+  const own: Record<string, ModelLimitsEntry> = { ...(was?.limits ?? {}) };
+  if (model !== null) {
+    const typed = (name: string): number | undefined => {
+      const raw = field.get(name) ?? "";
+      const value = Number(raw);
+      return raw === "" || !Number.isFinite(value) ? undefined : value;
+    };
+    const contextWindow = typed("contextWindow");
+    const maxTokens = typed("maxTokens");
+    // Whether it takes pictures is no field of the form: an entry's own stays as it was.
+    const pictures = own[model]?.pictures;
+    const entry: ModelLimitsEntry = { ...(pictures === undefined ? {} : { pictures }), ...(contextWindow === undefined ? {} : { contextWindow }), ...(maxTokens === undefined ? {} : { maxTokens }) };
+    for (const part of MEDIA) {
+      const said = field.get(part);
+      if (said === "yes" || said === "no") entry[part] = said === "yes";
+    }
+    if (Object.keys(entry).length === 0) delete own[model];
+    else own[model] = entry;
+  }
+  return Object.keys(own).length === 0 ? null : own;
+}
+
+/** The model fields' values for `model`: the user's own entry for it on the connection, else empty (for audio and video, not said). */
+export function limitFieldsFor(was: ConnectionShown | null, model: string): { contextWindow: string; maxTokens: string; audio: string; video: string } {
+  const entry = model === "" ? undefined : was?.limits?.[model];
+  const said = (takes: boolean | undefined): string => (takes === undefined ? "" : takes ? "yes" : "no");
+  return { contextWindow: String(entry?.contextWindow ?? ""), maxTokens: String(entry?.maxTokens ?? ""), audio: said(entry?.audio), video: said(entry?.video) };
+}
+
+/** The form that adds a connection (`was` null) or changes one. Its key field starts empty: RPE never sends a key back. `fill` starts the limit fields with figures a test found, for the player to save or not. */
+function ConnectionForm(props: { was: ConnectionShown | null; fill?: ModelLimitsEntry; providers: readonly ProviderOffer[]; saving: boolean; refusal: string | null; onSave(save: SaveConnection): void; onCancel(): void }) {
+  const { was, fill } = props;
+  const start = limitFieldsFor(was, was?.model ?? "");
+  return (
+    <form
+      class="lre-section lre-stack rpe-form"
+      data-form={was?.id ?? "new"}
+      onSubmit={(event) => {
+        event.preventDefault();
+        props.onSave(draftOf(new FormData(event.currentTarget), was));
+      }}
+    >
+      <div class="lre-section-head">
+        <h3 class="lre-section-title">{was === null ? "A new connection" : `Change ${was.name}`}</h3>
+      </div>
+      <div class="lre-section-body lre-stack">
+        {props.refusal === null ? null : (
+          <Banner tone="neg" icon="alert" title="RPE did not save it">
+            <span>{props.refusal}</span>
+          </Banner>
+        )}
+        <label class="lre-field">
+          <span class="label">Name</span>
+          <input name="name" class="lre-input" required defaultValue={was?.name ?? ""} autoComplete="off" />
+        </label>
+        <label class="lre-field">
+          <span class="label">Provider</span>
+          <select name="provider" class="lre-input">
+            {props.providers.map((p, i) => (
+              <option key={p.id} value={p.id} selected={was === null ? i === 0 : p.id === was.provider}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label class="lre-field">
+          <span class="label">How its calls are signed</span>
+          <select name="auth" class="lre-input">
+            {(Object.keys(AUTH_WORDS) as ConnectionAuth[]).map((auth) => (
+              <option key={auth} value={auth} selected={auth === (was?.auth ?? "key")}>
+                {AUTH_WORDS[auth]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label class="lre-field">
+          <span class="label">Model</span>
+          <input
+            name="model"
+            class="lre-input"
+            defaultValue={was?.model ?? ""}
+            autoComplete="off"
+            spellcheck={false}
+            onInput={(event) => {
+              // The limit fields are for the model named here: another model's figures are not carried over to it.
+              const input = event.currentTarget;
+              const fields = limitFieldsFor(was, input.value.trim());
+              for (const name of ["contextWindow", "maxTokens", ...MEDIA] as const) {
+                const field = input.form?.elements.namedItem(name) as HTMLInputElement | HTMLSelectElement | null | undefined;
+                if (field != null) field.value = fields[name];
+              }
+            }}
+          />
+          <span class="lre-field-help">For an agent whose definition names none.</span>
+        </label>
+        <label class="lre-field">
+          <span class="label">Thinking effort</span>
+          {/* A select's starting choice is its option marked selected: Preact gives a select no defaultValue. */}
+          <select name="effort" class="lre-input">
+            <option value="" selected={was?.effort === undefined}>
+              The model's own
+            </option>
+            {EFFORTS.map((effort) => (
+              <option key={effort} value={effort} selected={effort === was?.effort}>
+                {effort}
+              </option>
+            ))}
+          </select>
+          <span class="lre-field-help">For an agent whose definition names none.</span>
+        </label>
+        <label class="lre-field">
+          <span class="label">Address</span>
+          <input name="baseUrl" class="lre-input" type="url" defaultValue={was?.baseUrl ?? ""} autoComplete="off" spellcheck={false} />
+          <span class="lre-field-help">Where its calls go instead of the provider's own address: a compatible server's, or a proxy's.</span>
+        </label>
+        <label class="lre-field">
+          <span class="label">API</span>
+          <input name="api" class="lre-input" defaultValue={was?.api ?? ""} autoComplete="off" spellcheck={false} />
+          <span class="lre-field-help">The API a compatible server speaks, where it speaks more than one.</span>
+        </label>
+        <label class="lre-field">
+          <span class="label">Tries again</span>
+          <input name="retries" class="lre-input" type="number" inputMode="numeric" min={0} defaultValue={was?.retries === undefined ? "" : String(was.retries)} autoComplete="off" />
+          <span class="lre-field-help">
+            How many times a call on this connection that failed is made again, whenever in the call it failed; how long it waits and which failures it tries again after are in Settings, under When a call to the model fails. Left empty, the number in <SettingName settingKey="calls.retries" /> holds.
+          </span>
+        </label>
+        <label class="lre-inline">
+          <input name="messageThreads" type="checkbox" defaultChecked={was?.messageThreads === true} />
+          <span>Message threads: off unless ticked (Appendix D.1), so every request carries everything it is about.</span>
+        </label>
+        <label class="lre-inline">
+          <input name="serialTools" type="checkbox" defaultChecked={was?.serialTools === true} />
+          <span>One tool call per answer: off unless ticked, for a model that takes only one at a time.</span>
+        </label>
+        <label class="lre-field">
+          <span class="label">Context window</span>
+          <input name="contextWindow" class="lre-input" type="number" inputMode="numeric" defaultValue={fill?.contextWindow === undefined ? start.contextWindow : String(fill.contextWindow)} autoComplete="off" />
+          <span class="lre-field-help">In tokens, for its model, in place of the figure RPH would use. Leave it empty to use that figure.</span>
+        </label>
+        <label class="lre-field">
+          <span class="label">Longest reply</span>
+          <input name="maxTokens" class="lre-input" type="number" inputMode="numeric" defaultValue={fill?.maxTokens === undefined ? start.maxTokens : String(fill.maxTokens)} autoComplete="off" />
+          <span class="lre-field-help">In tokens, for its model, in place of the figure RPH would use. Leave it empty to use that figure.</span>
+        </label>
+        {MEDIA.map((part) => (
+          <label key={part} class="lre-field">
+            <span class="label">{`Takes ${part}`}</span>
+            <select name={part} class="lre-input">
+              <option value="" selected={start[part] === ""}>
+                As its server reports
+              </option>
+              <option value="yes" selected={start[part] === "yes"}>
+                Yes
+              </option>
+              <option value="no" selected={start[part] === "no"}>
+                No
+              </option>
+            </select>
+            <span class="lre-field-help">{`Whether its model takes ${part} in a request passed through to it: one that carries ${part === "audio" ? "audio" : "a video"} it takes none of is refused before anything is sent. Not said by you or its server, it is sent.`}</span>
+          </label>
+        ))}
+        {fill === undefined ? null : <p class="rpe-meta" data-filled="true">The two limits are filled in from the test. Save to take them as this connection's own; nothing is written until you do.</p>}
+        <label class="lre-field">
+          <span class="label">Key</span>
+          <input name="key" class="lre-input" type="password" defaultValue="" autoComplete="off" spellcheck={false} />
+          <span class="lre-field-help">{was === null ? "Sent to RPE once, and never shown again." : `${keyWords(was)} Type a new one to replace it, or leave it empty to keep it.`}</span>
+        </label>
+        {was?.key?.set === true ? (
+          <label class="lre-inline">
+            <input name="dropKey" type="checkbox" />
+            <span>Take the key away</span>
+          </label>
+        ) : null}
+        <div class="lre-inline">
+          <button type="submit" class="lre-btn primary" disabled={props.saving} aria-busy={props.saving ? "true" : undefined}>
+            Save
+          </button>
+          <Button variant="ghost" onClick={props.onCancel}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+    </form>
+  );
+}
+
+/** What the page is doing besides showing the list: a form open (adding when its id is null), a removal waiting for its yes. */
+export type ConnectionsAction = { kind: "none" } | { kind: "form"; id: string | null; fill?: ModelLimitsEntry } | { kind: "remove"; id: string };
+
+/** A connection's test: under way, what came of it, or RPE's refusal to make it, in its words. */
+export type ConnectionTestShown = { busy: true } | { busy: false; tested: ConnectionTested; problem: null } | { busy: false; tested: null; problem: string };
+
+/** Tests a connection with one small call. */
+export async function testConnection(client: Pick<RpeClient, "call">, id: string): Promise<ConnectionTestShown> {
+  try {
+    return { busy: false, tested: await client.call("POST /api/v1/connections/:id/test", { id }), problem: null };
+  } catch (error) {
+    return { busy: false, tested: null, problem: errorWords(error) };
+  }
+}
+
+export interface ConnectionsViewProps {
+  list: ConnectionsShown | null;
+  loading: boolean;
+  /** Why the list could not be read, in RPE's words. */
+  problem: string | null;
+  action: ConnectionsAction;
+  saving: boolean;
+  /** What stands after the connections: the web search provider. */
+  extra?: ComponentChildren;
+  /** RPE's refusal of the last change asked of it, in its words. */
+  refusal: string | null;
+  onAction(action: ConnectionsAction): void;
+  onSave(save: SaveConnection, id: string | null): void;
+  onRemove(id: string): void;
+  onDefault(id: string): void;
+  /** Each connection's last test, by its id. */
+  tests: Readonly<Record<string, ConnectionTestShown>>;
+  onTest(id: string): void;
+  /** Each connection's sign-in, by its id, and the steps of it. */
+  signIn(id: string): SignInHandle;
+  /** Each connection's tag check, by its id, and what the page does for it. */
+  tags?: { states: Readonly<Record<string, TagCheckState>>; onCheck(id: string): void; onForm(id: string, form: ReplyForm): void };
+}
+
+/**
+ * What came of a connection's test: the model that answered and its limits, or the provider's words.
+ * Where the provider answered as another model than the connection names, and the catalogue lists
+ * limits for it, it says so and offers them as the connection's own: `onTake` opens the form with them
+ * filled in, and writes nothing.
+ */
+function TestShown(props: { test: ConnectionTestShown; view: ConnectionShown; onTake(fill: ModelLimitsEntry): void }) {
+  const { test, view } = props;
+  if (test.busy) return <p class="lre-muted rpe-line">Testing…</p>;
+  if (test.problem !== null) {
+    return (
+      <Banner tone="neg" icon="alert" title="The test could not be made">
+        <span>{test.problem}</span>
+      </Banner>
+    );
+  }
+  const tested = test.tested;
+  if (!tested.ok) {
+    return (
+      <Banner tone="warn" icon="alert" title="It did not answer">
+        <span>{`${tested.error} (${duration(tested.ms)})`}</span>
+      </Banner>
+    );
+  }
+  const limits = tested.limits;
+  const fill: ModelLimitsEntry = { ...(limits?.contextWindow == null ? {} : { contextWindow: limits.contextWindow.tokens }), ...(limits?.maxTokens == null ? {} : { maxTokens: limits.maxTokens.tokens }) };
+  const other = view.model !== undefined && view.model !== null && tested.model !== view.model && Object.keys(fill).length > 0;
+  return (
+    <div class="lre-stack">
+      <p class="rpe-line" data-tested="ok">{`It answered in ${duration(tested.ms)}, as ${tested.model}. ${limitsWords(tested.limits, tested.limitsProblem ?? null)}.`}</p>
+      {other ? (
+        <div class="lre-inline rpe-wrap" data-offer="limits">
+          <span class="rpe-meta">{`The provider answered as ${tested.model}, not ${view.model}, so RPH does not use these figures for this connection unless you take them as its own.`}</span>
+          <Button size="sm" onClick={() => props.onTake(fill)}>
+            Take these limits
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** A key whose provider or address changed since it was given: held, sent nowhere, until he allows the address on the server; no page releases it. */
+function KeyHeld(props: { view: ConnectionShown }) {
+  const { view } = props;
+  const named = /\s/.test(view.name) ? `"${view.name}"` : view.name;
+  return (
+    <div class="lre-stack" data-key-held>
+      <p class="rpe-line">{`Its key is held and sent nowhere: its provider or address changed since the key was given. It would go to ${view.baseUrl ?? `${view.provider}'s own address`}.`}</p>
+      <p class="rpe-meta">
+        To let it go there, run on the server: <code>rpe allow {named}</code>
+      </p>
+    </div>
+  );
+}
+
+/** What the page does for a connection that signs in: where its sign-in stands, and the steps of it. */
+export interface SignInHandle {
+  shown: SignInShown | undefined;
+  start(id: string): void;
+  code(id: string, code: string): void;
+  finish(id: string, code: string): void;
+  cancel(id: string): void;
+  out(id: string): void;
+}
+
+function ConnectionRow(props: { view: ConnectionShown; action: ConnectionsAction; test: ConnectionTestShown | undefined; signIn: SignInHandle; tags: ConnectionsViewProps["tags"]; onAction(action: ConnectionsAction): void; onRemove(id: string): void; onDefault(id: string): void; onTest(id: string): void }) {
+  const { view, action, signIn } = props;
+  const said = [view.provider, view.model, view.effort === undefined ? null : `thinks at ${view.effort}`].filter((part) => part !== null && part !== undefined).join(" · ");
+  return (
+    <li class="lre-section" data-connection={view.id}>
+      <div class="lre-section-head">
+        <h3 class="lre-section-title">{view.name}</h3>
+        {view.default ? <Badge tone="pos">default</Badge> : null}
+      </div>
+      <div class="lre-section-body lre-stack">
+        <p class="rpe-line">{said}</p>
+        <p class="rpe-meta">{keyWords(view)}</p>
+        {view.key?.waiting === true ? <KeyHeld view={view} /> : null}
+        {view.auth === "signin" ? <SignInPanel name={view.name} provider={signIn.shown?.state?.provider ?? (view.provider.startsWith("openai") ? "openai" : "anthropic")} shown={signIn.shown ?? NO_SIGNIN} onStart={() => signIn.start(view.id)} onCode={(code) => signIn.code(view.id, code)} onFinish={(code) => signIn.finish(view.id, code)} onCancel={() => signIn.cancel(view.id)} onOut={() => signIn.out(view.id)} /> : null}
+        <p class="rpe-meta" data-limits={view.id}>{`${limitsWords(view.limitsInForce, view.limitsProblem ?? null)}.`}</p>
+        {action.kind === "remove" && action.id === view.id ? (
+          <div class="lre-inline rpe-wrap">
+            <span>Remove {view.name}?</span>
+            <Button size="sm" variant="danger" onClick={() => props.onRemove(view.id)}>
+              Remove it
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => props.onAction({ kind: "none" })}>
+              Keep it
+            </Button>
+          </div>
+        ) : (
+          <div class="lre-inline rpe-wrap">
+            {view.default ? null : (
+              <Button size="sm" onClick={() => props.onDefault(view.id)}>
+                Make it the default
+              </Button>
+            )}
+            <Button size="sm" variant="ghost" onClick={() => props.onAction({ kind: "form", id: view.id })}>
+              Change
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => props.onAction({ kind: "remove", id: view.id })}>
+              Remove
+            </Button>
+            <Button size="sm" variant="ghost" busy={props.test?.busy === true} onClick={() => props.onTest(view.id)}>
+              Test it
+            </Button>
+          </div>
+        )}
+        {props.test === undefined ? null : <TestShown test={props.test} view={view} onTake={(fill) => props.onAction({ kind: "form", id: view.id, fill })} />}
+        {props.tags === undefined ? null : <TagCheckShown view={view} state={props.tags.states[view.id]} onCheck={props.tags.onCheck} onForm={props.tags.onForm} />}
+      </div>
+    </li>
+  );
+}
+
+export function ConnectionsView(props: ConnectionsViewProps) {
+  const { list, action } = props;
+  const editing = action.kind === "form" ? action : null;
+  const was = editing === null || editing.id === null ? null : (list?.connections.find((c) => c.id === editing.id) ?? null);
+  return (
+    <div class="lre-stack rpe-page" data-page="connections">
+      <PageHeader
+        title="Connections"
+        subtitle="The models RPE's agents call, and how each signs its calls."
+        actions={
+          editing === null && list !== null ? (
+            <Button size="sm" onClick={() => props.onAction({ kind: "form", id: null })}>
+              Add a connection
+            </Button>
+          ) : undefined
+        }
+      />
+      {props.problem === null ? null : (
+        <Banner tone="neg" icon="alert" title="The connections could not be read">
+          <span>{props.problem}</span>
+        </Banner>
+      )}
+      {props.refusal === null || editing !== null ? null : (
+        <Banner tone="neg" icon="alert" title="RPE did not make that change">
+          <span>{props.refusal}</span>
+        </Banner>
+      )}
+      {editing === null || list === null ? null : <ConnectionForm key={`${editing.id ?? "new"}:${JSON.stringify(editing.fill ?? null)}`} was={was} fill={editing.fill} providers={list.providers} saving={props.saving} refusal={props.refusal} onSave={(save) => props.onSave(save, editing.id)} onCancel={() => props.onAction({ kind: "none" })} />}
+      {list === null ? (
+        props.loading ? (
+          <p class="lre-muted rpe-line">Reading the connections…</p>
+        ) : null
+      ) : list.connections.length === 0 ? (
+        <Empty icon="link" title="No connection yet">
+          <span>RPE's agents call their models through a connection.</span>
+        </Empty>
+      ) : (
+        <ul class="lre-stack rpe-plain">
+          {list.connections.map((view) => (
+            <ConnectionRow key={view.id} view={view} action={action} test={props.tests[view.id]} signIn={props.signIn(view.id)} tags={props.tags} onAction={props.onAction} onRemove={props.onRemove} onDefault={props.onDefault} onTest={props.onTest} />
+          ))}
+        </ul>
+      )}
+      {props.extra}
+    </div>
+  );
+}
+
+/** Asks RPE for a change to the connections, then reads them again; RPE's refusal comes back in its words. */
+async function changeThen(client: Pick<RpeClient, "call">, change: () => Promise<unknown>): Promise<{ list: ConnectionsShown | null; refusal: string | null }> {
+  try {
+    await change();
+  } catch (error) {
+    return { list: null, refusal: errorWords(error) };
+  }
+  return { list: await client.call("GET /api/v1/connections", {}), refusal: null };
+}
+
+export function ConnectionsPage() {
+  const app = useApp();
+  const [list, setList] = useState<ConnectionsShown | null>(null);
+  const [read, setRead] = useState<{ loading: boolean; problem: string | null }>({ loading: true, problem: null });
+  const [action, setAction] = useState<ConnectionsAction>({ kind: "none" });
+  const [saving, setSaving] = useState(false);
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const [tests, setTests] = useState<Readonly<Record<string, ConnectionTestShown>>>({});
+  const [signins, setSignins] = useState<Readonly<Record<string, SignInShown>>>({});
+  const [tagStates, setTagStates] = useState<Readonly<Record<string, TagCheckState>>>({});
+  const readAgain = (): void => {
+    app.client.call("GET /api/v1/connections", {}).then(setList, () => undefined);
+  };
+  // A check is a job; when any job changes the connections are read again, so its result shows without a poll.
+  useEffect(
+    () =>
+      app.client.follow("~jobs", {
+        events(events) {
+          if (events.some((event) => String(event.kind) === "job")) readAgain();
+        },
+        reset: readAgain,
+        refused: () => undefined,
+      }),
+    [],
+  );
+  const checkTags = (id: string): void => {
+    setTagStates((now) => ({ ...now, [id]: { ...NO_TAG_STATE, busy: true } }));
+    app.client.call("POST /api/v1/connections/:id/tag-check", { id }).then(
+      (answer) => setTagStates((now) => ({ ...now, [id]: startedState(answer) })),
+      (error: unknown) => setTagStates((now) => ({ ...now, [id]: { ...NO_TAG_STATE, refusal: errorWords(error) } })),
+    );
+  };
+  const setForm = (id: string, form: ReplyForm): void => {
+    app.client.call("PUT /api/v1/settings", {}, { body: { level: "global", key: formKey(id), value: form } }).then(
+      () => setTagStates((now) => ({ ...now, [id]: { ...(now[id] ?? NO_TAG_STATE), refusal: null, said: `Saved: this connection's replies are marked with ${FORM_WORDS[form]} from the next turn.` } })),
+      (error: unknown) => setTagStates((now) => ({ ...now, [id]: { ...(now[id] ?? NO_TAG_STATE), said: null, refusal: errorWords(error) } })),
+    );
+  };
+  useEffect(() => {
+    let alive = true;
+    app.client.call("GET /api/v1/connections", {}).then(
+      (got) => {
+        if (!alive) return;
+        setList(got);
+        setRead({ loading: false, problem: null });
+      },
+      (error: unknown) => {
+        if (alive) setRead({ loading: false, problem: errorWords(error) });
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const readFor = useRef(new Set<string>());
+  useEffect(() => {
+    for (const c of list?.connections ?? []) {
+      if (c.auth !== "signin" || readFor.current.has(c.id)) continue;
+      readFor.current.add(c.id);
+      signInSteps(signInCalls(app.client))
+        .read(c.id)
+        .then((shown) => setSignins((now) => ({ ...now, [c.id]: shown })));
+    }
+  }, [list]);
+  const ask = (change: () => Promise<unknown>, after: ConnectionsAction): void => {
+    setSaving(true);
+    setRefusal(null);
+    changeThen(app.client, change).then(
+      (done) => {
+        setSaving(false);
+        setRefusal(done.refusal);
+        if (done.list !== null) {
+          setList(done.list);
+          setAction(after);
+        }
+      },
+      (error: unknown) => {
+        setSaving(false);
+        setRead({ loading: false, problem: errorWords(error) });
+      },
+    );
+  };
+  const steps = signInSteps(signInCalls(app.client));
+  /** One step of a sign-in: the connection's panel shows it busy, then what came of it; where it may have changed the connection, the list is read again. */
+  const signAct = (id: string, run: (was: SignInShown) => Promise<SignInShown>, reread = false): void => {
+    const was = signins[id] ?? NO_SIGNIN;
+    setSignins((now) => ({ ...now, [id]: { ...was, busy: true } }));
+    run(was).then(async (next) => {
+      setSignins((now) => ({ ...now, [id]: next }));
+      if (reread) await app.client.call("GET /api/v1/connections", {}).then(setList, () => undefined);
+    });
+  };
+  return (
+    <ConnectionsView
+      extra={<WebSearchSection />}
+      list={list}
+      loading={read.loading}
+      problem={read.problem}
+      action={action}
+      saving={saving}
+      refusal={refusal}
+      onAction={(next) => {
+        setRefusal(null);
+        setAction(next);
+      }}
+      onSave={(save, id) => ask(() => (id === null ? app.client.call("POST /api/v1/connections", {}, { body: save }) : app.client.call("PUT /api/v1/connections/:id", { id }, { body: save })), { kind: "none" })}
+      onRemove={(id) => ask(() => app.client.call("DELETE /api/v1/connections/:id", { id }), { kind: "none" })}
+      onDefault={(id) => ask(() => app.client.call("PUT /api/v1/connections/:id/default", { id }), action)}
+      tests={tests}
+      signIn={(id) => ({
+        shown: signins[id],
+        start: (key) => signAct(key, (was) => steps.start(key, was)),
+        code: (key, code) => setSignins((now) => ({ ...now, [key]: { ...(now[key] ?? NO_SIGNIN), code } })),
+        finish: (key, code) => signAct(key, (was) => steps.finish(key, was, code), true),
+        cancel: (key) => signAct(key, (was) => steps.cancel(key, was)),
+        out: (key) => signAct(key, (was) => steps.out(key, was), true),
+      })}
+      tags={{ states: tagStates, onCheck: checkTags, onForm: setForm }}
+      onTest={(id) => {
+        setTests((now) => ({ ...now, [id]: { busy: true } }));
+        testConnection(app.client, id).then((test) => setTests((now) => ({ ...now, [id]: test })));
+      }}
+    />
+  );
+}
+
+export const entry: PageEntry = { id: "connections", title: "Connections", icon: "link", shells: ["web", "drawer"], needsChat: false, often: false, order: 100, render: () => <ConnectionsPage /> };

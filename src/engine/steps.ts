@@ -1,0 +1,238 @@
+// Model steps (DESIGN §5.2, D10, D31; ARCHITECTURE §3.4). The engine asks; the backend answers
+// through a StepPort it implements over the host. Routing (D10): `interpret` on the helper;
+// `npc.choose` on the Decision connection; on a decision error the helper, then
+// engine-only. Prompts and schemas stay model-agnostic (D31). Producers land after the ledger gate.
+
+import type { JsonObject, JsonValue } from "../shared/json";
+import type { ClaimPlace } from "../shared/claims";
+import type { ActionId } from "../shared/ids";
+import type { GenerationKind, LedgerEvent } from "../shared/ledger";
+import type { StepPurpose, WorldDoc } from "../shared/world";
+import type { Judgement } from "./adjudication";
+import type { Answers, Questions } from "./decide";
+import type { Registry } from "./registry-impl";
+import type { WorldState } from "./state";
+import type { SkipRecord } from "./time";
+
+export interface DecisionRequest {
+  purpose: StepPurpose;
+  state: JsonValue;
+  questions: Questions;
+}
+
+export interface DecisionResult {
+  answers: Answers;
+  /** Resolved model id. */
+  model: string;
+  /** Which path answered. */
+  via: "decision" | "helper";
+  ms: number;
+}
+
+export interface PromptMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+export interface PromptRequest {
+  purpose: StepPurpose;
+  messages: PromptMessage[];
+  maxTokens: number;
+  json: boolean;
+}
+
+export interface PromptResult {
+  text: string;
+  model: string;
+  ms: number;
+}
+
+export type StepFailure = { kind: "timeout" } | { kind: "aborted" } | { kind: "provider"; message: string } | { kind: "parse"; message: string };
+
+export type StepOutcome<T> = { ok: true; value: T } | { ok: false; failure: StepFailure };
+
+/** Implemented by the backend. Every call is bounded by the caller's signal; there is no blind retry. */
+export interface StepPort {
+  decide(request: DecisionRequest, signal: AbortSignal): Promise<StepOutcome<DecisionResult>>;
+  prompt(request: PromptRequest, signal: AbortSignal): Promise<StepOutcome<PromptResult>>;
+}
+
+/** `interpret`: typed input to its actions, in order (DESIGN §9.4, §11). */
+export interface InterpretInput {
+  text: string;
+  scene: JsonValue;
+  actions: ActionId[];
+}
+
+/** The most actions one message plays in a turn: the first and the queued ones after it (DESIGN §11). */
+export const ACTION_QUEUE_LIMIT = 5;
+
+/**
+ * A thing the player's typed action uses that the world doesn't have, made real for it (DESIGN
+ * §9.4 player claims): the plan makes it where the action expects it, marked `claimed`, just
+ * before the action plays, and the action's `param` takes it. Money (`cents`) is no thing: it goes
+ * into the player character's carried cash, and the action pays it over.
+ */
+export interface Claim {
+  param: string;
+  /** Its name, in the player's own words; money's, its amount. */
+  name: string;
+  at: ClaimPlace;
+  /** Its kind: the param's. */
+  kind: string;
+  /** The economy catalog row that prices it, and that row's price category. */
+  catalog?: string;
+  category?: string;
+  /** Food or drink: cleared once handed over or used. */
+  consumable: boolean;
+  /** A gear item row it takes its weight, size and wear slot from. */
+  like?: string;
+  /** The player character's own thing the world had elsewhere: brought to hand (or here) rather than made (DESIGN §9.4). Absent in older records. */
+  existing?: string;
+  /** A short walk away (ITEMS-SPEC §4.5): the minutes on foot fetching `existing` takes, added to the action's time. */
+  fetch?: number;
+  /**
+   * Money the player said they had, in minor units: the amount they agreed to have added for. As the
+   * action plays, only what the claimer's carried cash lacks of what it pays is added (DESIGN §9.4),
+   * and nothing when they carry that much by then, or when it pays more than this (raised on the
+   * intent gate's Edit), which no one asked them about.
+   */
+  cents?: number;
+  /**
+   * Money's: the param of the action that plays (the economy Pay's `amount`) holding what it pays.
+   * Read as it plays, so an edit of that pick is what the claim covers; without it, `cents`.
+   */
+  amountParam?: string;
+}
+
+/**
+ * The action the player's words named, when another plays in its place (money handed over plays as
+ * the economy's Pay, DESIGN §9.4): its requirements on the picks it was given still hold the one
+ * that plays (Give's `at(to, here)`: cash goes only to someone here).
+ */
+export interface Needs {
+  action: ActionId;
+  /** Its picks the action that plays doesn't carry, as the read gave them. */
+  params: JsonObject;
+  /**
+   * Its picks the action that plays carries, each by that action's param (Give's `to` is Pay's
+   * `to`): read from that action's params as it plays, so an edit of them (the intent gate's Edit)
+   * holds it to what it now names.
+   */
+  shared: Record<string, string>;
+}
+
+/** One of the input's actions after the first, as `interpret` read it: an engine action, its params, and its words. */
+export interface QueuedAction {
+  action: ActionId;
+  params: JsonObject;
+  /** As the player would type it ("I buy a latte"): what the chip offers when the queue stops before it; empty when it can't be offered. */
+  text: string;
+  /** The `judge` step's answer for its check, when the queue's check is this action's (DESIGN §11). */
+  judgement?: Judgement;
+  /** The thing the player said they had that this action uses, made real before it plays (DESIGN §9.4). */
+  claim?: Claim;
+  /** The action the player's words named, when this one plays in its place. */
+  needs?: Needs;
+  /** The player's own words for what its params paid in another's place named (`InterpretOutput.said`). */
+  said?: Record<string, string>;
+}
+
+export interface InterpretOutput {
+  action: ActionId | null;
+  params: JsonObject;
+  probabilities: Record<string, number>;
+  /**
+   * The first action as the player would type it ("I take the letter from Marcus"), or, for a time
+   * skip, what the input says happens in that time ("we catch up with John"): the player's own words
+   * the intent gate's card quotes (DESIGN §5.1). Absent when the read gave none it may show.
+   */
+  text?: string;
+  /** Time the input lets pass after its last action ("…and sleep until the next morning"): `minutes` or `until`. */
+  then?: JsonObject;
+  /** The input's further actions, in order, each played against the state the one before it left until the queue stops (DESIGN §11); none without a first action. */
+  queue?: QueuedAction[];
+  /** What the input says after its actions that no engine action reads, each as the player would type it: offered on a chip that sends it as the next message. Never time passing, which is `then`'s. */
+  next?: string[];
+  /** The `judge` step's answer for the action's check (DESIGN §11), recorded with the intent so a Re-run reads the same one. */
+  judgement?: Judgement;
+  /** The thing the player said they had that the first action uses, made real before it plays (DESIGN §9.4). */
+  claim?: Claim;
+  /** The action the player's words named, when the first action plays in its place. */
+  needs?: Needs;
+  /**
+   * The player's own words for what each of the first action's params paid in another's place named
+   * (`ParamDef.outside`, DESIGN §9.4 typed money), by param ("the tip jar" for a Pay's `to`): the
+   * intent gate's card and the Outcome name the receiver by them (`actionWords`), so each says what
+   * the payment was for. A param whose words the message doesn't say has none.
+   */
+  said?: Record<string, string>;
+  /**
+   * The first action was picked in the engine's own controls (the Actions sheet, a panel, the map, a
+   * chip), not typed: its requirements hold it as they always have, while a typed action whose plain
+   * requirement doesn't hold plays as plain roleplay (DESIGN §11).
+   */
+  picked?: true;
+}
+
+/** `extract`: proposals read from a reply, bounded per channel (DESIGN §9.4). */
+export interface ExtractInput {
+  narration: string;
+  /** The fold prefix the proposals validate against, rendered for the prompt. */
+  prefix: JsonValue;
+  /** Minutes already applied for this swipe (DESIGN §9.2, `time.advance`). */
+  appliedMinutes: number;
+  channels: string[];
+}
+
+export interface ExtractOutput {
+  proposals: JsonObject[];
+}
+
+// ---------------------------------------------------------------- the pure turn pipeline
+// Implemented in `engine/simulate.ts`; called by the ledger (`TurnModel`) through
+// the backend. Everything here is synchronous and deterministic given its inputs: model steps run
+// before (`interpret`) and after (`extract`) and arrive as plain data (DESIGN §5.1).
+
+export interface TurnPlanInput {
+  registry: Registry;
+  world: WorldDoc;
+  /** The fold prefix with the target's live markers applied (DESIGN §5.1 step 2). */
+  state: Readonly<WorldState>;
+  runSeed: string;
+  /** The action seed: fresh per Re-run, or `hash(runSeed, parent path, action)` in same-roll worlds. */
+  seed: string;
+  kind: GenerationKind;
+  /** The turn's user messages, oldest first. */
+  userTexts: string[];
+  /** `interpret`'s answer when it ran and succeeded; null otherwise (engine-only, or not an action). */
+  intent: InterpretOutput | null;
+  /** A timelapse intent's time skip as the pre phase ran it (DESIGN §24.7), replayed beat by beat; absent, a plain timelapse. */
+  skip?: SkipRecord | null;
+}
+
+/** Pre-reply events: resolution, elapsed time, simulation, timelapse and in-turn materialization, in fold order. */
+export interface TurnPlan {
+  events: LedgerEvent[];
+  /** The turn's elapsed game minutes (already included in `events` as clock advances). */
+  elapsedMinutes: number;
+}
+
+export interface PostTurnInput {
+  registry: Registry;
+  world: WorldDoc;
+  /** The fold prefix plus `pre` plus the validated extraction events. */
+  state: Readonly<WorldState>;
+  runSeed: string;
+  seed: string;
+  /** Minutes this swipe has applied so far (elapsed plus any `time.advance`). */
+  appliedMinutes: number;
+  /** The validated extraction events, so post steps can fire event rules on them (e.g. `enter`). */
+  extracted: LedgerEvent[];
+}
+
+export interface TurnPipeline {
+  plan(input: TurnPlanInput): TurnPlan;
+  /** Post steps after extraction: catch-up, off-screen agents, tracks and rules (DESIGN §5.1 step 5). */
+  post(input: PostTurnInput): LedgerEvent[];
+}

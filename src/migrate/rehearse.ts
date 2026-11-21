@@ -1,0 +1,518 @@
+// The rehearsal (STANDALONE-PLAN §15.3 step 1, §15.5): a full read of today's data, all three places
+// of it, that changes nothing and returns the report. Today's build keeps its data in Lumiverse's
+// database (one user's chats, messages and their metadata), in the extension's storage folders in
+// Lumiverse's data folder (per user, and per extension or per user as the extension is installed:
+// both are read), and in the runtime's own folders on the server, its working copy's unsent writes
+// laid over the user's storage. Every file and database entry found is classified to a row of the
+// plan's table, every chat is read by today's own readers over the read-only stand-in, and the
+// report holds counts and checksums only. Each run reads everything again: given the report of an
+// earlier run, the report says what changed since.
+
+import { existsSync } from "node:fs";
+import { statfs } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { walk, type FoundFile } from "../app/archive";
+import { agentMetaOf } from "./today/chat-agent-meta";
+import { decodeLedger } from "./today/ledger-io";
+import { readRun } from "./today/run";
+import { chatKnowledgePrefsOf } from "./today/chat-knowledge-prefs";
+import type { ChatId, UserId, WorldId } from "../shared/ids";
+import { isRecord, type JsonObject } from "../shared/json";
+import { LEDGER_NAMESPACE } from "../shared/ledger";
+import { tidySettingsOf } from "./today/user-settings";
+import { backupSize, backupSources, makeBackup, type BackupChat, type BackupResult } from "./backup";
+import { classifyRuntime, classifyStorage, EXTENSION_WIDE, type Classified, type ClassifyContext } from "./classify";
+import { namedFiles, readBytes, sha256 } from "./files";
+import { areaFiles, areaHead, countLedgers, countLink, countSettings, countWorldDoc, INSIDE_UNIT, MIND_FILE, recordBlobs, Tally, type Unreadable } from "./inside";
+import { damagedOf, notReadAsJson } from "./failures";
+import type { ChatRow, LumiverseDb } from "./lumiverse-db";
+import { CHAT_HELD, chatEndOf, changesSince, countRow, insideEnds, refusalsOf, type ChatReport, type Item, type MigrationReport, REPORT_FORMAT, type RowReport, type Where } from "./report";
+import { placesOf, type Place } from "./carry";
+import { ROW, ROWS, type RowId } from "./rows";
+import type { OwnerRow, RefusedRow } from "./setting-list";
+import { runtimeOrigins } from "./today/lumiah/runtime/lumiverse";
+import { loopbackModel, loopsBack, runtimeBase } from "./today/lumiah/link/contract";
+import { openToday, type Sources, type Today } from "./today";
+import { disownedOf } from "./no-runtime";
+import { registeredNames } from "./runtime-folders";
+
+export interface RehearseOptions {
+  mode?: "rehearsal" | "real run";
+  /** The report of an earlier run: this one says what changed since. */
+  previous?: MigrationReport;
+  /** Where the real run will write (RPE's data folder, the backup): the free space there is weighed against what it needs. */
+  target?: string;
+  /** Whose RPE the real run would write into: the Lumiverse user its config names, and the users earlier runs carried into its data folder. Absent: not asked. */
+  rpe?: { owner: string | null; earlier: readonly string[] };
+  /** The rows he gave to what no row names (`migration.rows`). */
+  given?: readonly OwnerRow[];
+  /** The rows `migration.rows` gives that cannot be used, as written, each with why: the report names them, and the run goes on without them. */
+  refused?: readonly RefusedRow[];
+  /** Whether the real run is given the file tree's places, where the user's own files go (`rpe migrate` always gives them). */
+  tree?: boolean;
+  /** Whether the real run is given the turn lane's writer of his jobs and approvals, so they land (`rpe migrate` gives it). */
+  jobs?: boolean;
+  now?: () => Date;
+}
+
+/** The bytes and checksum of a JSON value as text: how a database entry is measured. */
+function measured(value: unknown): { bytes: number; sha256: string } {
+  const text = JSON.stringify(value) ?? "null";
+  return { bytes: new TextEncoder().encode(text).length, sha256: sha256(text) };
+}
+
+function itemOf(where: Where, path: string, size: { bytes: number; sha256: string }, found: Classified | null, note?: string): Item {
+  const n = note ?? found?.note;
+  return { where, path, bytes: size.bytes, sha256: size.sha256, row: found?.row ?? null, fate: found?.fate ?? null, ...(n ? { note: n } : {}) };
+}
+
+/** The keys of the engine's own key of a chat's metadata (`lumi_rp_engine`): its run (`ChatRun`), its own choices and its agents' metadata. */
+const RUN_KEYS: Readonly<Record<string, true>> = { v: true, worldId: true, revision: true, runSeed: true, startedAt: true };
+const PREFS_KEYS: Readonly<Record<string, true>> = { knowledge: true, narrator: true, engine: true, tidy: true };
+const AGENTS_KEYS: Readonly<Record<string, true>> = { learned: true, assistant: true, rollback: true };
+
+/**
+ * `prefs.engineFrom: "default"`: that the chat's engine was the user's New chats start on, recorded at
+ * its first turn rather than chosen by the chat. Only the depth build wrote and read it (a54b3987,
+ * `src/backend/chat-knowledge-prefs.ts:41,78,192-193`); today's reader keeps the engine alone
+ * (`chat-knowledge-prefs.ts:61-62`), so it steers nothing now.
+ */
+const ENGINE_FROM = "which engine the chat plays came from your default for new chats, as a build with the depth engine marked it; the previous build reads the engine alone, so nothing reads this now";
+
+/**
+ * The engine's entries in a chat's metadata, each its own item: the run, the engine chosen, the
+ * chat's own settings, the agents' learned area, the assistant thread, a rollback never applied;
+ * and LumiAH's switch for the chat. A key the engine doesn't write is found, not classified.
+ */
+function chatEntries(chat: ChatRow, identifier: string): Item[] {
+  const out: Item[] = [];
+  const at = (part: string): string => `chats/${chat.id}/${part}`;
+  const own = chat.metadata[LEDGER_NAMESPACE];
+  if (isRecord(own)) {
+    const run = Object.fromEntries(Object.entries(own).filter(([k]) => Object.hasOwn(RUN_KEYS, k)));
+    if (Object.keys(run).length > 0) out.push(itemOf("Lumiverse database", at(`${LEDGER_NAMESPACE}/run`), measured(run), { row: "chat-run", fate: "carried" }, readRun(chat.metadata) ? undefined : "a run that doesn't read: the previous build plays no world in this chat"));
+    for (const [key, value] of Object.entries(own)) {
+      if (Object.hasOwn(RUN_KEYS, key)) continue;
+      if (key === "prefs" && isRecord(value)) {
+        for (const [pref, v] of Object.entries(value)) {
+          if (pref === "engineFrom") {
+            out.push(itemOf("Lumiverse database", at(`${LEDGER_NAMESPACE}/prefs/${pref}`), measured(v), { row: "chat-switch", fate: "archived", note: ENGINE_FROM }));
+            continue;
+          }
+          const row = !Object.hasOwn(PREFS_KEYS, pref) ? null : pref === "engine" ? "chat-switch" : "settings";
+          out.push(itemOf("Lumiverse database", at(`${LEDGER_NAMESPACE}/prefs/${pref}`), measured(v), row === null ? null : { row, fate: "carried" }));
+        }
+      } else if (key === "agents" && isRecord(value)) {
+        for (const [part, v] of Object.entries(value)) {
+          if (part === "rollback" && v === null) continue;
+          const row = part === "learned" ? "agents-workspace" : part === "assistant" ? "assistant-threads" : part === "rollback" ? "rollback" : null;
+          out.push(itemOf("Lumiverse database", at(`${LEDGER_NAMESPACE}/agents/${part}`), measured(v), row === null || !Object.hasOwn(AGENTS_KEYS, part) ? null : { row, fate: row === "rollback" ? "archived" : "carried" }));
+        }
+      } else out.push(itemOf("Lumiverse database", at(`${LEDGER_NAMESPACE}/${key}`), measured(value), null));
+    }
+  } else if (own !== undefined) out.push(itemOf("Lumiverse database", at(LEDGER_NAMESPACE), measured(own), null));
+  const mark = chat.metadata[`lumiah_chat_${identifier}`];
+  if (mark !== undefined && mark !== null) out.push(itemOf("Lumiverse database", at(`lumiah_chat_${identifier}`), measured(mark), { row: "chat-switch", fate: "carried" }));
+  return out;
+}
+
+/**
+ * A message's engine entry, as one item: a reply's ledger (inline, or a header and its chunks), or
+ * the panel request recorded on a user's own message. One that reads as neither is found, not
+ * classified; a ledger that can't be decoded is listed as unreadable and archived.
+ */
+function messageEntry(message: { id: string; chatId: string; isUser: boolean; metadata: JsonObject }, identifier: string, unreadable: Unreadable[]): Item {
+  const parts = Object.entries(message.metadata).filter(([k]) => k === identifier || k.startsWith(`${identifier}:`));
+  const value = Object.fromEntries(parts) as JsonObject;
+  const path = `chats/${message.chatId}/messages/${message.id}/${identifier}`;
+  const head = message.metadata[identifier];
+  if (head === undefined) {
+    unreadable.push({ path, why: "chunks of a record whose header is missing" });
+    return itemOf("Lumiverse database", path, measured(value), { row: "ledger", fate: "archived" }, "chunks of a record whose header is missing");
+  }
+  if (message.isUser && isRecord(head) && typeof head.action === "string") return itemOf("Lumiverse database", path, measured(value), { row: "panel-requests", fate: "carried" });
+  if (isRecord(head) && (isRecord(head.swipes) || typeof head.chunks === "number")) {
+    if (decodeLedger(message.metadata) !== null) return itemOf("Lumiverse database", path, measured(value), { row: "ledger", fate: "carried" });
+    unreadable.push({ path, why: "the engine record on this message can't be decoded" });
+    return itemOf("Lumiverse database", path, measured(value), { row: "ledger", fate: "archived" }, "an engine record that can't be decoded");
+  }
+  return itemOf("Lumiverse database", path, measured(value), null);
+}
+
+/** A storage folder's files as items, with what the runtime hasn't sent laid over it (`pending`). `files` are the folder's files that are read: the user's whole, the extension's own folder's named few. */
+async function storageItems(where: Where, root: string | null, files: readonly FoundFile[], pending: ReadonlyMap<string, string | null>, context: ClassifyContext, unreadable: Unreadable[]): Promise<Item[]> {
+  const out: Item[] = [];
+  const onDisk = new Set<string>();
+  for (const f of files) {
+    onDisk.add(f.path);
+    if (f.link) {
+      out.push(itemOf(where, f.path, { bytes: f.bytes, sha256: "" }, null, "a symbolic link, which the migration doesn't follow"));
+      continue;
+    }
+    const found = classifyStorage(f.path, context);
+    if (found?.unreadable) unreadable.push({ path: `${where}: ${f.path}`, why: found.note ?? "damaged" });
+    const fresher = pending.get(f.path);
+    if (typeof fresher === "string") {
+      out.push(itemOf(where, f.path, measuredText(fresher), found, "taken from the runtime's working copy, which hadn't sent it yet"));
+      continue;
+    }
+    const size = { bytes: f.bytes, sha256: sha256((await readBytes(join(root ?? "", f.path))) ?? new Uint8Array()) };
+    if (fresher === null) out.push(itemOf(where, f.path, size, found && { ...found, fate: "archived" }, "removed in the runtime's working copy, which hadn't sent that yet"));
+    else out.push(itemOf(where, f.path, size, found));
+  }
+  for (const [path, text] of pending) {
+    if (onDisk.has(path) || text === null) continue;
+    out.push(itemOf(where, path, measuredText(text), classifyStorage(path, context), "taken from the runtime's working copy, which hadn't sent it yet"));
+  }
+  return out;
+}
+
+function measuredText(text: string): { bytes: number; sha256: string } {
+  return { bytes: new TextEncoder().encode(text).length, sha256: sha256(text) };
+}
+
+/** The chats LumiAH's list of chats to forget names (`{v:1, chats{chatId→ms}}`, `H/extension/backend/forget.ts:52`). */
+function forgottenOf(raw: unknown): Set<string> {
+  return new Set(isRecord(raw) && isRecord(raw.chats) ? Object.keys(raw.chats) : []);
+}
+
+/** Free bytes where `target` is, or would be made (its nearest folder that exists). */
+async function freeAt(target: string): Promise<number> {
+  let at = resolve(target);
+  while (!existsSync(at) && dirname(at) !== at) at = dirname(at);
+  const s = await statfs(at);
+  return s.bavail * s.bsize;
+}
+
+/** The chats with engine records, from Lumiverse's database alone: what the backup lists. */
+function engineChats(db: LumiverseDb, chats: readonly ChatRow[], identifier: string): BackupChat[] {
+  const turns = new Map<string, number>();
+  for (const m of db.engineMessages(identifier)) {
+    const ledger = m.isUser ? null : decodeLedger(m.metadata);
+    turns.set(m.chatId, (turns.get(m.chatId) ?? 0) + (ledger ? Object.keys(ledger.swipes).length : 0));
+  }
+  return chats.flatMap((c) => {
+    if (!turns.has(c.id) && !isRecord(c.metadata[LEDGER_NAMESPACE]) && !isRecord(c.metadata[`lumiah_chat_${identifier}`])) return [];
+    const run = readRun(c.metadata);
+    return [{ chatId: c.id, name: c.name, engine: run ? (chatKnowledgePrefsOf(c.metadata).engine ?? "classic") : null, worldId: run?.worldId ?? null, messages: db.messageCount(c.id), turns: turns.get(c.id) ?? 0 }];
+  });
+}
+
+/** Takes the backup of today's data into `dest`, reading each file `pieceBytes` at a time: a new archive each time. */
+export async function backup(sources: Sources, dest: string, pieceBytes: number, now?: () => Date): Promise<BackupResult> {
+  const today = await openToday(sources);
+  try {
+    return await backupOf(today, dest, pieceBytes, now);
+  } finally {
+    today.close();
+  }
+}
+
+/** The backup of an open read of today's data: its storage folders, its runtime's files and the chats with engine records. */
+export async function backupOf(today: Today, dest: string, pieceBytes: number, now?: () => Date): Promise<BackupResult> {
+  const chats = engineChats(today.db, today.chats, today.sources.identifier);
+  const sources = await backupSources({ user: today.user, extension: today.extension }, today.runtime.files);
+  return makeBackup({ dest, sources, chats, roots: { user: today.user, extension: today.extension, runtime: today.sources.runtime }, pieceBytes, ...(now ? { now } : {}) });
+}
+
+export async function rehearse(sources: Sources, options: RehearseOptions = {}): Promise<MigrationReport> {
+  const today = await openToday(sources);
+  try {
+    return await reportOf(today, options);
+  } finally {
+    today.close();
+  }
+}
+
+/** The report on an open read of today's data: every file and database entry found, classified and counted, and every chat read by today's readers. */
+export async function reportOf(today: Today, options: RehearseOptions = {}): Promise<MigrationReport> {
+  const at = (options.now?.() ?? new Date()).toISOString();
+  const { sources, db, pending, writes, userView, standIn, reader } = today;
+  const found = today;
+  {
+    const userId = sources.userId as UserId;
+    const chatRows = today.chats;
+    const context: ClassifyContext = { chats: new Set(chatRows.map((c) => c.id)), forgotten: forgottenOf(await userView.json("harness/forget.json")) };
+
+    const unreadable: Unreadable[] = [];
+    const items: Item[] = [];
+    items.push(...(await storageItems("user storage", found.user, found.user === null ? [] : await walk(found.user), pending, context, unreadable)));
+    // The extension's own folder is shared by every user of the Lumiverse: only the files kept there for the extension as a whole are read.
+    if (found.extension !== null) items.push(...(await storageItems("extension storage", found.extension, await namedFiles(found.extension, EXTENSION_WIDE), new Map(), context, unreadable)));
+    for (const f of found.runtime.files) {
+      const bytes = await readBytes(f.disk);
+      items.push(itemOf("runtime", f.path, { bytes: bytes?.length ?? f.bytes, sha256: sha256(bytes ?? new Uint8Array()) }, f.link ? null : f.working !== undefined ? { row: "working-copy", fate: "archived", note: f.working } : classifyRuntime(f.path), f.link ? "a symbolic link, which the migration doesn't follow" : undefined));
+    }
+    for (const chat of chatRows) items.push(...chatEntries(chat, sources.identifier));
+    for (const m of db.engineMessages(sources.identifier)) items.push(messageEntry(m, sources.identifier, unreadable));
+
+    // Every chat the engine has anything of, read by today's readers.
+    const engine = new Set<string>();
+    for (const i of items) {
+      const chat = /^chats\/([^/]+)\//.exec(i.path)?.[1] ?? /^runs\/([^/]+)\//.exec(i.path)?.[1] ?? null;
+      if (chat !== null && context.chats.has(chat)) engine.add(chat);
+    }
+    // Today's settings reader runs first, as the runtime's does: it sets a damaged settings file aside.
+    await reader.userSettings(userId);
+    const tally = new Tally();
+    const chats: ChatReport[] = [];
+    const named = new Map<string, { row: RowId; why: string }>();
+    const fromRecords: string[] = [];
+    const nameBlob = (path: string, row: RowId, why: string): void => {
+      if (!named.has(path)) named.set(path, { row, why });
+    };
+    const blobs = new Set(items.filter((i) => i.where === "user storage" && (i.path.startsWith("agents/blobs/") || i.path.startsWith("harness/blobs/")) && i.fate !== null).map((i) => i.path));
+    const missingBlob = (path: string, why: string): void => {
+      if (!blobs.has(path)) unreadable.push({ path: `user storage: ${path}`, why });
+    };
+    for (const chat of chatRows) {
+      if (!engine.has(chat.id)) continue;
+      const read = await reader.read(chat.id as ChatId, userId);
+      const before = tally.counts.get("ledger") ?? 0;
+      const stories = tally.counts.get("story-record") ?? 0;
+      const held = new Map(CHAT_HELD.map((row) => [row, tally.counts.get(row) ?? 0]));
+      countLedgers(read.ledgers, tally);
+      for (const ledger of read.ledgers) {
+        for (const rec of Object.values(ledger?.swipes ?? {})) {
+          const refs = recordBlobs(rec);
+          for (const h of refs.agents) {
+            missingBlob(`agents/blobs/${h}`, `a session text a record on chat ${chat.id} names; the previous build's clean-up had removed it`);
+            fromRecords.push(`agents/blobs/${h}`);
+          }
+          for (const h of refs.harness) {
+            missingBlob(`harness/blobs/${h.slice(0, 2)}/${h}`, `a harness text a record on chat ${chat.id} names; the previous build's clean-up had removed it`);
+            fromRecords.push(`harness/blobs/${h.slice(0, 2)}/${h}`);
+          }
+        }
+      }
+      const meta = agentMetaOf(chat.metadata);
+      tally.add("agents-workspace", Object.keys(meta.learned).length);
+      tally.add("assistant-threads", meta.assistant.messages.length + Object.keys(meta.assistant.proposals).length);
+      for (const h of [...Object.values(meta.learned).map((f) => f.hash), ...meta.assistant.messages, ...Object.values(meta.assistant.proposals)]) missingBlob(`agents/blobs/${h}`, `a file chat ${chat.id}'s agents kept; the previous build's clean-up had removed it`);
+      for (const f of Object.values(meta.learned)) nameBlob(`agents/blobs/${f.hash}`, "agents-workspace", `a file of chat ${chat.id}'s learned area`);
+      for (const h of [...meta.assistant.messages, ...Object.values(meta.assistant.proposals)]) nameBlob(`agents/blobs/${h}`, "assistant-threads", `a message or proposal of chat ${chat.id}'s assistant thread`);
+      unreadable.push(...read.unreadable);
+      const inside = Object.fromEntries(CHAT_HELD.flatMap((row) => ((tally.counts.get(row) ?? 0) - (held.get(row) ?? 0) > 0 ? [[row, (tally.counts.get(row) ?? 0) - (held.get(row) ?? 0)]] : [])));
+      chats.push({ chatId: chat.id, engine: read.engine, worldId: read.worldId, messages: read.messages, replies: read.replies, inside, turns: (tally.counts.get("ledger") ?? 0) - before, story: (tally.counts.get("story-record") ?? 0) - stories, journal: read.journal, notOpened: read.notOpened, deletedTurns: read.deletedTurns, underWay: read.underWay, waiting: read.waiting, held: read.held });
+    }
+
+    // The agents engine's global workspace: its files, by the blobs they name.
+    const global = await userView.json("agents/global.json");
+    if (isRecord(global) && isRecord(global.files)) {
+      tally.add("agents-workspace", Object.keys(global.files).length);
+      for (const f of Object.values(global.files)) {
+        if (!isRecord(f) || typeof f.hash !== "string") continue;
+        missingBlob(`agents/blobs/${f.hash}`, "a file of the global workspace; the previous build's clean-up had removed it");
+        nameBlob(`agents/blobs/${f.hash}`, "agents-workspace", "a file of the global workspace");
+      }
+    }
+
+    // The worlds, through today's world store: every revision its index lists must read. A world whose head revision holds the tidy-up's switch (`packs.gear.config.tidy.auto`) is noted, its level named in the report.
+    const worldIds = new Set<string>();
+    const tidyWorlds: string[] = [];
+    for (const path of await userView.list("worlds")) {
+      const id = /^worlds\/([^/]+)\/index\.json$/.exec(path)?.[1];
+      if (id) worldIds.add(id);
+    }
+    for (const id of [...worldIds].sort()) {
+      try {
+        const index = await reader.worldStore.index(id as WorldId, userId);
+        if (!index) {
+          unreadable.push({ path: `user storage: worlds/${id}/index.json`, why: "a world index the previous build's world store doesn't read" });
+          continue;
+        }
+        const docs = await reader.worldStore.getMany(id as WorldId, userId, index.revisions);
+        for (const rev of index.revisions) {
+          const doc = docs.get(rev);
+          if (!doc) {
+            unreadable.push({ path: `user storage: worlds/${id}/rev/${rev}.json`, why: "a revision the world's index lists, which the previous build's world store can't read" });
+            continue;
+          }
+          countWorldDoc(doc, rev === index.head, tally);
+          const raw: unknown = doc;
+          const packs = rev === index.head && isRecord(raw) ? raw.packs : undefined;
+          const tidyOf = isRecord(packs) && isRecord(packs.gear) && isRecord(packs.gear.config) && isRecord(packs.gear.config.tidy) ? packs.gear.config.tidy : null;
+          if (tidyOf !== null && tidyOf.auto !== undefined) tidyWorlds.push(id);
+        }
+        await reader.worldStore.history(id as WorldId, userId);
+        const draft = await userView.json(`worlds/${id}/draft.json`);
+        if (isRecord(draft)) countWorldDoc(draft.doc, false, tally);
+      } catch {
+        // A fixed reason: the store's own words can quote the file's text, and the report holds no content.
+        unreadable.push({ path: `user storage: worlds/${id}/index.json`, why: "the previous build's world store can't read it" });
+      }
+    }
+
+    // The harness's workspace areas: each head's index, and every file it names.
+    const versions = { mind: new Set<string>(), notes: new Set<string>(), home: new Set<string>(), guidance: new Set<string>() };
+    for (const item of items) {
+      if (item.where !== "user storage" || item.fate === null) continue;
+      const area = /^harness\/docs\/(chats\/([^/]+)\/(area\/[^/]+|learned)\.json|workspace\/user\.json)$/.exec(item.path);
+      if (!area) continue;
+      const head = areaHead(await userView.json(item.path));
+      if (head === undefined) {
+        unreadable.push({ path: `user storage: ${item.path}`, why: "an area head that doesn't read" });
+        continue;
+      }
+      if (head === null) continue;
+      const indexPath = `harness/blobs/${head.slice(0, 2)}/${head}`;
+      nameBlob(indexPath, item.row ?? "learned-and-home", `the index of the area ${item.path} names`);
+      const files = areaFiles(await userView.json(indexPath));
+      if (files === null) {
+        unreadable.push({ path: `user storage: ${indexPath}`, why: `the index ${item.path} names; the previous build's clean-up had removed it, or it doesn't read` });
+        continue;
+      }
+      const chat = area[2] ?? "";
+      for (const f of files) {
+        const blob = `harness/blobs/${f.hash.slice(0, 2)}/${f.hash}`;
+        missingBlob(blob, `the text of ${f.path} in ${item.path}; the previous build's clean-up had removed it`);
+        const key = `${chat}\u0000${f.path}\u0000${f.hash}`;
+        if (area[3]?.startsWith("area/")) {
+          (MIND_FILE.test(f.path) ? versions.mind : versions.notes).add(key);
+          nameBlob(blob, MIND_FILE.test(f.path) ? "mind-files" : "author-notes", `the text of ${MIND_FILE.test(f.path) ? "a mind file" : "a note"} in a chat's area (${f.path})`);
+        } else {
+          versions.home.add(key);
+          const guidance = area[1] === "workspace/user.json" && f.path.split("/").pop() === "GUIDANCE.md";
+          if (guidance) versions.guidance.add(key);
+          nameBlob(blob, guidance ? "guidance" : "learned-and-home", `the text of ${f.path} in ${item.path}`);
+        }
+      }
+    }
+    tally.add("mind-files", versions.mind.size);
+    tally.add("author-notes", versions.notes.size);
+    tally.add("learned-and-home", versions.home.size);
+    tally.add("guidance", versions.guidance.size);
+
+    const settingsDoc = await userView.json("settings.json");
+    countSettings(settingsDoc, await userView.json("harness/settings.json"), tally);
+    // Where the tidy-up's settings are found (R-201): a chat's switch (its own choice) and leave-alone list (its prefs), the world's switch, and a user-level `tidy` read as today's own reader reads it.
+    const tidyChats = new Set<string>();
+    for (const item of items) {
+      const pref = item.where === "Lumiverse database" ? new RegExp(`^chats/([^/]+)/${LEDGER_NAMESPACE}/prefs/(tidy|tidyLeft)$`).exec(item.path)?.[1] : undefined;
+      if (pref !== undefined) tidyChats.add(pref);
+      const run = item.where === "user storage" ? /^runs\/([^/]+)\/prefs\.json$/.exec(item.path)?.[1] : undefined;
+      if (run === undefined) continue;
+      const prefs = await userView.json(item.path);
+      if (isRecord(prefs) && (prefs.tidy !== undefined || prefs.tidyLeft !== undefined)) tidyChats.add(run);
+    }
+    const tidy = { chats: [...tidyChats].sort(), worlds: tidyWorlds, user: isRecord(settingsDoc) && settingsDoc.tidy !== undefined ? tidySettingsOf(settingsDoc.tidy).findings : null };
+    countLink(found.runtime.runtimes.length, await userView.json("harness/registry.json"), tally);
+    // Where today's build keeps two copies of the acceptance connections, the file of the acceptance runs is the authority (today's guard reads its list first, `agents/provider.ts:711`), and the settings' copy is counted as attached.
+    const guarded = await userView.json("agent-acceptance.json");
+    const copy = isRecord(settingsDoc) && isRecord(settingsDoc.agents) && isRecord(settingsDoc.agents.acceptance) && Array.isArray(settingsDoc.agents.acceptance.connections) ? settingsDoc.agents.acceptance.connections.length : 0;
+    if (isRecord(guarded) && Array.isArray(guarded.connections)) {
+      tally.add("second-copies", copy);
+      const file = items.find((i) => i.where === "user storage" && i.path === "agent-acceptance.json");
+      if (file !== undefined) file.note = "the authority for the connections acceptance runs guard, which the previous build's guard reads first: settings.json's copy of that list is counted as attached";
+    }
+
+    // A damaged file today's readers set aside, as the stand-in kept it.
+    for (const w of writes) if (w.op === "move" && w.to !== undefined && /\.corrupt-\d+$/.test(w.to)) unreadable.push({ path: `${w.store}: ${w.path}`, why: "damaged: the previous build's reader sets it aside and starts afresh" });
+    // Every other file read as JSON here that does not read, in the storage or the runtime's folders.
+    unreadable.push(...notReadAsJson(damagedOf(today), unreadable));
+
+    // The blobs a thing names count where that thing goes (a mind file's text with the mind files, a note's with the notes), and the sessions row holds the session, summary and transcript texts: the row of what names each blob is its row, and a blob nothing names stays with the sessions, where both blob stores are kept whole.
+    for (const p of fromRecords) nameBlob(p, "sessions", "a session, summary or transcript text a record names");
+    for (const item of items) {
+      if (item.where !== "user storage" || item.row !== "sessions" || item.fate !== "attached") continue;
+      const by = named.get(item.path);
+      if (by !== undefined) {
+        item.row = by.row;
+        item.fate = ROW[by.row].fate;
+        item.note = by.why;
+      } else if (/^(agents\/blobs\/[0-9a-f]{32}|harness\/blobs\/[0-9a-f]{2}\/[0-9a-f]{64})$/.test(item.path)) item.note = "no record, area or file names it; the previous build's clean-up removes a text nothing names after a week, so it is kept whole here";
+    }
+
+    // The rows he gave to what no row names (`migration.rows`): a path as the report names it, or a folder (a path ending in `/`).
+    const given = options.given ?? [];
+    const gave = given.map(() => 0);
+    for (const item of items) {
+      if (item.row !== null) continue;
+      const at = given.findIndex((g) => g.path === item.path || g.path === `${item.where}: ${item.path}` || (g.path.endsWith("/") && (item.path.startsWith(g.path) || `${item.where}: ${item.path}`.startsWith(g.path))));
+      const g = given[at];
+      if (g === undefined) continue;
+      gave[at] = (gave[at] ?? 0) + 1;
+      item.row = "owner-rows";
+      item.fate = g.fate;
+      item.note = `yours: ${g.line}`;
+    }
+
+    // Where each thing carried or attached goes in this run, decided before anything is written.
+    const placeOf = await placesOf(today, items, options.tree ?? false, options.jobs ?? false);
+    const places = new Map<Item, Place>(items.flatMap((i): [Item, Place][] => (i.fate === "carried" || i.fate === "attached" ? [[i, placeOf(i)]] : [])));
+    const rows: RowReport[] = ROWS.map((r) => {
+      const own = items.filter((i) => i.row === r.id);
+      const unit = INSIDE_UNIT[r.id];
+      return {
+        row: r.id,
+        what: r.what,
+        found: r.found,
+        ...("why" in r ? { why: r.why } : {}),
+        ...countRow(r.id, own, (i) => places.get(i)),
+        bytes: own.reduce((n, i) => n + i.bytes, 0),
+        digest: sha256(own.map((i) => `${i.where}\t${i.path}\t${i.sha256}`).join("\n")),
+        inside: unit === undefined ? null : { count: tally.counts.get(r.id) ?? 0, unit },
+      };
+    });
+    const notClassified = items.filter((i) => i.row === null);
+    const backupFiles = (await backupSources({ user: found.user, extension: found.extension }, found.runtime.files)).map((s) => ({ name: s.name, bytes: Bun.file(s.disk).size }));
+    const chatList = engineChats(db, chatRows, sources.identifier);
+    const backupBytes = backupSize(backupFiles, chatList);
+    const importBytes = items.filter((i) => places.get(i) === "lands").reduce((n, i) => n + i.bytes, 0);
+    const disk = { backup: backupBytes, import: importBytes, total: backupBytes + importBytes, free: options.target === undefined ? null : await freeAt(options.target) };
+    const logged = { debug: 0, info: 0, warn: 0, error: 0 };
+    for (const line of standIn.logged) logged[line.level]++;
+    // RPE's connections once swapped: every connection in Lumiverse that reaches the runtime the run takes (R-109). A chat that was on today and is pinned to none of them, or to none at all, is his to put on RPE (N-14).
+    const taken = found.runtime.runtimes[0] ?? null;
+    const model = loopbackModel(sources.identifier);
+    const rpeConnections = new Set(taken === null ? [] : db.connectionProfiles().flatMap((c) => (loopsBack(c, model, [runtimeBase(taken.config.listen, taken.config.port)]) ? [c.id] : [])));
+    const offRpe = chatRows.flatMap((c) => {
+      if (readRun(c.metadata) === null && !isRecord(c.metadata[`lumiah_chat_${sources.identifier}`])) return [];
+      const pin = c.metadata.connection_profile_id;
+      const pinned = typeof pin === "string" && pin.trim() !== "" ? pin.trim() : null;
+      return pinned !== null && rpeConnections.has(pinned) ? [] : [{ chat: c.id, pinned }];
+    });
+    // What `--no-runtime` leaves out where this user's runtime is found all the same, by its registration or its folders: the chats that would be on RPE's connections with it count as one.
+    const away = found.disowned?.runtimes[0] ?? null;
+    const awayBase = away === null ? null : runtimeBase(away.config.listen, away.config.port);
+    const awayConnections = new Set(awayBase === null ? [] : db.connectionProfiles().flatMap((c) => (loopsBack(c, model, [awayBase]) ? [c.id] : [])));
+    const disowned = found.disowned === null || sources.ignored === undefined ? null : disownedOf(sources.ignored, found.disowned, registeredNames(await userView.json("harness/registry.json")), offRpe.filter((c) => c.pinned !== null && awayConnections.has(c.pinned)).length);
+    const report: MigrationReport = {
+      format: REPORT_FORMAT,
+      at,
+      mode: options.mode ?? "rehearsal",
+      layout: { scope: found.install?.scope ?? "not installed", userFolder: found.user !== null, extensionFolder: found.extension !== null },
+      database: db.opened,
+      rows,
+      items,
+      notClassified,
+      chats,
+      unreadable,
+      unsent: found.runtime.unsent.map((u) => ({ runtime: u.runtime, files: u.files.size, kept: u.kept, why: u.why })),
+      runtime: { taken: found.runtime.runtimes.map(({ name, why, config }) => ({ name, why, unit: config.service?.unit ?? null, source: config.source })).at(0) ?? null, leftAlone: found.runtime.leftAlone, archived: found.runtime.archived },
+      ...(disowned === null ? {} : { disowned }),
+      ...(given.length > 0 ? { given: given.map((g, i) => ({ ...g, found: gave[i] ?? 0 })) } : {}),
+      ...((options.refused ?? []).length > 0 ? { refused: [...(options.refused ?? [])] } : {}),
+      standIn: { writes, logged },
+      lumiverse: db.marks(chatRows, sources.identifier, found.runtime.runtimes.flatMap((r) => runtimeOrigins(r.config.listen, r.config.port))),
+      disk,
+      underWay: chats.reduce((n, c) => n + c.underWay, 0),
+      imports: null,
+      backup: null,
+      landed: null,
+      carried: null,
+      worldsInStore: null,
+      changes: null,
+      identifier: sources.identifier,
+      sources: { lumiverse: sources.lumiverse, runtime: sources.runtime, ...(sources.ignored !== undefined ? { ignored: sources.ignored } : {}), ...(sources.runtimeName !== undefined ? { runtimeName: sources.runtimeName } : {}), ...(sources.runtimeFolders !== undefined ? { runtimeFolders: sources.runtimeFolders } : {}) },
+      offRpe,
+      tidy,
+      refusals: [],
+    };
+    // Each row found only inside other rows' things gets its three ends where this run would put them, every chat as the import would take it.
+    insideEnds(report, chatEndOf(report, () => true), options.tree ?? false);
+    report.refusals = refusalsOf(report, { user: sources.userId, known: found.username !== null, owner: options.rpe?.owner ?? null, earlier: options.rpe?.earlier ?? [] }, { missing: found.runtimeMissing, undecided: found.runtime.undecided });
+    if (options.previous) report.changes = changesSince(options.previous, report);
+    return report;
+  }
+}

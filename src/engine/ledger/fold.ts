@@ -1,0 +1,664 @@
+// The optimized fold (DESIGN §4.3 Fold): the same semantics as the reference fold, plus
+//  - a prefix cache keyed by fold key (path, record path, pause state), so a re-fold after a
+//    change at the head reuses everything before it; only every SNAPSHOT_EVERY-th step (a
+//    checkpoint) and each fold's last keep a state copy, the rest keep their outputs; of those,
+//    the TAILS_KEPT fold ends and CHECKPOINTS_KEPT checkpoints used last keep it, and steps that
+//    hold the same state (one that changed nothing, a stored snapshot) hold the same copy; as many
+//    steps as the user's setting keeps (`kept.folds`), those used longest ago going first;
+//  - the keys alone (`keys`): what a fold would end on, read without folding, so what is made
+//    from a fold (a state view's parts) can be kept under them;
+//  - stored snapshots (cold folds): a fold with no cached prefix finds the furthest stored
+//    state on its chain by path hash and fold shape (`shapeAfter`), rebuilds the outputs before it
+//    without state (and caches them, so the next fold walks the cache past it), and folds on from
+//    there; it stores a snapshot every SNAPSHOT_EVERY messages;
+//  - re-convergence: a rebased record whose running state equals the state a record folding the
+//    same (events, post entries, undos, Keep overlays, path and markers) folded from on its own
+//    path with nothing failing applies without re-validation (validation is a function of state).
+// L1 holds when this equals referenceFold for every input; L42 checks snapshot-started folds.
+
+import { hashJson, hashParts } from "../../shared/hash";
+import type { EventRef, JournalNote, KeepLine, LedgerEvent, Marker, MarkerBody, PathHash, PostEntry, Rec } from "../../shared/ledger";
+import { ROOT_PATH } from "../../shared/ledger";
+import { apartHost, applyEvent, applyMarker, tiesOf, TIED_DROP, validateEvent } from "../events";
+import type { WorldState } from "../state";
+import { initialState } from "../world-state";
+import { FoldError, type ChainMessage, type FoldInput, type FoldOutput, type FoldSnapshot, type MessageResult, type ResolvedFix } from "./chain";
+import { activeRecord, activeText, contentId, isLive, isTombstoned, markersHash, recordHash, stepPath, turnPath } from "./path";
+import type { FoldTypes } from "./reference";
+
+/** The messages kept worked out by default (`KeptSettings.folds`): room for the longest chats, each message's steps a few hundred bytes. */
+export const KEPT_FOLDS_DEFAULT = 65_536;
+
+interface Step {
+  /** The state after this step: kept on few checkpoints and fold ends (`kept`), else null. */
+  state: WorldState | null;
+  result: MessageResult;
+  notes: JournalNote[];
+  keep: KeepLine[];
+  violations: string[];
+  /** The GM edits and ✎ fixes this step, a rebased view, worked out again: state-dependent, as its drops are. */
+  resolved: ResolvedFix[];
+  paused: boolean;
+  /** The chain's fold shape through this step (`shapeAfter`), which a stored snapshot keys on with the path. */
+  shape: string;
+}
+
+interface Frame {
+  /** Everything of the step's result but its clock, which only folding the state gives. */
+  result: Omit<MessageResult, "clock">;
+  notes: JournalNote[];
+  keep: KeepLine[];
+  rec: Rec | null;
+  recPath: PathHash | null;
+  liveMarkers: (MarkerBody & { seq: number; at: PathHash | null })[];
+  livePost: PostEntry[];
+  /** Whether the chain is paused after this message. */
+  paused: boolean;
+}
+
+function refEq(a: EventRef, b: EventRef): boolean {
+  if (a.in !== b.in || a.index !== b.index) return false;
+  return a.in === "events" || (b.in === "post" && a.seq === b.seq);
+}
+
+/** State-dependent outputs (the rest are rebuilt from the chain without state): drops, and an Upgrade's notes. */
+const dependentNote = (n: JournalNote): boolean => n.kind === "dropped" || n.kind === "note";
+const dependentKeep = (k: KeepLine): boolean => k.status === "dropped" || k.status === "converted";
+
+/** The fold shape of a chain before its first step: no rebased view yet. */
+const NO_SHAPE = "";
+
+/**
+ * The chain's fold shape after a step, chained from the one before it: what folds the chain besides
+ * its path hashes. A path holds no record's own path, so a record folded as a rebased view (a swipe
+ * of the same text and entries planned on another path, or one read elsewhere) has the path of one
+ * folded on its own path, yet folds otherwise: it drops what fails, groups whole, and works out
+ * again its GM edits and ✎ fixes that keep their requests. So each view adds its path and those
+ * requests; any other step leaves the shape as it was.
+ */
+function shapeAfter(prev: string, f: Frame): string {
+  if (f.result.fold !== "view") return prev;
+  const asked = f.livePost.flatMap((p) => (p.kind === "fix" && p.edit !== undefined ? [[p.seq, p.edit, p.gm ?? null]] : []));
+  return hashParts("lre.shape", prev, f.result.path, hashJson(asked));
+}
+
+/** Fold ends whose state the cache keeps, the most recently used: a turn folds its chat's head, and the messages just before it, over and over. */
+export const TAILS_KEPT = 8;
+/** Checkpoints whose state the cache keeps, the most recently used; the chat's stored snapshots hold its own too. */
+export const CHECKPOINTS_KEPT = 16;
+
+export interface LedgerFoldOptions {
+  /** Steps between state copies in the cache and between stored snapshots. */
+  snapshotEvery?: number;
+  /** Identifies the code that folded (a build id): snapshots from other code never apply. */
+  fingerprint?: string;
+  /**
+   * The most steps the cache keeps, read as each is added (the user's Settings → Agents → Budgets,
+   * `kept.folds`): past it, the step used longest ago goes, and so do the step keys and re-convergence
+   * hashes used longest ago past as many.
+   */
+  keep?: () => number;
+}
+
+/** What a fold of a chain ends on, read without folding it (`LedgerFold.keys`). */
+export interface FoldKeys {
+  /** The key a fold of no message is: its revision's. */
+  root: string;
+  /** Each message's step key, in chain order: equal keys fold to equal outputs up to that message. */
+  steps: string[];
+  /** The key of the last step that may change the state (a user message never does, nor one with no record and no marker): equal keys end on equal states. */
+  state: string;
+}
+
+/** What a cached step keeps its state for: it is a checkpoint, or it ended a fold. */
+type Kept = "checkpoint" | "tail";
+
+const KEPT_LIMIT: Readonly<Record<Kept, number>> = { checkpoint: CHECKPOINTS_KEPT, tail: TAILS_KEPT };
+
+/** A digest kept beside the object it was made from, with the text it was made from. */
+interface Digest {
+  text: string;
+  digest: string;
+}
+
+/** `owner`'s digest as kept beside it; made again (`make`) when its text changed, as the journal's own records change in place. */
+function digestOf(kept: WeakMap<object, Digest>, owner: object, text: string, make: () => string): string {
+  const known = kept.get(owner);
+  if (known?.text === text) return known.digest;
+  const digest = make();
+  kept.set(owner, { text, digest });
+  return digest;
+}
+
+/** Whether the chain is paused after `m`: from the message a pause sits on (a user message) on. */
+function pausedAfter(m: ChainMessage, paused: boolean, pausesHere: boolean): boolean {
+  return paused || (m.isUser && pausesHere);
+}
+
+export class LedgerFold {
+  /** Cached steps by key, the least recently used first. */
+  private readonly cache = new Map<string, Step>();
+  /**
+   * Per record fold (what a step folds besides the state: the record's events, `markersApplied`,
+   * post entries, undos, Keep overlays and path, and its message's markers): the hash of the state
+   * it folded from on the record's own path with nothing failing, for re-convergence. Keyed by
+   * record, not by path: the swipes of a message share their parent path, and one may hold what
+   * fails there. What the step never reads (an accepted edit, the status) leaves it as it was.
+   * The least recently used first.
+   */
+  private readonly settled = new Map<string, string>();
+  private readonly every: number;
+  private readonly fingerprint: string;
+  private readonly limit: () => number;
+  /** The cache keys whose step keeps its state, by what for, least recently used first (`keep`). */
+  private readonly kept: Record<Kept, Map<string, true>> = { checkpoint: new Map(), tail: new Map() };
+  /**
+   * Digests of stored records, of markers and of record folds, each kept beside the object it was
+   * made from with the JSON text it was made from (DESIGN §9.6): a warm fold's prefix walk hashes
+   * only what changed, and one changed in place, as the journal's own records are, is hashed again.
+   * Each goes with its object, so a record's earlier versions and a closed chat's records hold none.
+   * Message texts are `contentId`'s, which keeps one copy of each, the one the chat's messages hold now.
+   */
+  private records = new WeakMap<object, Digest>();
+  private markers = new WeakMap<object, Digest>();
+  private folds = new WeakMap<object, Digest>();
+  /** Step keys by what they hash (the key before and the message's parts), the least recently used first. */
+  private readonly stepKeys = new Map<string, string>();
+
+  constructor(
+    private readonly types: FoldTypes,
+    options: LedgerFoldOptions = {},
+  ) {
+    this.every = Math.max(1, options.snapshotEvery ?? 200);
+    this.fingerprint = options.fingerprint ?? "dev";
+    this.limit = options.keep ?? (() => KEPT_FOLDS_DEFAULT);
+  }
+
+  private keyOf(prev: string, m: ChainMessage, input: FoldInput, paused: boolean, pausesHere: boolean): string {
+    const rec = activeRecord(m, input.tombstones);
+    // A tombstoned record folds as none, but adds a note: key the stored record, and whether it is live.
+    const stored = m.ledger?.swipes[String(m.swipeId)];
+    const recKey = stored ? `${rec ? "r" : "t"}${digestOf(this.records, stored, JSON.stringify(stored), () => hashJson(stored))}` : "";
+    const markers = m.ledger ? digestOf(this.markers, m.ledger.markers, JSON.stringify(m.ledger.markers), () => hashJson(m.ledger?.markers)) : "";
+    const content = contentId(activeText(m)).hash;
+    const flags = `${m.isUser ? "u" : "a"}${paused ? "p" : ""}${pausesHere ? "P" : ""}`;
+    // The memo key: every part but the message id has a fixed form without NUL, and the id comes last.
+    const memo = `${prev}\u0000${flags}\u0000${m.swipeId}\u0000${content}\u0000${recKey}\u0000${markers}\u0000${m.id}`;
+    return this.recent(this.stepKeys, memo, () => hashParts("lre.fold", prev, m.id, m.isUser ? "u" : "a", String(m.swipeId), content, recKey, markers, paused ? "p" : "", pausesHere ? "P" : ""));
+  }
+
+  /** `memo`'s value for `key`, now its newest; else `make()`'s, kept, the least recently used going past the limit. */
+  private recent(memo: Map<string, string>, key: string, make: () => string): string {
+    const hit = memo.get(key);
+    if (hit !== undefined) {
+      memo.delete(key);
+      memo.set(key, hit);
+      return hit;
+    }
+    const made = make();
+    memo.set(key, made);
+    const limit = Math.max(1, this.limit());
+    for (const oldest of memo.keys()) {
+      if (memo.size <= limit) break;
+      memo.delete(oldest);
+    }
+    return made;
+  }
+
+  /**
+   * The keys a fold of `input` ends on, read without folding (DESIGN §9.6): the one it starts from,
+   * each message's, and the state's. Equal keys fold to equal outputs, as the cache's own do, so what
+   * is made from a fold can be kept under them; this costs a walk of the chain, hashing only what
+   * changed since it was last walked.
+   */
+  keys(input: FoldInput): FoldKeys {
+    const root = hashParts("lre.fold", input.revision);
+    const pausedAt = new Set(input.pauses.map((p) => p.messageId));
+    const steps: string[] = [];
+    let key = root;
+    let state = root;
+    let paused = false;
+    for (const m of input.chain) {
+      const here = pausedAt.has(m.id);
+      key = this.keyOf(key, m, input, paused, here);
+      steps.push(key);
+      paused = pausedAfter(m, paused, here);
+      if (!m.isUser && (m.ledger?.swipes[String(m.swipeId)] !== undefined || (m.ledger?.markers.length ?? 0) > 0)) state = key;
+    }
+    return { root, steps, state };
+  }
+
+  /** Lets go of every step and digest kept (the memory budget): each chat's next fold starts from its stored snapshots. How many steps went. */
+  trim(): number {
+    const gone = this.cache.size;
+    this.cache.clear();
+    this.kept.checkpoint.clear();
+    this.kept.tail.clear();
+    this.settled.clear();
+    this.stepKeys.clear();
+    this.records = new WeakMap();
+    this.markers = new WeakMap();
+    this.folds = new WeakMap();
+    return gone;
+  }
+
+  fold(input: FoldInput): FoldOutput {
+    const startWorld = input.worlds(input.revision);
+    if (!startWorld) throw new FoldError(`unknown revision ${input.revision}`);
+    const n = input.chain.length;
+    const pausedAt = new Set(input.pauses.map((p) => p.messageId));
+    const steps: Step[] = [];
+    const keys: string[] = [];
+    let key = hashParts("lre.fold", input.revision);
+    let paused = false;
+    // 1. The cached prefix, and the last cached step that kept its state; each step found is the newest used.
+    let base = -1;
+    for (let i = 0; i < n; i++) {
+      const m = input.chain[i] as ChainMessage;
+      const k = this.keyOf(key, m, input, paused, pausedAt.has(m.id));
+      const cached = this.cache.get(k);
+      if (!cached) break;
+      this.cache.delete(k);
+      this.cache.set(k, cached);
+      steps.push(cached);
+      keys.push(k);
+      key = k;
+      paused = cached.paused;
+      if (cached.state) base = i;
+    }
+    const from = base >= 0 ? steps[base] : undefined;
+    if (base >= 0) this.used(keys[base] as string);
+    // A kept state (a cached step's, a snapshot's) is shared: it is copied once, only when a step
+    // changes it or the output takes it. The working state is local to this fold, so the output takes it as is.
+    let shared: WorldState | null = from?.state ?? null;
+    let state: WorldState = shared ?? initialState(startWorld, input.revision, this.types);
+    steps.length = base + 1;
+    keys.length = base + 1;
+    let parent: PathHash = from?.result.path ?? ROOT_PATH;
+    let shape = from?.shape ?? NO_SHAPE;
+    key = keys[base] ?? hashParts("lre.fold", input.revision);
+    paused = from?.paused ?? false;
+
+    // 2. A stored snapshot further along this chain (no pauses: a snapshot never spans one).
+    const context = hashParts("lre.snap", this.fingerprint, input.revision);
+    if (input.snapshots && input.pauses.length === 0 && base < n - 1) {
+      const frames: Frame[] = [];
+      const frameKeys: string[] = [];
+      const frameShapes: string[] = [];
+      let p = parent;
+      let k = key;
+      let s = shape;
+      let best = -1;
+      let snapshot: FoldSnapshot | undefined;
+      for (let i = base + 1; i < n; i++) {
+        const m = input.chain[i] as ChainMessage;
+        const f = this.frame(input, m, p, false, false);
+        k = this.keyOf(k, m, input, false, false);
+        s = shapeAfter(s, f);
+        frames.push(f);
+        frameKeys.push(k);
+        frameShapes.push(s);
+        p = f.result.path;
+        if ((i + 1) % this.every !== 0) continue;
+        const found = input.snapshots.get(hashParts(context, p, s));
+        // A snapshot that lacks the clock of a step it would restore (saved before steps kept their
+        // clocks, or on top of one), or the fixes its views worked out again (saved before the folds
+        // kept them), is passed over, so every reply keeps the time it ended at and its chips.
+        if (found && found.resolved !== undefined && clocksCover(found, base, i)) {
+          best = i;
+          snapshot = found;
+        }
+      }
+      if (snapshot && best > base) {
+        const notes = new Map<number, JournalNote[]>();
+        const keep = new Map<number, KeepLine[]>();
+        const violations = new Map<number, string[]>();
+        const resolved = new Map<number, ResolvedFix[]>();
+        for (const [i, x] of snapshot.notes) notes.set(i, [...(notes.get(i) ?? []), x]);
+        for (const [i, x] of snapshot.keep) keep.set(i, [...(keep.get(i) ?? []), x]);
+        for (const [i, x] of snapshot.violations) violations.set(i, [...(violations.get(i) ?? []), x]);
+        for (const [i, x] of snapshot.resolved ?? []) resolved.set(i, [...(resolved.get(i) ?? []), x]);
+        const clocks = new Map(snapshot.clocks ?? []);
+        // Steps already cached keep their outputs; the rest come from their frames and the snapshot.
+        // They are remembered, the snapshot's step with its state, so the next fold of this chain
+        // walks the cache past the snapshot instead of starting from it again.
+        for (let i = base + 1; i <= best; i++) {
+          const f = frames[i - base - 1] as Frame;
+          const k = frameKeys[i - base - 1] as string;
+          const step: Step = { state: null, result: { ...f.result, clock: clocks.get(i) ?? null }, notes: [...f.notes, ...(notes.get(i) ?? [])], keep: [...f.keep, ...(keep.get(i) ?? [])], violations: violations.get(i) ?? [], resolved: resolved.get(i) ?? [], paused: false, shape: frameShapes[i - base - 1] as string };
+          this.remember(k, i === best ? { ...step, state: snapshot.state } : step, i === best ? "checkpoint" : null, true);
+          steps.push(step);
+          keys.push(k);
+        }
+        shared = snapshot.state;
+        state = shared;
+        base = best;
+        parent = steps[best]?.result.path ?? ROOT_PATH;
+        shape = steps[best]?.shape ?? NO_SHAPE;
+        key = keys[best] ?? key;
+        paused = false;
+      }
+    }
+
+    // 3. Fold on from there. A step that changes nothing (a user message, a paused one, one with no
+    // record or marker to fold) ends on the state it started from: a kept state is copied only when
+    // the first step that may change it runs, and the steps before that keep the same state.
+    for (let i = base + 1; i < n; i++) {
+      const m = input.chain[i] as ChainMessage;
+      key = this.keyOf(key, m, input, paused, pausedAt.has(m.id));
+      const f = this.frame(input, m, parent, paused, pausedAt.has(m.id));
+      shape = shapeAfter(shape, f);
+      if (shared && !(m.isUser || f.result.fold === "paused" || (!f.rec && f.liveMarkers.length === 0))) {
+        state = structuredClone(shared);
+        shared = null;
+      }
+      const step = this.step(input, m, f, shared ?? state, shape);
+      const checkpoint = (i + 1) % this.every === 0;
+      const kept = this.remember(key, step, checkpoint ? "checkpoint" : i === n - 1 ? "tail" : null, shared !== null);
+      steps.push(step);
+      keys.push(key);
+      parent = step.result.path;
+      paused = step.paused;
+      if (kept && checkpoint && input.snapshots && input.pauses.length === 0) input.snapshots.put(this.snapshotOf(hashParts(context, parent, shape), steps, kept));
+    }
+
+    // A reader that only reads (`FoldInput.share`) takes the kept state as it is; any other, its own copy.
+    const out: FoldOutput = { state: shared ? (input.share ? shared : structuredClone(shared)) : state, notes: [], keepReport: [], messages: [], resolved: [], violations: [] };
+    for (const s of steps) {
+      out.messages.push(s.result);
+      out.notes.push(...s.notes);
+      out.keepReport.push(...s.keep);
+      out.resolved.push(...s.resolved);
+      out.violations.push(...s.violations);
+    }
+    return out;
+  }
+
+  /** The stored snapshot of a checkpoint: `state` is the copy its cached step keeps, which no fold changes, so the snapshot holds that copy too. */
+  private snapshotOf(key: string, steps: readonly Step[], state: WorldState): FoldSnapshot {
+    const clocks: [number, number][] = [];
+    const resolved: [number, ResolvedFix][] = [];
+    const snap: FoldSnapshot = { key, state, notes: [], keep: [], violations: [], clocks, resolved };
+    steps.forEach((s, i) => {
+      for (const x of s.notes) if (dependentNote(x)) snap.notes.push([i, x]);
+      for (const x of s.keep) if (dependentKeep(x)) snap.keep.push([i, x]);
+      for (const x of s.violations) snap.violations.push([i, x]);
+      for (const x of s.resolved) resolved.push([i, x]);
+      if (s.result.clock !== null) clocks.push([i, s.result.clock]);
+    });
+    return snap;
+  }
+
+  /**
+   * Caches a step's outputs and, for `kept`, its state, which it returns. The live working state is
+   * copied; a `shared` one (a stored snapshot's, or a kept state that a step that changed nothing
+   * ended on) is a copy no fold changes, kept as it is.
+   */
+  private remember(key: string, step: Step, kept: Kept | null, shared: boolean): WorldState | null {
+    const state = kept && step.state ? (shared ? step.state : structuredClone(step.state)) : null;
+    // The newest used: past the user's limit, the steps used longest ago go.
+    this.cache.delete(key);
+    this.cache.set(key, { ...step, state });
+    this.kept.checkpoint.delete(key);
+    this.kept.tail.delete(key);
+    if (kept && state) this.keep(kept, key);
+    const limit = Math.max(1, this.limit());
+    for (const oldest of this.cache.keys()) {
+      if (this.cache.size <= limit) break;
+      this.cache.delete(oldest);
+      this.kept.checkpoint.delete(oldest);
+      this.kept.tail.delete(oldest);
+    }
+    return state;
+  }
+
+  /** `key`'s state is the newest of its kind kept; past the kind's limit the one used longest ago is let go (its step keeps its outputs). */
+  private keep(kind: Kept, key: string): void {
+    const kept = this.kept[kind];
+    kept.delete(key);
+    kept.set(key, true);
+    while (kept.size > KEPT_LIMIT[kind]) {
+      const oldest = kept.keys().next().value;
+      if (oldest === undefined) break;
+      kept.delete(oldest);
+      const entry = this.cache.get(oldest);
+      if (entry) entry.state = null;
+    }
+  }
+
+  /** A fold started from `key`'s kept state: it is the newest kept again. */
+  private used(key: string): void {
+    if (this.kept.tail.has(key)) this.keep("tail", key);
+    else if (this.kept.checkpoint.has(key)) this.keep("checkpoint", key);
+  }
+
+  private step(input: FoldInput, m: ChainMessage, f: Frame, state: WorldState, shape: string): Step {
+    const notes: JournalNote[] = [...f.notes];
+    const keep: KeepLine[] = [...f.keep];
+    const violations: string[] = [];
+    const resolved: ResolvedFix[] = [];
+    const types = this.types;
+    const ctx = () => {
+      const world = input.worlds(state.revision);
+      if (!world) throw new FoldError(`unknown revision ${state.revision}`);
+      return types.context(world, state);
+    };
+    const env = { worlds: input.worlds, types };
+    const marker = (mk: Marker): void => {
+      if (mk.kind === "migrate" && !input.worlds(mk.to)) throw new FoldError(`unknown revision ${mk.to}`);
+      for (const text of applyMarker(state, mk, env)) notes.push({ kind: "note", messageId: m.id, ref: { marker: mk.seq }, text });
+    };
+    const { rec, recPath, liveMarkers, livePost } = f;
+    const parent = f.result.parentPath;
+    if (m.isUser || f.result.fold === "paused") {
+      // A user message changes no state; a paused one waits for Keep or Discard.
+    } else if (!rec) {
+      for (const mk of liveMarkers) marker(mk);
+    } else {
+      const view = f.result.fold === "view";
+      // Re-convergence is keyed by what this step folds besides the state.
+      const folds = recPath === null ? null : [rec.events, rec.markersApplied, rec.post, rec.undone, rec.keep ?? null, rec.path, m.ledger?.markers ?? []];
+      const settledKey = folds === null ? "" : digestOf(this.folds, rec, JSON.stringify(folds), () => hashJson(folds));
+      const before = recPath !== null && !view && !this.settled.has(settledKey) ? hashJson(state) : null;
+      let converged = false;
+      if (view) {
+        // A view folds as its record did on its own path only from the same state and with the same
+        // entries: a marker or post entry made on this branch (live here by its `at`, inert on the
+        // record's path) can make a stored one fail, so then everything is re-validated. So it is
+        // when it holds a GM edit or ✎ fix with its request, which folds worked out again (`post`)
+        // and may leave a state its record never folded on its own path.
+        const asOnPath = liveMarkers.every((mk) => mk.at === null || mk.at === recPath) && livePost.every((p) => p.at === recPath && !(p.kind === "fix" && p.edit !== undefined));
+        const original = this.settled.get(settledKey);
+        converged = asOnPath && original !== undefined && original === hashJson(state);
+      }
+      const converted = rec.keep?.[parent]?.convert ?? [];
+      const record = rec;
+      // The groups this view dropped in the record so far, so a unit tied to one drops with it.
+      const fell = new Set<string>();
+      /** Folds one event; whether a rebased view dropped it. */
+      const event = (ev: LedgerEvent, ref: EventRef): boolean => {
+        if (record.undone.some((u) => refEq(u, ref))) return false;
+        if (converged) {
+          applyEvent(types, ev, state, ctx());
+          return false;
+        }
+        const failure = validateEvent(types, ev, ctx());
+        if (failure && !view) {
+          violations.push(`${m.id}: on-path ${ev.type} failed re-validation (${failure.reason})`);
+          return false;
+        }
+        if (failure) {
+          if (converted.some((c) => refEq(c, ref))) {
+            keep.push({ messageId: m.id, parentPath: parent, ref, status: "converted", text: failure.reason });
+          } else {
+            notes.push({ kind: "dropped", messageId: m.id, ref, text: failure.reason });
+            keep.push({ messageId: m.id, parentPath: parent, ref, status: "dropped", text: failure.reason });
+            return true;
+          }
+        }
+        applyEvent(types, ev, state, ctx());
+        return false;
+      };
+      // Groups on a rebased view land whole or not at all (the reference fold's rule, written apart),
+      // and a unit kept apart (`APART_GROUP`) lands only with the unit it stands with: both if both
+      // fit, else that unit alone, else neither; where either has a Keep conversion each folds alone.
+      // A unit tied to one the view dropped (`tiedTo`) drops with it, unless Keep converted it.
+      const run = (list: readonly LedgerEvent[], refOf: (index: number) => EventRef): void => {
+        const unitAt = (i: number): { end: number; unit: { ev: LedgerEvent; ref: EventRef }[] } => {
+          const group = list[i]?.group;
+          let end = i + 1;
+          if (group !== undefined) while (end < list.length && list[end]?.group === group) end++;
+          const unit: { ev: LedgerEvent; ref: EventRef }[] = [];
+          for (let k = i; k < end; k++) {
+            const ev = list[k];
+            const ref = refOf(k);
+            if (ev && !record.undone.some((u) => refEq(u, ref))) unit.push({ ev, ref });
+          }
+          return { end, unit };
+        };
+        const trial = (unit: readonly { ev: LedgerEvent }[]): { reason: string } | null => {
+          const world = input.worlds(state.revision);
+          if (!world) throw new FoldError(`unknown revision ${state.revision}`);
+          const scratch = structuredClone(state);
+          return unit
+            .map((u) => u.ev)
+            .reduce<{ reason: string } | null>((found, ev) => {
+              if (found) return found;
+              const c = types.context(world, scratch);
+              const rejection = validateEvent(types, ev, c);
+              if (!rejection) applyEvent(types, ev, scratch, c);
+              return rejection;
+            }, null);
+        };
+        const drop = (unit: readonly { ref: EventRef }[], reason: string, group: string | undefined): void => {
+          for (const u of unit) {
+            notes.push({ kind: "dropped", messageId: m.id, ref: u.ref, text: reason });
+            keep.push({ messageId: m.id, parentPath: parent, ref: u.ref, status: "dropped", text: reason });
+          }
+          if (group !== undefined && unit.length > 0) fell.add(group);
+        };
+        const isConverted = (unit: readonly { ref: EventRef }[]): boolean => unit.some((u) => converted.some((c) => refEq(c, u.ref)));
+        for (let i = 0; i < list.length; ) {
+          const { end, unit } = unitAt(i);
+          const group = list[i]?.group;
+          const host = view && !converged ? apartHost(list, [i, end]) : null;
+          const hosted = host ? unitAt(host[0]).unit : [];
+          if (host && !isConverted(unit) && !isConverted(hosted)) {
+            i = host[1];
+            const together = trial([...unit, ...hosted]);
+            if (together === null) {
+              for (const u of [...unit, ...hosted]) applyEvent(types, u.ev, state, ctx());
+              continue;
+            }
+            const alone = trial(hosted);
+            drop(unit, together.reason, group);
+            if (alone === null) for (const u of hosted) applyEvent(types, u.ev, state, ctx());
+            else drop(hosted, alone.reason, list[host[0]]?.group);
+            continue;
+          }
+          i = end;
+          if (view && !converged && !isConverted(unit) && tiesOf(unit.map((u) => u.ev)).some((t) => fell.has(t))) {
+            drop(unit, TIED_DROP, group);
+            continue;
+          }
+          if (unit.length < 2 || !view || converged) {
+            for (const u of unit) if (event(u.ev, u.ref) && group !== undefined) fell.add(group);
+            continue;
+          }
+          const failure = trial(unit);
+          if (failure === null) {
+            for (const u of unit) applyEvent(types, u.ev, state, ctx());
+          } else if (isConverted(unit)) {
+            for (const u of unit) {
+              const own = validateEvent(types, u.ev, ctx());
+              if (own) keep.push({ messageId: m.id, parentPath: parent, ref: u.ref, status: "converted", text: own.reason });
+              applyEvent(types, u.ev, state, ctx());
+            }
+          } else drop(unit, failure.reason, group);
+        }
+      };
+      // On a view, a GM edit or ✎ fix that keeps what it asked for folds as that request worked out
+      // again against the state here (DESIGN §7, P2): the story before it changed, and it still says
+      // what it said. One the request can't be made from is dropped whole, as a group is, by its first
+      // ref when it holds no events of its own (it was already so where it was made); one undone or
+      // converted in any part, by those refs too, folds as stored.
+      const post = (p: PostEntry): void => {
+        const refOf = (index: number): EventRef => ({ in: "post", seq: p.seq, index });
+        const own = (u: EventRef): boolean => u.in === "post" && u.seq === p.seq;
+        const asked = view && p.kind === "fix" && p.edit !== undefined && !record.undone.some(own) && !converted.some(own);
+        const world = asked ? input.worlds(state.revision) : undefined;
+        if (asked && !world) throw new FoldError(`unknown revision ${state.revision}`);
+        const again = world ? input.resolveFix(world, state, p) : null;
+        if (!again) {
+          run(p.events, refOf);
+          return;
+        }
+        if ("rejection" in again) {
+          for (const i of p.events.length > 0 ? p.events.keys() : [0]) {
+            notes.push({ kind: "dropped", messageId: m.id, ref: refOf(i), text: again.rejection.reason });
+            keep.push({ messageId: m.id, parentPath: parent, ref: refOf(i), status: "dropped", text: again.rejection.reason });
+          }
+          return;
+        }
+        resolved.push({ messageId: m.id, seq: p.seq, events: again.events });
+        for (const ev of again.events) applyEvent(types, ev, state, ctx());
+      };
+      for (const mk of liveMarkers) if (mk.seq <= record.markersApplied) marker(mk);
+      run(record.events, (index) => ({ in: "events", index }));
+      const later: ({ seq: number; marker: Marker } | { seq: number; post: PostEntry })[] = [
+        ...liveMarkers.filter((mk) => mk.seq > record.markersApplied).map((mk) => ({ seq: mk.seq, marker: mk })),
+        ...livePost.map((p) => ({ seq: p.seq, post: p })),
+      ].sort((a, b) => a.seq - b.seq);
+      for (const item of later) {
+        if ("marker" in item) marker(item.marker);
+        else post(item.post);
+      }
+      if (before !== null && violations.length === 0) this.recent(this.settled, settledKey, () => before);
+    }
+    return { state, result: { ...f.result, clock: state.clock }, notes, keep, violations, resolved, paused: f.paused, shape };
+  }
+
+  /** Everything about one message that doesn't need the state: its record, live entries, path, fold kind and inert notes. */
+  private frame(input: FoldInput, m: ChainMessage, parent: PathHash, paused: boolean, pausesHere: boolean): Frame {
+    const notes: JournalNote[] = [];
+    const keep: KeepLine[] = [];
+    if (m.isUser) {
+      const path = stepPath(parent, true, contentId(activeText(m)).hash, "", "");
+      return { result: { id: m.id, fold: "user", parentPath: parent, path }, notes, keep, rec: null, recPath: null, liveMarkers: [], livePost: [], paused: pausedAfter(m, paused, pausesHere) };
+    }
+    const rec = activeRecord(m, input.tombstones);
+    const stored = m.ledger?.swipes[String(m.swipeId)];
+    const tombstoned = stored !== undefined && isTombstoned(input.tombstones, m.id, stored);
+    if (tombstoned) notes.push({ kind: "tombstoned", messageId: m.id, ref: null, text: "discarded" });
+    const recPath = turnPath(rec);
+    const markers = [...(m.ledger?.markers ?? [])].sort((a, b) => a.seq - b.seq);
+    const liveMarkers = markers.filter((mk) => isLive(mk.at, parent, recPath));
+    for (const mk of markers) {
+      if (isLive(mk.at, parent, recPath)) continue;
+      notes.push({ kind: "inert", messageId: m.id, ref: { marker: mk.seq }, text: "made on another branch" });
+      keep.push({ messageId: m.id, parentPath: parent, ref: { marker: mk.seq }, status: "inert", text: "made on another branch" });
+    }
+    const livePost: PostEntry[] = rec ? rec.post.filter((p) => isLive(p.at, parent, recPath)).sort((a, b) => a.seq - b.seq) : [];
+    if (rec) {
+      for (const p of rec.post) {
+        if (isLive(p.at, parent, recPath)) continue;
+        notes.push({ kind: "inert", messageId: m.id, ref: { in: "post", seq: p.seq, index: 0 }, text: "made on another branch" });
+        keep.push({ messageId: m.id, parentPath: parent, ref: { in: "post", seq: p.seq, index: 0 }, status: "inert", text: "made on another branch" });
+      }
+      for (const d of rec.dropped ?? []) notes.push({ kind: "not_carried", messageId: m.id, ref: { in: "post", seq: d.seq, index: 0 }, text: d.reason });
+    }
+    // A record read elsewhere is a view on its own path too.
+    const view = recPath !== null && (recPath !== parent || rec?.readElsewhere === true);
+    const fold: MessageResult["fold"] = paused ? "paused" : !rec ? (tombstoned ? "tombstoned" : "plain") : recPath === null ? "plain" : view ? "view" : "on_path";
+    const content = rec ? rec.swipeHash.hash : contentId(activeText(m)).hash;
+    const path = stepPath(parent, false, content, recordHash(rec, livePost, parent), markersHash(liveMarkers));
+    return { result: { id: m.id, fold, parentPath: parent, path }, notes, keep, rec, recPath, liveMarkers, livePost, paused: pausedAfter(m, paused, pausesHere) };
+  }
+}
+
+/** Whether a snapshot holds the clock of every step after `base` up to its own, `at`. */
+function clocksCover(snapshot: FoldSnapshot, base: number, at: number): boolean {
+  const have = new Set((snapshot.clocks ?? []).map(([i]) => i));
+  for (let i = base + 1; i <= at; i++) if (!have.has(i)) return false;
+  return true;
+}

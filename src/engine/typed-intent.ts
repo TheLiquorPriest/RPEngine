@@ -1,0 +1,355 @@
+// Typed text → an action without a model, for Playtest (engine-only): the action whose lexicon phrase
+// the text says (its words in order, with only filler words such as "down" or "back" between them,
+// so "walk down to" says "walk to"), with its ref params filled from names said in the text (a
+// `from` or `to` from the words after "from", or "to" and "into", when the text says them), its first
+// required text param from what follows the phrase, a money param from the first amount said in the
+// world's currency ("$500", "20 dollars"), else from the first number, and other amounts from the
+// numbers in order. Of the phrases said, one whose action's required params are all filled wins,
+// then one said exactly, then the longest. An amount in the world's currency said with a money verb
+// ("send $500 to Danny", "give Danny $20", "wire them 1,000 dollars") is a Pay as well, though no
+// lexicon phrase of Pay's is said; "transfer $500 from checking to savings" stays a move between
+// accounts, since no one to pay is named.
+//
+// A phrase only counts where the player does it: not after a negation ("I don't want to walk to"),
+// not in a hypothetical ("I wonder whether to buy", "if I walk to"), not inside an idiom ("pay
+// attention"), and only with the player as the subject: first person ("I", "we", "let's") or a bare
+// command, never someone else ("Danny says he'll walk to", "ask her to buy").
+
+import type { JsonObject } from "../shared/json";
+import { hasOwn } from "../shared/json";
+import type { ActionDef, WorldCurrency, WorldDoc } from "../shared/world";
+import { offersAction } from "../shared/world";
+import { FINANCE_ACTIONS } from "../shared/finance";
+import { offeredActions } from "./offered";
+import { optionalQuery } from "./pack-kit";
+import type { Registry } from "./registry-impl";
+import { isGone, kindIs } from "./scope";
+import { calendarOf } from "./calendar";
+import { typedSpan } from "./time";
+import { selectorMatches } from "./selector";
+import type { WorldState } from "./state";
+import type { InterpretOutput } from "./steps";
+import { canSeeEntity, canSeePlace } from "./visibility";
+
+const STOP = new Set(["the", "a", "an", "to", "of", "at", "my", "your", "and", "with", "about", "for", "in", "on", "some", "over", "up", "down"]);
+
+/** Words a typed line may put inside a lexicon phrase ("walk down to", "head back over to"). */
+const FILLER = new Set(["down", "up", "over", "back", "out", "across", "along", "around", "right", "straight", "on", "off", "just"]);
+
+/** Verbs that hand money over: said by the player with an amount in the world's currency, a payment ("send $500 to Danny", "tip her $5"). */
+const MONEY_VERBS: Readonly<Record<string, true>> = { pay: true, repay: true, send: true, wire: true, transfer: true, give: true, hand: true, tip: true, lend: true, loan: true, venmo: true, zelle: true, reimburse: true };
+
+/** The words a ref param of that name is said after ("from checking", "to savings", "into savings"). */
+const LEADS: Readonly<Record<string, readonly string[]>> = { from: ["from"], to: ["to", "into"] };
+
+/** A number as typed, thousands separators and decimals included ("1,200.50"). */
+const NUMBER = String.raw`\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?`;
+
+/** What "k" or "million" after a number multiplies it by. */
+const SCALES: Readonly<Record<string, number>> = { k: 1e3, thousand: 1e3, m: 1e6, million: 1e6 };
+
+const escaped = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The amounts the text states in the world's currency, in minor units, in order, each with where it
+ * was said: its symbol before a number ("$500", "$1,200.50", "$5k"), or after one its code, its
+ * minor unit's name, or for a dollar "dollars" or "bucks" ("1,000 dollars", "20 GP", "50 cents").
+ */
+function currencyAmounts(currency: WorldCurrency, text: string): { minor: number; start: number; end: number }[] {
+  const scale = String.raw`(?:\s?(k|thousand|m|million)\b)?`;
+  const symbol = currency.symbol.trim();
+  const minorUnit = currency.minorUnit.trim().toLowerCase();
+  const major = [currency.code.trim(), ...(symbol === "$" ? ["dollar", "buck"] : [])].filter((w) => w !== "").map((w) => `${escaped(w)}s?`);
+  const units = [...major, ...(minorUnit !== "" ? [`${escaped(minorUnit)}s?`] : [])];
+  const patterns = [...(symbol !== "" ? [new RegExp(`${escaped(symbol)}\\s?(${NUMBER})${scale}`, "gi")] : []), ...(units.length > 0 ? [new RegExp(`\\b(${NUMBER})${scale}\\s*(${units.join("|")})\\b`, "gi")] : [])];
+  const found: { minor: number; start: number; end: number }[] = [];
+  for (const pattern of patterns) {
+    for (const m of text.matchAll(pattern)) {
+      const start = m.index;
+      const end = start + m[0].length;
+      if (found.some((f) => start < f.end && end > f.start)) continue;
+      const value = Number((m[1] ?? "").replace(/,/g, "")) * (SCALES[(m[2] ?? "").toLowerCase()] ?? 1);
+      const unit = (m[3] ?? "").toLowerCase().replace(/s$/, "");
+      const minor = minorUnit !== "" && unit === minorUnit ? Math.round(value) : Math.round(value * 10 ** currency.decimals);
+      if (Number.isFinite(minor) && minor > 0) found.push({ minor, start, end });
+    }
+  }
+  return found.sort((a, b) => a.start - b.start);
+}
+
+/** Words that start a new clause: a negation or a subject before them doesn't reach past them. */
+const CLAUSE_WORDS = new Set(["but", "so", "because", "though", "although", "however", "instead"]);
+
+const NEGATION = new Set(["not", "no", "never", "cannot", "nothing", "nobody", "neither", "nor", "refuse", "refuses", "refused", "avoid", "avoiding"]);
+
+/** Hypotheticals in the phrase's own clause ("might", "whether to"). */
+const HYPOTHETICAL = new Set(["might", "maybe", "perhaps", "whether", "wonder", "wonders", "wondering", "wondered", "consider", "considering", "imagine", "imagining", "suppose", "supposing", "wish", "debating"]);
+
+/** Conditionals reach across the sentence ("If I had the money, I'd buy a boat"). */
+const CONDITIONAL = new Set(["if", "unless"]);
+
+/** "think about" / "thinking of": a verb of musing followed by one of these. */
+const MUSING = new Set(["think", "thinks", "thinking", "thought"]);
+const MUSING_OBJECT = new Set(["about", "of"]);
+
+const FIRST_PERSON = new Set(["i", "i'm", "i'll", "i'd", "i've", "me", "myself", "we", "we're", "we'll", "we'd", "we've", "us", "let's", "lets"]);
+
+const OTHER_PERSON = new Set([
+  "he", "she", "they", "you", "he's", "she's", "they're", "you're", "he'll", "she'll", "they'll", "you'll", "he'd", "she'd", "they'd", "you'd", "they've", "you've",
+  "him", "her", "them", "someone", "somebody", "everyone", "everybody", "anyone", "anybody", "people", "y'all",
+]);
+
+/**
+ * Words that put a subject before the verb: modals, "is", and the third-person verbs a line uses to
+ * say what someone else will do ("Danny will walk to", "the clerk wants to buy"). A bare command has none.
+ */
+const AUX = new Set([
+  "will", "would", "shall", "should", "can", "could", "may", "might", "must", "is", "are", "was", "were", "does", "did", "has",
+  "wants", "needs", "decides", "decided", "tries", "tried", "plans", "planned", "says", "said", "tells", "told", "asks", "asked", "agrees", "agreed", "offers", "offered", "starts", "begins", "gets", "likes", "hopes",
+]);
+
+/** Words that may sit between someone's name and the phrase while that person stays its subject. */
+const BRIDGE = new Set(["to", "going", "gonna", "just", "then", "also", "now", "soon", "finally", "quickly", "slowly", "really", "probably", "already", "still"]);
+
+/** Phrases that read as an action's words but never mean it. */
+const IDIOMS: readonly (readonly string[])[] = [
+  ["pay", "attention"],
+  ["pay", "close", "attention"],
+  ["pay", "heed"],
+  ["pay", "no", "mind"],
+  ["pay", "respects"],
+  ["pay", "my", "respects"],
+  ["pay", "a", "visit"],
+  ["pay", "a", "compliment"],
+  ["pay", "the", "price"],
+  ["buy", "time"],
+  ["buy", "some", "time"],
+  ["take", "a", "look"],
+  ["take", "a", "seat"],
+  ["take", "a", "breath"],
+  ["take", "a", "deep", "breath"],
+  ["take", "care"],
+  ["take", "my", "time"],
+  ["take", "your", "time"],
+  ["take", "it", "easy"],
+  ["lend", "a", "hand"],
+  ["lend", "an", "ear"],
+  ["on", "the", "other", "hand"],
+  ["give", "up"],
+  ["give", "it", "a", "try"],
+];
+
+interface Token {
+  word: string;
+  clause: number;
+  sentence: number;
+}
+
+/** The text's lowercase words (contractions kept whole: "don't", "he'll"), each with its clause and sentence. */
+function tokenize(text: string): Token[] {
+  const out: Token[] = [];
+  let clause = 0;
+  let sentence = 0;
+  for (const m of text.toLowerCase().replace(/[‘’]/g, "'").matchAll(new RegExp(`${NUMBER}|[a-z0-9]+(?:'[a-z]+)*|[.!?;:,]`, "g"))) {
+    const word = m[0];
+    if (/^[.!?;]$/.test(word)) {
+      sentence++;
+      clause++;
+    } else if (word === "," || word === ":") clause++;
+    else {
+      if (CLAUSE_WORDS.has(word)) clause++;
+      out.push({ word, clause, sentence });
+    }
+  }
+  return out;
+}
+
+function words(s: string): string[] {
+  return s
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 1 && !STOP.has(w));
+}
+
+/** The candidate whose name shares the most words with what was said (none when nothing is shared). */
+function byName(said: ReadonlySet<string>, pool: readonly { id: string; name: string }[]): string | null {
+  let best: { id: string; n: number } | null = null;
+  for (const c of pool) {
+    const n = words(c.name).filter((w) => said.has(w)).length;
+    if (n > 0 && (!best || n > best.n)) best = { id: c.id, n };
+  }
+  return best?.id ?? null;
+}
+
+/**
+ * Whether the player is the subject of the verb that starts at the end of `lead` (the phrase's clause
+ * up to the phrase): the nearest subject word before the phrase decides. A name of someone present
+ * decides when only "to", an auxiliary or an adverb follows it ("ask Danny to walk", "Danny will
+ * walk"), not across other words ("I meet Danny and walk"). With no subject word, a bare command.
+ */
+function playerSubject(lead: readonly string[], names: ReadonlySet<string>): boolean {
+  for (let i = lead.length - 1; i >= 0; i--) {
+    const w = lead[i] ?? "";
+    if (FIRST_PERSON.has(w)) return true;
+    if (OTHER_PERSON.has(w)) return false;
+    const name = w.replace(/'(s|ll|d|re|ve)$/, "");
+    if (!names.has(name)) continue;
+    // "Danny'll walk" carries its own auxiliary; a bare name is the subject only right before the verb.
+    if (/'(ll|d|re|ve)$/.test(w) || lead.slice(i + 1).every((b) => AUX.has(b) || BRIDGE.has(b))) return false;
+  }
+  return !lead.some((w) => AUX.has(w));
+}
+
+/** Whether a phrase said at `start` is something the player does (see the module comment). */
+function playerActs(tokens: readonly Token[], start: number, names: ReadonlySet<string>): boolean {
+  const at = tokens[start];
+  if (!at) return false;
+  const before = tokens.slice(0, start);
+  const lead = before.filter((t) => t.clause === at.clause).map((t) => t.word);
+  // An idiom that covers the phrase's first word ("pay" in "I pay attention").
+  if (IDIOMS.some((idiom) => idiom.some((w, offset) => w === at.word && idiom.every((x, k) => tokens[start - offset + k]?.word === x)))) return false;
+  if (lead.some((w) => NEGATION.has(w) || w.endsWith("n't"))) return false;
+  if (lead.some((w, i) => HYPOTHETICAL.has(w) || (MUSING.has(w) && MUSING_OBJECT.has(lead[i + 1] ?? "")))) return false;
+  if (before.some((t) => t.sentence === at.sentence && CONDITIONAL.has(t.word))) return false;
+  return playerSubject(lead, names);
+}
+
+/**
+ * Where `phrase` is said in `tokens` (the text's lowercase words) by the player: its words in order,
+ * from some start that `acts` accepts, with only filler words between them. The token index just
+ * past it and how many fillers it skipped, or null.
+ */
+function phraseAt(tokens: readonly string[], phrase: readonly string[], acts: (start: number) => boolean): { end: number; skipped: number } | null {
+  for (let start = 0; start < tokens.length; start++) {
+    if (tokens[start] !== phrase[0]) continue;
+    let at = start + 1;
+    let skipped = 0;
+    let k = 1;
+    for (; k < phrase.length; k++) {
+      while (at < tokens.length && tokens[at] !== phrase[k] && FILLER.has(tokens[at] ?? "")) {
+        at++;
+        skipped++;
+      }
+      if (tokens[at] !== phrase[k]) break;
+      at++;
+    }
+    if (k === phrase.length && acts(start)) return { end: at, skipped };
+  }
+  return null;
+}
+
+export function typedIntent(reg: Registry, world: WorldDoc, state: Readonly<WorldState>, text: string): InterpretOutput | null {
+  const said = tokenize(text);
+  const tokens = said.map((t) => t.word);
+  const ctx = reg.context(world, state);
+  const actions = offeredActions(reg, ctx);
+  const named = new Set(words(text));
+  const pov = world.pov;
+  const people = new Set<string>();
+  for (const [id, e] of Object.entries(state.entities)) if (id !== pov && kindIs(reg, world, e.kind, "person") && !isGone(state, id)) for (const w of words(e.name)) people.add(w);
+  const acts = (start: number) => playerActs(said, start, people);
+  // Only what fits the fight's state for the POV, as interpret and the Combat tab offer it: a start
+  // outside a fight, any other combat action in one the POV is in.
+  const fits = optionalQuery(ctx, "combat.offers");
+  const holders = optionalQuery(ctx, "economy.holders");
+  const candidates: { action: ActionDef; params: JsonObject; skipped: number; length: number }[] = [];
+  // Amounts in the world's currency fill money params in the order they were said; the other numbers
+  // fill number params so ("walk over to 6, 2" is x 6, y 2), and a money param when no amount is said.
+  const amounts = currencyAmounts(world.currency, text);
+  const numbers = [...text.matchAll(new RegExp(NUMBER, "g"))].filter((m) => !amounts.some((a) => m.index >= a.start && m.index < a.end)).map((m) => Number(m[0].replace(/,/g, "")));
+  /** The words said after the first of `leads`, up to the next lead word: where a `from` or `to` is named. */
+  const after = (leads: readonly string[]): Set<string> | null => {
+    const at = tokens.findIndex((w) => leads.includes(w));
+    if (at < 0) return null;
+    const end = tokens.findIndex((w, i) => i > at && Object.values(LEADS).some((l) => l.includes(w)));
+    return new Set(words(tokens.slice(at + 1, end < 0 ? undefined : end).join(" ")));
+  };
+  const fill = (action: ActionDef, rest: string): JsonObject => {
+    const params: JsonObject = {};
+    let textFilled = false;
+    let nextNumber = 0;
+    let nextAmount = 0;
+    const ordered = Object.entries(action.params).sort(([, a], [, b]) => Number(a.optional === true) - Number(b.optional === true));
+    const refs = ordered.flatMap(([name, def]) => {
+      if (def.type !== "ref") return [];
+      // An account the player names is one of theirs (the economy pack's holders): "transfer $300 to Danny" names no account of theirs, so it is a payment.
+      const pool =
+        def.ref === "place"
+          ? Object.values(world.places).filter((p) => canSeePlace(reg, world, state, pov, p.id))
+          : Object.entries(state.entities)
+              .filter(([id, e]) => id !== pov && canSeeEntity(reg, world, state, pov, id) && (!def.ref || kindIs(reg, world, e.kind, def.ref)) && (!def.of || selectorMatches(reg, world, state, def.of, id)) && (def.ref !== "account" || !holders || holders(ctx, id).includes(pov)))
+              .map(([id, e]) => ({ id, name: e.name }));
+      return [{ name, pool }];
+    });
+    // A ref named after its lead word goes first ("from checking to savings"), and no two refs take
+    // the same one, so each account of a move is its own; the others are named anywhere in the text.
+    const taken = new Set<string>();
+    const take = (name: string, id: string | null): void => {
+      if (id === null) return;
+      params[name] = id;
+      taken.add(id);
+    };
+    for (const { name, pool } of refs) {
+      const lead = hasOwn(LEADS, name) ? after(LEADS[name] ?? []) : null;
+      if (lead) take(name, byName(lead, pool));
+    }
+    for (const { name, pool } of refs)
+      if (params[name] === undefined)
+        take(
+          name,
+          byName(
+            named,
+            pool.filter((c) => !taken.has(c.id)),
+          ),
+        );
+    for (const [name, def] of ordered) {
+      if (def.type === "text" && !textFilled && def.optional !== true && rest !== "") {
+        params[name] = rest;
+        textFilled = true;
+      } else if (def.type === "duration") {
+        // A length is read as words say one ("for an hour", "two hours and a half"), from the text as
+        // typed (its filler words count: "an hour"), not as the first number: "rest for 1 hour" is 60
+        // minutes. None stated, or two, none filled: the action's own time.
+        const span = typedSpan(calendarOf(world), state.clock, text);
+        if (span?.type === "duration") params[name] = span.minutes;
+      } else if (def.type === "money" && amounts[nextAmount] !== undefined) {
+        params[name] = amounts[nextAmount]?.minor ?? 0;
+        nextAmount += 1;
+      } else if (def.type === "money" || def.type === "number") {
+        // A bare amount is in the world's currency: "5" is 5 bits, or $5.00 (500 cents).
+        const n = numbers[nextNumber];
+        if (n !== undefined) {
+          params[name] = def.type === "money" ? Math.round(n * 10 ** world.currency.decimals) : n;
+          nextNumber += 1;
+        }
+      }
+    }
+    return params;
+  };
+  const offered = (action: ActionDef): boolean => offersAction(world, action) && fits?.(ctx, action) !== false;
+  for (const action of actions.values()) {
+    // A combat action only where the ruleset has combat, and the fight's state allows it.
+    if (!offered(action)) continue;
+    for (const raw of action.lexicon ?? []) {
+      const phrase = raw.trim().toLowerCase();
+      if (phrase.length <= 2) continue;
+      const at = phraseAt(
+        tokens,
+        tokenize(phrase).map((t) => t.word),
+        acts,
+      );
+      if (!at) continue;
+      candidates.push({ action, params: fill(action, words(tokens.slice(at.end).join(" ")).join(" ")), skipped: at.skipped, length: phrase.length });
+    }
+  }
+  // An amount in the world's currency with a money verb the player says is a Pay, said exactly.
+  const pay = actions.get(FINANCE_ACTIONS.pay);
+  const verb = tokens.findIndex((w, i) => hasOwn(MONEY_VERBS, w) && acts(i));
+  if (pay && amounts.length > 0 && verb >= 0 && offered(pay)) candidates.push({ action: pay, params: fill(pay, words(tokens.slice(verb + 1).join(" ")).join(" ")), skipped: 0, length: tokens[verb]?.length ?? 0 });
+  let best: { action: ActionDef; params: JsonObject; filled: boolean; skipped: number; length: number } | null = null;
+  for (const c of candidates) {
+    const filled = Object.entries(c.action.params).every(([name, def]) => def.optional === true || c.params[name] !== undefined);
+    if (!best || (filled !== best.filled ? filled : c.skipped !== best.skipped ? c.skipped < best.skipped : c.length > best.length)) best = { ...c, filled };
+  }
+  return best ? { action: best.action.id, params: best.params, probabilities: { [best.action.id]: 1 } } : null;
+}

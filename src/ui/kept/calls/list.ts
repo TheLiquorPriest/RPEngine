@@ -1,0 +1,15 @@
+// Written by `bun scripts/ui/calls.ts` from the call files in this folder, and again by the build: never by hand.
+// Every call file of the kept views, in name order.
+
+import type { CallFile } from "../client";
+import { calls as gmCalls } from "./gm";
+import { calls as jobsCalls } from "./jobs";
+import { calls as journalCalls } from "./journal";
+import { calls as loreCalls } from "./lore";
+import { calls as mapCalls } from "./map";
+import { calls as orgsCalls } from "./orgs";
+import { calls as playCalls } from "./play";
+import { calls as thingsCalls } from "./things";
+import { calls as worldsCalls } from "./worlds";
+
+export const CALLS: readonly CallFile[] = [gmCalls, jobsCalls, journalCalls, loreCalls, mapCalls, orgsCalls, playCalls, thingsCalls, worldsCalls];

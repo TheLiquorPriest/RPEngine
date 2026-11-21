@@ -1,0 +1,750 @@
+// The built-in `engine` pack: bookkeeping events the runtime records (rule firings, interrupt
+// signals, agent catch-up cursors, the clock set back by a ✎ fix and how far it had run, recorded
+// choices, puzzle attempts, reveals, the hints the player opened, the paused scene, checks rolled by the `check` effect), GM
+// edits of an entity's tier, agent flag and levels and of its classes and tags, the chat's workspace
+// files and pins (`engine/workspace`: `engine.ws.write`, `engine.ws.delete`, `engine.ws.pin`), life states
+// (`engine/life`: the events, the `life` effect, the `life` channel and `life_of`), this chat's own
+// draft of its world (`engine/world-draft`: `engine.world`), the engine's
+// narration channels (`knows`, `spawn`) and the taxonomy formulas (`kind_is`, `in_class`,
+// `has_tag`, `member_of`, `tier_of`, `band_of`). Every registry is built with it first:
+// `createRegistry([enginePack, ...packs])`. Its state lives in `state.packs.engine`.
+
+import { listOf, say } from "../shared/lines";
+import { facetsInOrder } from "../shared/classes";
+import { isLifeState, lifeStateOf, type FacetDef } from "../shared/world";
+import type { JsonObject, JsonValue } from "../shared/json";
+import { isRecord, safeKey } from "../shared/json";
+import { jsonEqual } from "../shared/json-patch";
+import type { EntityId, InterruptClass, Level, Visibility } from "../shared/ids";
+import { DOMAIN_LABEL, DOMAINS, INTERRUPT_CLASSES, LEVEL_LABEL } from "../shared/ids";
+import { isBand, tierBand, tierLabel, tierOf } from "../shared/tiers";
+import { fieldNoun, possessive } from "../shared/words";
+import type { PackEvent } from "../shared/ledger";
+import type { EventTypeDef, PackDef, ReadContext, Rejection } from "./registry";
+import type { Value } from "./expr";
+import { acts, applyLife, lifeChannel, lifeEffect, lifeKnownTo, lifeOf, tellLife } from "./life";
+import { calendarOf, clockPlus, clockSeconds, formatClock, placeOffset, slotIndexAt } from "./calendar";
+import { knowsChannel, spawnChannel } from "./narration-channels";
+import { kindIs, placeOfEntity } from "./scope";
+import { restoreObservations } from "./seen";
+import { classOf, classProblems, inClass, isMemberOf, tagsOf } from "./selector";
+import { isStaff, orgPower } from "./org";
+import { isOrgPower } from "../shared/org";
+import type { EntityState, WorldState } from "./state";
+import { own } from "./pack-kit";
+import { minutesBetween } from "./world-state";
+import { feedEvent } from "./feed";
+import { wsDeleteEvent, wsPinEvent, wsReadersEvent, wsWriteEvent } from "./workspace";
+import { outLinesEvent, outSceneEvent } from "./outputs";
+import { draftBackDef, draftEventDef } from "./world-draft";
+import { UNMATERIALIZED, unmaterializedEvent } from "./materialize";
+
+const LEVELS: readonly Level[] = [0, 1, 2, 3, 4];
+
+export const ENGINE_PACK = "engine";
+
+/** Event types the runtime emits. */
+export const ENGINE_EVENTS = {
+  fired: "engine.fired",
+  signal: "engine.signal",
+  note: "engine.note",
+  beat: "engine.beat",
+  caught: "engine.caught",
+  cursor: "engine.cursor",
+  choice: "engine.choice",
+  attempt: "engine.attempt",
+  revealed: "engine.revealed",
+  /** A hint the player opened at a track's stage (DESIGN §10): the narrator is told the hints opened, never the rest. */
+  hint: "engine.hint",
+  /** One hint the player opened at a track's stage closed again (the Undo of `engine.hint`). */
+  hintClosed: "engine.hint_closed",
+  pause: "engine.pause",
+  /** A check the `check` effect rolled, with its final values (the outcome's effects follow it). */
+  check: "engine.check",
+  /** A GM edit of an entity's simulation detail: its tier, agent flag and per-entity level overrides. */
+  entity: "engine.entity",
+  /** A GM edit of an entity's classes and tags, held in state from then on over the world's definition. */
+  classes: "engine.class",
+  /** What a coarsened record's fold would get wrong of the POV's observations (`engine/seen`), at its end. */
+  observed: "engine.observed",
+  /** How the adjudication policy decided an action's check (DESIGN §11): rolled or not and why, the judge's rating, and the attempt a retry rule reads. */
+  adjudged: "engine.adjudged",
+  /** An entity's life state set (DESIGN §8, `engine/life`): everyone with it learns it as it changes. */
+  life: "engine.life",
+  /** People told an entity's life state as it is. */
+  told: "engine.told",
+  /** An entity's name changed in play (an item op's label, ITEMS-SPEC §3.5), `was` the name before. */
+  rename: "engine.rename",
+  /**
+   * The clock set back by a ✎ fix of the time (DESIGN §9.2, §12), `minutes` before where it stood.
+   * How far it had run stays recorded (`reached`), so nothing up to there runs again (L48).
+   */
+  rewind: "engine.rewind",
+  /** A materialization's detail taken off the record of what was sampled (the Undo of one, `engine/materialize`). */
+  unmaterialized: UNMATERIALIZED,
+  /** The newest entry equal to `entry` taken off a list at `path` in a pack's slice (`pack`, `path`, `entry`): the Undo of an event that appended it. */
+  unlist: "engine.unlist",
+  /** A number at `path` in a pack's slice changed by `delta` (`pack`, `path`, `delta`), where the path holds one: the Undo of an event that added to it. */
+  bump: "engine.bump",
+  /** What an event wrote under a pack's slice or in what an entity holds put back as it was (`path`, its first key `packs` or `entities`, and `value`; none: taken off): the Undo of an event that has no reverse of its own. */
+  put: "engine.put",
+} as const;
+
+/** The event that takes the newest entry equal to `entry` off the list at `path` in a pack's slice, for an event's `reverse` (`ENGINE_EVENTS.unlist`). */
+export function unlisting(pack: string, path: readonly string[], entry: JsonValue): JsonObject {
+  return { type: ENGINE_EVENTS.unlist, data: { pack, path: [...path], entry } };
+}
+
+/** The event that changes the number at `path` in a pack's slice by `delta`, for an event's `reverse` (`ENGINE_EVENTS.bump`). */
+export function bumping(pack: string, path: readonly string[], delta: number): JsonObject {
+  return { type: ENGINE_EVENTS.bump, data: { pack, path: [...path], delta } };
+}
+
+/** The object that holds the last key of `path` in a pack's slice, and that key; none where the path does not lead to one. */
+function parentAt(state: WorldState, e: PackEvent): { at: JsonObject; key: string } | null {
+  const path = Array.isArray(e.data.path) ? e.data.path.filter((k): k is string => typeof k === "string") : [];
+  const key = path.pop();
+  let at: JsonValue | undefined = state.packs[str(e, "pack")];
+  for (const step of path) at = isRecord(at) ? (at as JsonObject)[step] : undefined;
+  return key !== undefined && isRecord(at) ? { at: at as JsonObject, key } : null;
+}
+
+/** Whether an event names a pack and a path of safe keys in it. */
+function pathNamed(e: PackEvent): boolean {
+  return safeKey(str(e, "pack")) && Array.isArray(e.data.path) && e.data.path.length > 0 && e.data.path.every((k) => typeof k === "string" && safeKey(k));
+}
+
+/** An action's latest attempt at a check, as a retry rule reads it (DESIGN §11). */
+export interface TryRecord {
+  /** The clock when it was made. */
+  at: number;
+  /** Where the actor was. */
+  place: string | null;
+  outcome: string;
+  failed: boolean;
+  /** The check as it was rolled (dice, modifier, DC): a different one is a change. */
+  odds: string;
+  /** The fight and its round, when one was under way: a later round is a change. */
+  round?: string;
+}
+
+export interface EngineSlice {
+  fired: Record<string, { n: number; last: number }>;
+  attempts: Record<string, number>;
+  /** Wrong answers to a puzzle by track and stage (`engine.attempt`): a stage's hints come one per wrong answer given there (DESIGN §10). */
+  missed: Record<string, Record<string, number>>;
+  /** Puzzle tracks answered correctly, with the stage the answer was for. */
+  solved: Record<string, string>;
+  revealed: Record<string, string[]>;
+  /** How many of a stage's hints the player has opened, by track and stage (`engine.hint`). */
+  hints: Record<string, Record<string, number>>;
+  /** Last slot index each LOD1 agent has been stepped through. */
+  agents: Record<string, number>;
+  /** Round-robin position of the off-screen catch-up queue. */
+  rr: number;
+  /** The scene key the clock was paused in, or null (DESIGN §9.2: paused for the current scene). */
+  pauseScene: string | null;
+  /** Each action's latest attempt at a check, keyed by actor, action and parameters (`engine.adjudged`). */
+  tries: Record<string, TryRecord>;
+  /**
+   * How far the clock had run when a ✎ fix last set it back (DESIGN §9.2, L48); null when none did.
+   * Everything time-driven up to it already happened, so until the clock passes it again, the clock
+   * is all that moves (`ranTo`).
+   */
+  reached: number | null;
+}
+
+export function readEngineSlice(state: Readonly<WorldState>): EngineSlice {
+  const s = state.packs[ENGINE_PACK] ?? {};
+  const rec = (v: JsonValue | undefined): JsonObject => (isRecord(v) ? (v as JsonObject) : {});
+  const fired: EngineSlice["fired"] = {};
+  for (const [k, v] of Object.entries(rec(s.fired))) if (isRecord(v) && typeof v.n === "number" && typeof v.last === "number") fired[k] = { n: v.n, last: v.last };
+  const attempts: Record<string, number> = {};
+  for (const [k, v] of Object.entries(rec(s.attempts))) if (typeof v === "number") attempts[k] = v;
+  const solved: Record<string, string> = {};
+  for (const [k, v] of Object.entries(rec(s.solved))) if (typeof v === "string") solved[k] = v;
+  const revealed: Record<string, string[]> = {};
+  for (const [k, v] of Object.entries(rec(s.revealed))) if (Array.isArray(v)) revealed[k] = v.filter((x): x is string => typeof x === "string");
+  // A count by track and by stage: a row that isn't a record, or a count that isn't a number, counts none.
+  const byStage = (v: JsonValue | undefined): Record<string, Record<string, number>> => {
+    const out: Record<string, Record<string, number>> = {};
+    for (const [track, row] of Object.entries(rec(v))) {
+      const counts: Record<string, number> = {};
+      for (const [stage, n] of Object.entries(rec(row))) if (typeof n === "number") counts[stage] = n;
+      out[track] = counts;
+    }
+    return out;
+  };
+  const agents: Record<string, number> = {};
+  for (const [k, v] of Object.entries(rec(s.agents))) if (typeof v === "number") agents[k] = v;
+  const tries: Record<string, TryRecord> = {};
+  for (const [k, v] of Object.entries(rec(s.tries))) {
+    if (isRecord(v) && typeof v.at === "number" && (typeof v.place === "string" || v.place === null) && typeof v.outcome === "string" && typeof v.failed === "boolean" && typeof v.odds === "string") tries[k] = { at: v.at, place: v.place, outcome: v.outcome, failed: v.failed, odds: v.odds, ...(typeof v.round === "string" ? { round: v.round } : {}) };
+  }
+  return {
+    fired,
+    attempts,
+    missed: byStage(s.missed),
+    solved,
+    revealed,
+    hints: byStage(s.hints),
+    agents,
+    rr: typeof s.rr === "number" ? s.rr : 0,
+    pauseScene: typeof s.pauseScene === "string" ? s.pauseScene : null,
+    reached: typeof s.reached === "number" ? s.reached : null,
+    tries,
+  };
+}
+
+function slice(state: WorldState): JsonObject {
+  const s = state.packs[ENGINE_PACK] ?? {};
+  state.packs[ENGINE_PACK] = s;
+  return s;
+}
+
+/** Lifts the clock pause's scene pin, so a pause set again holds in the scene it is set in: the next plan pins it there (DESIGN §9.2). */
+export function unpinPause(state: WorldState): void {
+  const s = state.packs[ENGINE_PACK];
+  if (s && typeof s.pauseScene === "string") s.pauseScene = null;
+}
+
+function sub(state: WorldState, key: string): JsonObject {
+  const s = slice(state);
+  const v = s[key];
+  if (isRecord(v)) return v as JsonObject;
+  const fresh: JsonObject = {};
+  s[key] = fresh;
+  return fresh;
+}
+
+/** Sets a track's stage in a by-stage count of the slice (`missed`, `hints`) to what `next` makes of its count there. */
+function countStage(state: WorldState, key: string, track: string, stage: string, next: (n: number) => number): void {
+  if (!safeKey(track) || !safeKey(stage)) return;
+  const all = sub(state, key);
+  const row = isRecord(all[track]) ? (all[track] as JsonObject) : {};
+  const n = row[stage];
+  all[track] = { ...row, [stage]: next(typeof n === "number" ? n : 0) };
+}
+
+function str(e: PackEvent, key: string): string {
+  const v = e.data[key];
+  return typeof v === "string" ? v : "";
+}
+
+/** Tags as an event holds them: a list of non-blank words; null when it isn't one. */
+function tagList(v: JsonValue | undefined): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const tags = v.filter((t): t is string => typeof t === "string" && t.trim() !== "");
+  return tags.length === v.length ? tags : null;
+}
+
+function need(e: PackEvent, ...keys: string[]): Rejection | null {
+  for (const k of keys) if (typeof e.data[k] !== "string" || e.data[k] === "") return { code: "bad_event", reason: say("why_type_needs_k", { type: e.type, k: k }) };
+  return null;
+}
+
+/** Signal data as the runtime reads it. */
+export interface Signal {
+  class: InterruptClass;
+  text: string;
+  entity?: string;
+  visibility: Visibility;
+  /** False: it only notes, whatever its class's policy (a Live or Near character's routine never stops a time skip for them, DESIGN §8). */
+  stops?: false;
+}
+
+export function signalOf(e: { type: string; data?: JsonObject }): Signal | null {
+  if (e.type !== ENGINE_EVENTS.signal || !e.data) return null;
+  const cls = e.data.class;
+  if (typeof cls !== "string" || !(INTERRUPT_CLASSES as readonly string[]).includes(cls)) return null;
+  const vis = e.data.visibility;
+  return {
+    class: cls as InterruptClass,
+    text: typeof e.data.text === "string" ? e.data.text : "",
+    ...(typeof e.data.entity === "string" ? { entity: e.data.entity } : {}),
+    // A value this reader doesn't know hides the signal (fail closed); unset is public.
+    visibility: vis === undefined || vis === null || vis === "public" ? "public" : vis === "known_by" ? "known_by" : "secret",
+    ...(e.data.stops === false ? { stops: false as const } : {}),
+  };
+}
+
+const noop = (): void => undefined;
+
+const events: EventTypeDef<PackEvent>[] = [
+  {
+    type: ENGINE_EVENTS.fired,
+    validate: (e) => need(e, "rule"),
+    apply: (e, state) => {
+      const fired = sub(state, "fired");
+      const prev = fired[str(e, "rule")];
+      const n = isRecord(prev) && typeof prev.n === "number" ? prev.n : 0;
+      fired[str(e, "rule")] = { n: n + 1, last: state.clock };
+    },
+    describe: (e) => say("ev_rule", { rule: str(e, "rule") }),
+  },
+  {
+    type: ENGINE_EVENTS.signal,
+    validate: (e) => (signalOf(e) ? null : { code: "bad_event", reason: say("why_signal_needs_a_known_class") }),
+    apply: noop,
+    describe: (e) => str(e, "text"),
+    // A signal only notes: it writes nothing, so there is nothing to take back.
+    reverse: () => [],
+  },
+  { type: ENGINE_EVENTS.note, validate: () => null, apply: noop, describe: (e) => str(e, "text"), reverse: () => [] },
+  { type: ENGINE_EVENTS.beat, validate: () => null, apply: noop, describe: (e) => str(e, "hint"), reverse: () => [] },
+  {
+    // The newest entry equal to `entry` off a list in a pack's slice, as the Undo of an event that appended it.
+    type: ENGINE_EVENTS.unlist,
+    validate: (e) => (pathNamed(e) && e.data.entry !== undefined ? null : { code: "bad_event", reason: say("why_taking_an_entry_off_needs_a_pack_a_path") }),
+    apply: (e, state) => {
+      const found = parentAt(state, e);
+      const list = found === null ? undefined : found.at[found.key];
+      if (!Array.isArray(list)) return;
+      const at = list.findLastIndex((x) => jsonEqual(x, e.data.entry ?? null));
+      if (at !== -1) list.splice(at, 1);
+    },
+    describe: () => "",
+  },
+  {
+    // A number in a pack's slice changed by `delta`, as the Undo of an event that added to it; a path that holds no number is left.
+    type: ENGINE_EVENTS.bump,
+    validate: (e) => (pathNamed(e) && typeof e.data.delta === "number" && Number.isFinite(e.data.delta) ? null : { code: "bad_event", reason: say("why_changing_a_number_needs_a_pack_a_path") }),
+    apply: (e, state) => {
+      const found = parentAt(state, e);
+      const held = found === null ? undefined : found.at[found.key];
+      if (found !== null && typeof held === "number" && typeof e.data.delta === "number") found.at[found.key] = held + e.data.delta;
+    },
+    describe: () => "",
+  },
+  {
+    // What an event wrote under a pack's slice put back as it was before: the value at `path` (its first key the pack's), or taken off where there was none.
+    type: ENGINE_EVENTS.put,
+    validate: (e) => (Array.isArray(e.data.path) && e.data.path.length > 1 && (e.data.path[0] === "packs" || e.data.path[0] === "entities") && e.data.path.every((k) => typeof k === "string" && safeKey(k)) ? null : { code: "bad_event", reason: say("why_putting_a_value_back_needs_a_path") }),
+    apply: (e, state) => {
+      const path = (Array.isArray(e.data.path) ? e.data.path : []).filter((k): k is string => typeof k === "string");
+      const root = path.shift();
+      const key = path.pop();
+      if (key === undefined || (root !== "packs" && root !== "entities")) return;
+      let at = (root === "packs" ? state.packs : state.entities) as unknown as JsonObject;
+      for (const step of path) {
+        let next = at[step];
+        if (!isRecord(next)) {
+          if (e.data.value === undefined) return;
+          next = {};
+          at[step] = next;
+        }
+        at = next as JsonObject;
+      }
+      if (e.data.value === undefined) delete at[key];
+      else at[key] = structuredClone(e.data.value);
+    },
+    describe: () => "",
+  },
+  {
+    type: ENGINE_EVENTS.caught,
+    validate: (e, ctx) => {
+      const missing = need(e, "agent");
+      if (missing) return missing;
+      return typeof e.data.slot === "number" && own(ctx.state.entities, str(e, "agent")) ? null : { code: "bad_event", reason: say("why_caught_needs_an_agent_and_a_slot") };
+    },
+    apply: (e, state) => {
+      const slot = e.data.slot;
+      if (typeof slot === "number") sub(state, "agents")[str(e, "agent")] = slot;
+    },
+    describe: (e) => say("ev_caught", { agent: str(e, "agent") }),
+  },
+  {
+    type: ENGINE_EVENTS.cursor,
+    validate: (e) => (typeof e.data.rr === "number" ? null : { code: "bad_event", reason: say("why_cursor_needs_rr") }),
+    apply: (e, state) => {
+      if (typeof e.data.rr === "number") slice(state).rr = e.data.rr;
+    },
+    describe: () => say("ev_catchup_queue"),
+  },
+  { type: ENGINE_EVENTS.choice, validate: (e) => need(e, "key", "choice"), apply: noop, describe: (e) => say("ev_choice", { key: str(e, "key"), choice: str(e, "choice") }) },
+  {
+    type: ENGINE_EVENTS.attempt,
+    validate: (e, ctx) => (own(ctx.world.tracks, str(e, "track")) ? null : { code: "missing_track", reason: say("why_no_track_track", { track: str(e, "track") }) }),
+    apply: (e, state) => {
+      const track = str(e, "track");
+      if (e.data.correct === true) sub(state, "solved")[track] = str(e, "stage");
+      else {
+        const attempts = sub(state, "attempts");
+        const n = own(attempts, track);
+        attempts[track] = (typeof n === "number" ? n : 0) + 1;
+        // The stage's own count: a later stage's hints don't come from the wrong answers given before it.
+        countStage(state, "missed", track, str(e, "stage"), (count) => count + 1);
+      }
+    },
+    describe: (e) => say("ev_attempt", { track: str(e, "track") }),
+  },
+  {
+    // `n`: how many of the stage's hints are open with this one, as the player saw them when they asked
+    // (DESIGN §10). Each opens one more, and only while fewer than `n` are open: a second tap on the
+    // same "Show a hint", sent before the first one showed (both held through a reply), opens nothing
+    // more, an Undo of either of two hints opened closes one, and a rebased view that lost an earlier
+    // one never jumps to `n`. One recorded without it opens one more, as it always has.
+    type: ENGINE_EVENTS.hint,
+    validate: (e, ctx) => {
+      const missing = need(e, "track", "stage");
+      if (missing) return missing;
+      const n = e.data.n;
+      if (n !== undefined && !(typeof n === "number" && Number.isInteger(n) && n >= 1)) return { code: "bad_event", reason: say("why_type_needs_n_a_whole_number_from", { type: e.type }) };
+      const t = own(ctx.world.tracks, str(e, "track"));
+      return t && own(t.stages, str(e, "stage")) ? null : { code: "missing_track", reason: say("why_no_stage_stage_of_track_track", { stage: str(e, "stage"), track: str(e, "track") }) };
+    },
+    apply: (e, state) => {
+      const n = e.data.n;
+      countStage(state, "hints", str(e, "track"), str(e, "stage"), (open) => (typeof n === "number" ? (open < n ? open + 1 : open) : open + 1));
+    },
+    describe: (e) => say("ev_hint_opened", { track: str(e, "track") }),
+  },
+  {
+    // The Undo of a hint the player opened: one fewer of the stage's hints is open, never fewer than none.
+    type: ENGINE_EVENTS.hintClosed,
+    validate: (e, ctx) => {
+      const missing = need(e, "track", "stage");
+      if (missing) return missing;
+      const t = own(ctx.world.tracks, str(e, "track"));
+      return t && own(t.stages, str(e, "stage")) ? null : { code: "missing_track", reason: say("why_no_stage_stage_of_track_track", { stage: str(e, "stage"), track: str(e, "track") }) };
+    },
+    apply: (e, state) => {
+      countStage(state, "hints", str(e, "track"), str(e, "stage"), (open) => Math.max(0, open - 1));
+    },
+    describe: (e) => say("ev_hint_closed", { track: str(e, "track") }),
+  },
+  {
+    type: ENGINE_EVENTS.revealed,
+    validate: (e) => need(e, "track", "stage"),
+    apply: (e, state) => {
+      const revealed = sub(state, "revealed");
+      const list = revealed[str(e, "track")];
+      const stages = Array.isArray(list) ? list.filter((x): x is string => typeof x === "string") : [];
+      if (!stages.includes(str(e, "stage"))) stages.push(str(e, "stage"));
+      revealed[str(e, "track")] = stages;
+    },
+    describe: (e) => say("ev_track_revealed", { track: str(e, "track") }),
+  },
+  {
+    type: ENGINE_EVENTS.pause,
+    validate: (e) => (typeof e.data.scene === "string" || e.data.scene === null ? null : { code: "bad_event", reason: say("why_pause_needs_scene") }),
+    apply: (e, state) => {
+      slice(state).pauseScene = typeof e.data.scene === "string" ? e.data.scene : null;
+    },
+    describe: (e) => say(e.data.scene === null ? "ev_clock_resume" : "ev_clock_pause"),
+    // The clock's pause is pinned to the scene it was before (or to none).
+    reverse: (_e, before) => [{ type: ENGINE_EVENTS.pause, data: { scene: readEngineSlice(before).pauseScene } }],
+  },
+  {
+    type: ENGINE_EVENTS.rewind,
+    // Any time the story states, before the story's start too: it is applied as stated, never clamped, and said (`before_start`).
+    validate: (e) => {
+      const minutes = e.data.minutes;
+      if (typeof minutes !== "number" || !Number.isFinite(minutes) || clockSeconds(minutes) <= 0) return { code: "bad_event", reason: say("why_a_clock_set_back_needs_a_time") };
+      return null;
+    },
+    advise: (e, ctx) => {
+      const minutes = e.data.minutes;
+      const start = minutesBetween(ctx.world.calendar.epoch, ctx.world.start.at);
+      if (typeof minutes !== "number" || clockPlus(ctx.state.clock, -minutes) >= start) return null;
+      return { code: "before_start", values: { start: formatClock(calendarOf(ctx.world), start, placeOffset(ctx.world, start, placeOfEntity(ctx.state, ctx.world.pov))) } };
+    },
+    // A second set-back inside the window keeps the furthest the clock had run, not where it stood.
+    apply: (e, state) => {
+      const minutes = e.data.minutes;
+      if (typeof minutes !== "number") return;
+      const s = slice(state);
+      s.reached = Math.max(typeof s.reached === "number" ? s.reached : state.clock, state.clock);
+      state.clock = clockPlus(state.clock, -minutes);
+    },
+    describe: (e) => say("ev_clock_set_back", { minutes: String(e.data.minutes) }),
+  },
+  {
+    type: ENGINE_EVENTS.check,
+    validate: (e, ctx) => need(e, "actor", "outcome") ?? (own(ctx.state.entities, str(e, "actor")) ? null : { code: "missing_entity", reason: say("why_no_entity_who", { who: str(e, "actor") }) }),
+    apply: noop,
+    // A roll whole, as every view says it: who rolled, for what (the roll tool's purpose, else the world's check), the dice and the
+    // numbers they showed, the total against the difficulty, and the outcome where it has one besides being rolled.
+    describe: (e) => {
+      const kept = Array.isArray(e.data.dice) ? e.data.dice.filter((d): d is number => typeof d === "number") : typeof e.data.natural === "number" ? [e.data.natural] : [];
+      const outcome = str(e, "outcome");
+      return say("ev_check", {
+        actor: str(e, "actor"),
+        for: str(e, "for"),
+        check: str(e, "check").replace(/_/g, " "),
+        notation: str(e, "notation"),
+        ...(kept.length > 0 ? { dice: kept.join(", ") } : {}),
+        ...(typeof e.data.total === "number" ? { total: String(e.data.total) } : {}),
+        ...(typeof e.data.dc === "number" ? { dc: String(e.data.dc) } : {}),
+        ...(outcome !== "" && outcome !== "rolled" ? { outcome: outcome.replace(/_/g, " ") } : {}),
+      });
+    },
+    irreversible: "roll",
+  },
+  {
+    type: ENGINE_EVENTS.entity,
+    validate: (e, ctx) => {
+      if (!own(ctx.state.entities, str(e, "entity"))) return { code: "missing_entity", reason: say("why_no_entity_who", { who: str(e, "entity") }) };
+      const { tier, agent, levels } = e.data;
+      if (tier !== undefined && (typeof tier !== "string" || !(tierOf(ctx.world, tier) || isBand(tier)))) return { code: "bad_tier", reason: say("why_no_tier_tier", { tier: String(tier) }) };
+      if (agent !== undefined && typeof agent !== "boolean") return { code: "bad_event", reason: say("why_agent_is_yes_or_no") };
+      if (levels !== undefined && !(isRecord(levels) && Object.entries(levels).every(([d, v]) => DOMAINS.some((x) => x === d) && (v === null || (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 4))))) return { code: "bad_level", reason: say("why_a_level_is_a_whole_number_0_2") };
+      return null;
+    },
+    apply: (e, state) => {
+      const ent = own(state.entities, str(e, "entity"));
+      if (!ent) return;
+      if (typeof e.data.tier === "string") ent.tier = e.data.tier;
+      if (typeof e.data.agent === "boolean") ent.agent = e.data.agent;
+      const levels = e.data.levels;
+      if (!isRecord(levels)) return;
+      for (const domain of DOMAINS) {
+        const v = levels[domain];
+        if (v === null) delete ent.levels[domain];
+        else if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 4) ent.levels[domain] = v as Level;
+      }
+    },
+    touches: (e) => {
+      const entity = str(e, "entity");
+      return (["tier", "agent", "levels"] as const).filter((aspect) => e.data[aspect] !== undefined).map((aspect) => ({ entity, aspect }));
+    },
+    describe: (e, ctx) => {
+      // One sentence for all of it: "Danny Okafor is now in the Supporting tier and has Money detail at level 2".
+      const clauses: string[] = [];
+      if (typeof e.data.tier === "string") clauses.push(say("ev_entity_tier", { tier: tierLabel(ctx.world, e.data.tier) }));
+      if (typeof e.data.agent === "boolean") clauses.push(say(e.data.agent ? "ev_entity_agent_on" : "ev_entity_agent_off"));
+      const levels = e.data.levels;
+      if (isRecord(levels))
+        for (const [d, v] of Object.entries(levels)) {
+          // An area and a level as Settings → Realism names them: "Money detail at level 2 (Simple)".
+          const domain = DOMAINS.find((x) => x === d);
+          const area = domain ? DOMAIN_LABEL[domain] : d;
+          const level = LEVELS.find((n) => n === v);
+          clauses.push(v === null ? say("ev_entity_level_cleared", { area }) : say("ev_entity_level", { area, level: String(v), ...(level !== undefined ? { label: LEVEL_LABEL[level] } : {}) }));
+        }
+      return clauses.length === 0 ? "" : say("ev_entity", { name: own(ctx.state.entities, str(e, "entity"))?.name ?? str(e, "entity"), clauses: listOf(clauses) });
+    },
+  },
+  {
+    type: ENGINE_EVENTS.classes,
+    validate: (e, ctx) => {
+      const ent = own(ctx.state.entities, str(e, "entity"));
+      if (!ent) return { code: "missing_entity", reason: say("why_no_entity_who", { who: str(e, "entity") }) };
+      const classes = classOf(e.data.class);
+      if (!classes) return { code: "bad_event", reason: say("why_a_classification_is_facet_values") };
+      // More values than a one-valued facet takes are held as they were recorded (the edit that recorded them said so); a facet or a value the world lacks is still held back.
+      const problem = classProblems(ctx.world, classes, ent.name).find((p) => p.code !== "single_class");
+      if (problem) return { code: problem.code, reason: problem.message };
+      if (e.data.was !== undefined && !classOf(e.data.was)) return { code: "bad_event", reason: say("why_the_classification_before_is_facet_values") };
+      return tagList(e.data.tags) ? null : { code: "bad_event", reason: say("why_tags_are_a_list_of_words") };
+    },
+    apply: (e, state) => {
+      const ent = own(state.entities, str(e, "entity"));
+      if (!ent) return;
+      // Both are held, empty ones too, so the world's definition no longer speaks for either.
+      ent.class = classOf(e.data.class) ?? {};
+      ent.tags = tagList(e.data.tags) ?? [];
+    },
+    touches: (e) => [{ entity: str(e, "entity"), aspect: "class" }],
+    describe: (e, ctx, viewer) => {
+      const classes = classOf(e.data.class) ?? {};
+      const name = own(ctx.state.entities, str(e, "entity"))?.name ?? str(e, "entity");
+      const valuesOf = (f: FacetDef, values: readonly string[]): string => (values.length > 0 ? listOf(values.map((v) => own(f.values, v)?.label ?? v)) : say("ev_none"));
+      // "Danny Okafor's trade is now mechanic": each facet as what it is, then its values.
+      const facetLine = (f: FacetDef, values: readonly string[]): string => say("ev_class_facet", { whose: possessive(name), noun: fieldNoun(f.label, "").noun, values: valuesOf(f, values) });
+      if (viewer !== undefined) {
+        // A player's line says only what changed on the facets players can see, a cleared one
+        // included, and never tags (DESIGN §4.1), so an edit to a hidden facet or a tag has no line.
+        // Without the values before, it can't say what changed, so it says nothing.
+        const was = classOf(e.data.was);
+        if (!was) return "";
+        const same = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((x) => b.includes(x));
+        const changed = facetsInOrder(ctx.world)
+          .filter(([id, f]) => f.shown === true && !same(own(classes, id) ?? [], own(was, id) ?? []))
+          .map(([id, f]) => facetLine(f, own(classes, id) ?? []));
+        return changed.join("; ");
+      }
+      const parts = facetsInOrder(ctx.world).flatMap(([id, f]) => {
+        const values = own(classes, id) ?? [];
+        return values.length > 0 ? [facetLine(f, values)] : [];
+      });
+      const tags = tagList(e.data.tags) ?? [];
+      if (tags.length > 0) parts.push(say("ev_class_tags", { whose: possessive(name), tags: listOf(tags) }));
+      return parts.length > 0 ? parts.join("; ") : say("ev_class_none", { name });
+    },
+  },
+  {
+    // A thing given a new name in play (ITEMS-SPEC: an item op's label): what every reader and line calls it from then on.
+    type: ENGINE_EVENTS.rename,
+    validate: (e, ctx) => {
+      const name = str(e, "name");
+      if (!own(ctx.state.entities, str(e, "entity"))) return { code: "missing_entity", reason: say("why_no_entity_who", { who: str(e, "entity") }) };
+      return name.trim() !== "" ? null : { code: "bad_name", reason: say("why_a_name_is_not_empty") };
+    },
+    apply: (e, state) => {
+      const ent = own(state.entities, str(e, "entity"));
+      if (ent) ent.name = str(e, "name");
+    },
+    // Play's name, so an Upgrade that renames it too keeps the chat's.
+    touches: (e) => [{ entity: str(e, "entity"), aspect: "name" }],
+    // Named as it was before; a thing made in the same change has no name before, and goes with it.
+    reverse: (e, before, now) => {
+      const entity = str(e, "entity");
+      if (own(now.entities, entity)?.name !== str(e, "name")) return "changed_since";
+      const was = own(before.entities, entity)?.name;
+      return was === undefined ? [] : [{ type: ENGINE_EVENTS.rename, data: { entity, name: was, was: str(e, "name") } }];
+    },
+    describe: (e, ctx) => say("ev_renamed", { was: str(e, "was") || str(e, "entity"), name: str(e, "name") }),
+    coarsen: { key: (e) => str(e, "entity"), merge: (earlier, later) => ({ ...later, data: { ...later.data, was: earlier.data.was ?? null } }) },
+  },
+  {
+    type: ENGINE_EVENTS.observed,
+    validate: (e) => (Object.values(e.data).every(isRecord) ? null : { code: "bad_event", reason: say("why_observed_needs_places_and_people") }),
+    apply: (e, state) => restoreObservations(state, e.data),
+    describe: () => say("ev_meanwhile"),
+  },
+  {
+    type: ENGINE_EVENTS.adjudged,
+    validate: (e, ctx) => need(e, "actor", "action", "outcome") ?? (own(ctx.state.entities, str(e, "actor")) ? null : { code: "missing_entity", reason: say("why_no_entity_who", { who: str(e, "actor") }) }),
+    apply: (e, state) => {
+      // Only an attempt a retry rule reads carries a key; its record is the latest for that check.
+      const key = e.data.key;
+      if (typeof key !== "string" || !safeKey(key)) return;
+      const { place, round } = e.data;
+      sub(state, "tries")[key] = { at: state.clock, place: typeof place === "string" ? place : null, outcome: str(e, "outcome"), failed: e.data.failed === true, odds: str(e, "odds"), ...(typeof round === "string" ? { round } : {}) };
+    },
+    describe: (e) => say("ev_roll", { actor: str(e, "actor"), action: str(e, "action").replace(/_/g, " "), outcome: str(e, "outcome").replace(/_/g, " "), ...(e.data.rolled === true ? { rolled: true } : { why: str(e, "why") }) }),
+    // A roll the player has seen, or the narrator has told, does not unroll: its result stands.
+    irreversible: "roll",
+  },
+  {
+    type: ENGINE_EVENTS.life,
+    validate: (e, ctx) => {
+      const ent = own(ctx.state.entities, str(e, "entity"));
+      if (!ent) return { code: "missing_entity", reason: say("why_no_entity_who", { who: str(e, "entity") }) };
+      if (!isLifeState(ctx.world, str(e, "to"))) return { code: "bad_life", reason: say("why_theres_no_life_state_to", { to: str(e, "to") }) };
+      const seen = e.data.witnesses;
+      if (seen !== undefined && !(Array.isArray(seen) && seen.every((id) => typeof id === "string"))) return { code: "bad_event", reason: say("why_a_life_changes_witnesses_are_entity_ids") };
+      return lifeOf(ctx.state, str(e, "entity")) === str(e, "to") ? { code: "no_change", reason: say("why_name_is_already_to", { name: ent.name, to: lifeStateOf(ctx.world, str(e, "to")).label.toLowerCase() }) } : null;
+    },
+    apply: (e, state, ctx) => applyLife(state, ctx, str(e, "entity"), str(e, "to"), witnessesOf(e)),
+    touches: (e) => [{ entity: str(e, "entity"), aspect: "life" }],
+    describe: (e, ctx, viewer) => {
+      const id = str(e, "entity");
+      const def = lifeStateOf(ctx.world, str(e, "to"));
+      const name = own(ctx.state.entities, id)?.name ?? id;
+      const state = def.label.toLowerCase();
+      if (viewer === undefined) return say("ev_life", { name, state });
+      if (id === viewer) return say("ev_life_you", { state });
+      // A player's line only for one who saw it change: one learned of later is the telling's news
+      // (`engine.told`), so the turn it happened on never dates it.
+      return witnessesOf(e)?.includes(viewer) === true ? say("ev_life_reads", { name, reads: def.reads }) : "";
+    },
+  },
+  {
+    type: ENGINE_EVENTS.told,
+    validate: (e, ctx) => {
+      if (!own(ctx.state.entities, str(e, "entity"))) return { code: "missing_entity", reason: say("why_no_entity_who", { who: str(e, "entity") }) };
+      const who = e.data.who;
+      return Array.isArray(who) && who.length > 0 && who.every((id) => typeof id === "string" && own(ctx.state.entities, id)) ? null : { code: "bad_event", reason: say("why_told_needs_the_people_told") };
+    },
+    apply: (e, state) => tellLife(state, str(e, "entity"), Array.isArray(e.data.who) ? e.data.who.filter((id): id is string => typeof id === "string") : []),
+    describe: (e, ctx, viewer) => {
+      const id = str(e, "entity");
+      const name = own(ctx.state.entities, id)?.name ?? id;
+      const who = Array.isArray(e.data.who) ? e.data.who.filter((x): x is string => typeof x === "string") : [];
+      if (viewer === undefined) return say("ev_told", { who: listOf(who.map((w) => own(ctx.state.entities, w)?.name ?? w)), ...(who.length === 1 ? { one: true } : {}), name, reads: lifeStateOf(ctx.world, lifeOf(ctx.state, id)).reads });
+      // Someone else being told is nobody's news; the POV hears what it now takes to be so.
+      return who.includes(viewer) ? say("ev_life_reads", { name, reads: lifeStateOf(ctx.world, lifeKnownTo(ctx.state, id, viewer)).reads }) : "";
+    },
+  },
+];
+
+/** Who an `engine.life` event records seeing the change; null on one recorded before witnesses were. */
+function witnessesOf(e: PackEvent): EntityId[] | null {
+  const seen = e.data.witnesses;
+  return Array.isArray(seen) ? seen.filter((id): id is string => typeof id === "string") : null;
+}
+
+/** A formula argument naming an entity in the state, with that entity; null otherwise. */
+function entityArg(ctx: ReadContext, v: Value | undefined): [EntityId, EntityState] | null {
+  const id = typeof v === "string" ? v : "";
+  const e = own(ctx.state.entities, id);
+  return e ? [id, e] : null;
+}
+export const enginePack: PackDef = {
+  id: ENGINE_PACK,
+  label: "Engine",
+  version: 1,
+  domain: null,
+  requires: [],
+  register(r) {
+    for (const def of events) r.event(def);
+    // The GM's per-chat section settings (DESIGN §6.11).
+    r.event(feedEvent);
+    // The chat's workspace files, by path, and the ones pinned (DESIGN §4.4).
+    r.event(wsWriteEvent);
+    r.event(wsDeleteEvent);
+    r.event(wsPinEvent);
+    r.event(wsReadersEvent);
+    // What an agent turn tells its narrator, recorded on the turn (INC2-SPEC C11): no state of its own.
+    r.event(outLinesEvent);
+    r.event(outSceneEvent);
+    // This chat's own draft of its world (`world-draft.ts`): places, paths and maps made or changed in play.
+    r.event(draftEventDef);
+    r.event(draftBackDef);
+    // The Undo of a materialization (`engine/materialize`).
+    r.event(unmaterializedEvent);
+    r.proposal(knowsChannel);
+    r.proposal(spawnChannel);
+    r.proposal(lifeChannel);
+    // Someone who acts again comes back caught up, as a restored agent does: the slots spent out of it aren't lived again.
+    r.effect({
+      type: "life",
+      args: ["entity", "to?", "tell?"],
+      resolve: (a, ctx) => {
+        const out = lifeEffect(a, ctx);
+        const subject = typeof a.entity === "string" ? a.entity : "";
+        const wakes = Array.isArray(out) && typeof a.to === "string" && out.some((e) => e.type === ENGINE_EVENTS.life) && own(ctx.state.entities, subject)?.agent === true && !acts(ctx.world, ctx.state, subject) && lifeStateOf(ctx.world, a.to).acts;
+        return wakes && Array.isArray(out) ? [...out, { type: ENGINE_EVENTS.caught, data: { agent: subject, slot: slotIndexAt(calendarOf(ctx.world), ctx.state.clock) } }] : out;
+      },
+    });
+    // An entity's life state (DESIGN §8), for rules and requirements: "" for an unknown entity.
+    r.formula("life_of", (ctx, entity) => {
+      const hit = entityArg(ctx, entity);
+      return hit ? lifeOf(ctx.state, hit[0]) : "";
+    });
+    // Taxonomy (DESIGN §4.1): what a selector tests, one constraint at a time. An unknown entity is false (or "").
+    r.formula("kind_is", (ctx, entity, kind) => {
+      const hit = entityArg(ctx, entity);
+      return hit !== null && kindIs(ctx.registry, ctx.world, hit[1].kind, String(kind ?? ""));
+    });
+    r.formula("in_class", (ctx, entity, facet, value) => {
+      const hit = entityArg(ctx, entity);
+      return hit !== null && inClass(ctx.world, ctx.state, hit[0], String(facet ?? ""), [String(value ?? "")]);
+    });
+    r.formula("has_tag", (ctx, entity, tag) => {
+      const hit = entityArg(ctx, entity);
+      return hit !== null && tagsOf(ctx.world, ctx.state, hit[0]).includes(String(tag ?? ""));
+    });
+    r.formula("member_of", (ctx, entity, group) => {
+      const hit = entityArg(ctx, entity);
+      return hit !== null && isMemberOf(ctx, hit[0], String(group ?? ""));
+    });
+    // Organizations (ORG-SPEC §3.4, §3.6): whether someone holds a power in one, works for one, and who acts (an organization `as` names, else themselves).
+    r.formula("may", (ctx, who, org, power) => {
+      const hit = entityArg(ctx, who);
+      return hit !== null && isOrgPower(power) && orgPower(ctx, hit[0], String(org ?? ""), power) !== null;
+    });
+    r.formula("staff_of", (ctx, who, org) => {
+      const hit = entityArg(ctx, who);
+      return hit !== null && isStaff(ctx, hit[0], String(org ?? "")) !== null;
+    });
+    r.formula("acting", (ctx, self, as) => (typeof as === "string" && as !== "" && own(ctx.state.entities, as) ? as : (entityArg(ctx, self)?.[0] ?? "")));
+    r.formula("tier_of", (ctx, entity) => entityArg(ctx, entity)?.[1].tier ?? "");
+    r.formula("band_of", (ctx, entity) => {
+      const hit = entityArg(ctx, entity);
+      return hit ? (tierBand(ctx.world, hit[1].tier) ?? "") : "";
+    });
+  },
+};

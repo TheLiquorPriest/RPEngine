@@ -1,0 +1,138 @@
+// The text map (plan §8.2): a grid as the world state prints it, whole up to the size the settings
+// give (Appendix D.1: 40 by 30 squares), and a larger one around a centre, saying which part is
+// shown. The picture is data: the column numbers, then each row's number and its squares' symbols,
+// as plan §8.2 lays it out. A thing the map draws is drawn where it stands now, over its footprint.
+// The legend (each symbol, what the map's legend says it is, and where it is shown), who and what
+// stands where, and the doors' states are data as well: whoever shows the map words them from a file.
+
+import type { EntityId, PlaceId } from "../../shared/ids";
+import { hasOwn } from "../../shared/json";
+import type { MapCellDef } from "../../shared/world";
+import { MAP_DEFAULTS, type MapConfig } from "../../shared/map-config";
+import { doorState, footprint, squareAt, standsAt, type DoorState, type Drawn, type Moving, type Piece, type Scale, type Square } from "../../packs/space/core/grid-model";
+
+/** One symbol of the picture: what the map's legend says it is, and the squares shown that carry it. */
+export interface LegendEntry {
+  symbol: string;
+  /** As the map's legend gives it (today's `MapCellDef`); a symbol the legend lacks is floor, as the compiler reads it. */
+  what: MapCellDef;
+  where: Square[];
+}
+
+/** Someone or something on the grid as the map lists it. */
+export interface Listed {
+  id: EntityId;
+  /** Where it stands; for what lies on something, that one's square. */
+  at: Square | null;
+  size?: Square;
+  on?: EntityId;
+  /** That `on` is what it lies in (a holder's contents), not what it lies on. */
+  within?: true;
+  blocks?: Piece["blocks"];
+  /** Whether it stands in the part shown. */
+  shown: boolean;
+}
+
+export interface Printed {
+  /** The grid's id, the place it draws, and the map that draws it. */
+  grid: string;
+  scope: PlaceId;
+  map?: string;
+  width: number;
+  height: number;
+  scale: Scale;
+  /** The part shown: its top left square and its bottom right one. */
+  from: Square;
+  to: Square;
+  whole: boolean;
+  /** The picture as data: the numbers of the columns shown, and each row shown by its number with its squares' symbols, each as wide as its column's number. */
+  columns: number[];
+  rows: { row: number; cells: string[] }[];
+  /** In the order each symbol first appears, row by row. */
+  legend: LegendEntry[];
+  /** Everyone and everything on the grid, by id, shown or not. */
+  pieces: Listed[];
+  /** Every door of the grid and its state. */
+  doors: { at: Square; state: DoorState }[];
+}
+
+/** Where a window of `size` squares starts on a side of `length` squares, centred on `centre` as far as the edges allow. */
+function windowStart(length: number, size: number, centre: number): number {
+  return Math.min(Math.max(1, centre - Math.floor((size - 1) / 2)), length - size + 1);
+}
+
+/** Where a window of `size` squares starts so that it holds squares `lo` to `hi`, they in its middle as far as the edges allow; null when they do not fit. */
+function windowAround(length: number, size: number, lo: number, hi: number): number | null {
+  const held = hi - lo + 1;
+  return held > size ? null : Math.min(Math.max(1, lo - Math.floor((size - held) / 2)), length - size + 1);
+}
+
+/**
+ * The grid as text, with its legend, who and what stands where, and its doors. Whole when it fits
+ * the settings' size; otherwise the part of that size that holds everyone and everything `around`
+ * names and stands on the grid, when they fit in it (the horizon's); else the part around `centre`
+ * (the player's character, else the scene's place; the grid's middle when none is given).
+ */
+export function printMap(drawn: Drawn, moving: Moving, opts: { centre?: Square; around?: readonly EntityId[]; config?: Readonly<MapConfig> } = {}): Printed {
+  const config = opts.config ?? MAP_DEFAULTS;
+  const cols = Math.min(drawn.width, config.printColumns);
+  const rows = Math.min(drawn.height, config.printRows);
+  const centre = opts.centre ?? [Math.ceil(drawn.width / 2), Math.ceil(drawn.height / 2)];
+  const held = (opts.around ?? []).map((id) => standsAt(moving, id)).filter((s): s is Square => s !== null);
+  const around =
+    held.length > 0
+      ? {
+          c: windowAround(drawn.width, cols, Math.min(...held.map((s) => s[0])), Math.max(...held.map((s) => s[0]))),
+          r: windowAround(drawn.height, rows, Math.min(...held.map((s) => s[1])), Math.max(...held.map((s) => s[1]))),
+        }
+      : null;
+  const fits = around !== null && around.c !== null && around.r !== null;
+  const c0 = fits ? (around.c ?? 1) : windowStart(drawn.width, cols, centre[0]);
+  const r0 = fits ? (around.r ?? 1) : windowStart(drawn.height, rows, centre[1]);
+  const c1 = c0 + cols - 1;
+  const r1 = r0 + rows - 1;
+
+  // The picture is the grid as drawn: the squares' own symbols, a thing the map draws at the square it is drawn on. Where a thing stands now is the moving layer's (`pieces`).
+  const symbols = drawn.symbols;
+  const columns: number[] = [];
+  for (let c = c0; c <= c1; c++) columns.push(c);
+  const picture: { row: number; cells: string[] }[] = [];
+  const legend = new Map<string, LegendEntry>();
+  for (let r = r0; r <= r1; r++) {
+    const cells: string[] = [];
+    for (const c of columns) {
+      const s = symbols[(r - 1) * drawn.width + (c - 1)] ?? " ";
+      // Each symbol under the first digit of its column's number.
+      cells.push(s.padEnd(String(c).length));
+      const entry = legend.get(s) ?? { symbol: s, what: (hasOwn(drawn.legend, s) ? drawn.legend[s] : undefined) ?? "floor", where: [] };
+      entry.where.push([c, r]);
+      legend.set(s, entry);
+    }
+    picture.push({ row: r, cells });
+  }
+
+  const pieces: Listed[] = Object.keys(moving.pieces)
+    .sort()
+    .map((id) => {
+      const p = moving.pieces[id];
+      const at = standsAt(moving, id);
+      return { id, at, ...(p?.size ? { size: p.size } : {}), ...(p?.on !== undefined ? { on: p.on } : {}), ...(p?.within ? { within: true as const } : {}), ...(p?.blocks ? { blocks: p.blocks } : {}), shown: at !== null && at[0] >= c0 && at[0] <= c1 && at[1] >= r0 && at[1] <= r1 };
+    });
+  const doors = [...drawn.doors].sort((a, b) => a - b).map((i) => ({ at: squareAt(drawn, i), state: doorState(drawn, moving, i) ?? "open" }));
+  return {
+    grid: drawn.id,
+    scope: drawn.scope,
+    ...(drawn.map !== undefined ? { map: drawn.map } : {}),
+    width: drawn.width,
+    height: drawn.height,
+    scale: drawn.scale,
+    from: [c0, r0],
+    to: [c1, r1],
+    whole: cols === drawn.width && rows === drawn.height,
+    columns,
+    rows: picture,
+    legend: [...legend.values()],
+    pieces,
+    doors,
+  };
+}

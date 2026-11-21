@@ -1,0 +1,80 @@
+// What a chat's state view builds from a state: built in stretches as one read pass, a panel of many pages a page at a time, it comes
+// to what one pass builds whole, and an organization's page, read apart, to what that pass builds of it; it is kept under the store's
+// key for the state, so a second ask builds nothing, the store letting the state go to fold others loses it not, and a turn makes another.
+
+import { describe, expect, test } from "bun:test";
+import { playedWorld } from "../../src/engine/places-in-play";
+import { readPass } from "../../src/engine/read-pass";
+import type { JsonValue } from "../../src/shared/json";
+import { MAP_DEFAULTS } from "../../src/shared/map-config";
+import { installHistoryLines } from "../../src/iface/history-lines";
+import { shippedTexts } from "../../src/iface/texts";
+import { CHAT, makeBed, USER } from "./bed";
+
+describe("a chat's state view", () => {
+  test("built in stretches, a page at a time, has the panels one pass builds whole", async () => {
+    const bed = makeBed();
+    await bed.plays("modern_slice_of_life");
+    await bed.turn();
+    const view = await bed.state();
+    const state = bed.store.user(USER).headState(CHAT).state.world;
+    const doc = bed.store.env.worlds(state.revision);
+    if (doc === undefined) throw new Error("the chat's world is not kept");
+    const world = playedWorld(doc, state);
+    const registry = bed.store.env.registry;
+    const whole = readPass(() => {
+      const ctx = registry.context(world, state);
+      return Object.fromEntries(registry.views.map((v): [string, JsonValue] => [v.panel, v.build(ctx, { mapDisplay: null, mapConfig: MAP_DEFAULTS })]));
+    });
+    // The organisations' summaries are built a page at a time: more than one here. Their pages are no part of the view.
+    expect(Object.keys(view.panels["orgs.summary"] as object).length).toBeGreaterThan(1);
+    expect(view.panels["orgs.org"]).toBeUndefined();
+    // Each page is read apart, as one pass builds it.
+    const pages = whole["orgs.org"] as Record<string, JsonValue>;
+    for (const id of Object.keys(pages)) expect(JSON.parse(JSON.stringify(await bed.service.orgPage(USER, CHAT, id)))).toEqual(JSON.parse(JSON.stringify(pages[id])));
+    // The quest log takes the quests' trails after it is built; every other panel is as its pack builds it.
+    const built = Object.fromEntries(Object.entries(view.panels).filter(([panel]) => panel !== "story.quests"));
+    const apart = new Set(registry.views.filter((v) => v.apart === true).map((v) => v.panel));
+    const asWhole = Object.fromEntries(Object.entries(whole).filter(([panel]) => panel !== "story.quests" && !apart.has(panel)));
+    expect(JSON.parse(JSON.stringify(built))).toEqual(JSON.parse(JSON.stringify(asWhole)));
+  });
+
+  test("is kept under the store's key for its state, past the store letting the state go, until a turn", async () => {
+    const bed = makeBed();
+    await bed.plays("modern_slice_of_life");
+    const turns = [];
+    for (let i = 0; i < 12; i++) turns.push(await bed.turn());
+    const first = await bed.state();
+    expect((await bed.state()).panels).toBe(first.panels);
+    const org = Object.keys(first.panels["orgs.summary"] as object)[0] ?? "";
+    const page = await bed.service.orgPage(USER, CHAT, org);
+    expect(page).not.toBeNull();
+    // Reading every turn's state and start folds more states than the store holds for a chat: the head's is let go.
+    const s = bed.store.user(USER);
+    const head = s.headState(CHAT);
+    for (const t of turns) {
+      s.stateAt(t.id);
+      s.startOf(t.id);
+    }
+    expect(s.headState(CHAT)).not.toBe(head);
+    expect((await bed.state()).panels).toBe(first.panels);
+    expect(await bed.service.orgPage(USER, CHAT, org)).toBe(page);
+    await bed.turn();
+    const next = await bed.state();
+    expect(next.panels).not.toBe(first.panels);
+    expect(await bed.service.orgPage(USER, CHAT, org)).not.toBe(page);
+    expect(next.hud?.clock.minutes).toBe(s.headState(CHAT).state.world.clock);
+  });
+
+  test("is built again once the application's lines are given again, as a history file written gives them", async () => {
+    const bed = makeBed();
+    await bed.plays("modern_slice_of_life");
+    await bed.turn();
+    const first = await bed.state();
+    expect((await bed.state()).panels).toBe(first.panels);
+    await installHistoryLines(shippedTexts());
+    const again = await bed.state();
+    expect(again.panels).not.toBe(first.panels);
+    expect(again.panels).toEqual(first.panels);
+  });
+});

@@ -1,0 +1,23 @@
+{
+  "failures": [],
+  "leftovers": [
+    {
+      "name": "rpe-standin-*",
+      "owner": "PlanAdapter-S17",
+      "wave": "the ground",
+      "why": "the stand-in's database removes its folder only in close() (test/standin/db.ts:169, :201-203), so a rig that fails before closing it leaves the folder"
+    },
+    {
+      "name": "rpe-door-*",
+      "owner": "PlanAdapter-S17",
+      "wave": "the ground",
+      "why": "openDoor's close removes its folder first and the app's cleanup after, so the folder outlives the run (test/adapter/door.ts:72-77; PlanAdapter-S17 item 3)"
+    },
+    {
+      "name": "lre-runtime-*",
+      "owner": "PlanSwap-8",
+      "wave": "4",
+      "why": "the bed of the runtime's copy of LumiAH removes a runtime's folder only when that runtime closes or the process exits (test/support/runtime-bed.ts:57-61), and the harness tests of the copy leave them; the copy of LumiAH goes with PlanSwap-8 and PlanSwap-10"
+    }
+  ]
+}
