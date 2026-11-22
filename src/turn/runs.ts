@@ -334,6 +334,14 @@ export function keepCarriedRun(db: Database, run: CarriedRun): void {
 
 const key = (user: string, id: string): string => `${user}\u0000${id}`;
 
+/**
+ * The turns a turn's runs played under, as their records' scope names them: the turn itself and, for each continue that joined it,
+ * the continue's own held turn, where that run's folder, its trace and the jobs it started are kept.
+ */
+export function playedUnder(turn: string, runs: readonly Pick<RunRecord, "held">[]): string[] {
+  return [...new Set([turn, ...runs.flatMap((r) => (r.held !== null ? [r.held] : []))])];
+}
+
 export class Runs {
   /** Runs going on now, by turn. */
   readonly #running = new Map<string, Run>();
@@ -521,6 +529,45 @@ export class Runs {
   /** The chats he played on RPE, the newest played first: a chat a migration carried and RPE has played no turn of is not among them. */
   chats(user: string): { chat: string; last: number }[] {
     return this.db.query<{ chat: string; last: number }, [string, string]>("SELECT chat, max(received) AS last FROM turn_run WHERE user = ? AND session <> ? GROUP BY chat ORDER BY last DESC").all(user, CARRIED_SESSION);
+  }
+
+  /**
+   * The newest `count` turns he played on RPE (one chat's, or every chat's), the newest first by when each was first received, among
+   * those first received at or after `from` and before `to`: each with that time and the turns its runs played under
+   * (`playedUnder`). A turn a migration carried, which RPE never played, is not one of them.
+   */
+  newestPlayed(user: string, count: number, within: { chat?: string; from?: number; to?: number } = {}): { turn: string; received: number; under: string[] }[] {
+    const where = ["user = ?", "session <> ?"];
+    const args: (string | number)[] = [user, CARRIED_SESSION];
+    if (within.chat !== undefined) {
+      where.push("chat = ?");
+      args.push(within.chat);
+    }
+    const having: string[] = [];
+    if (within.from !== undefined) {
+      having.push("min(received) >= ?");
+      args.push(within.from);
+    }
+    if (within.to !== undefined) {
+      having.push("min(received) < ?");
+      args.push(within.to);
+    }
+    return this.db
+      .query<{ turn: string; received: number; held: string }, (string | number)[]>(
+        `SELECT turn, min(received) AS received, COALESCE(json_group_array(held) FILTER (WHERE held IS NOT NULL), '[]') AS held FROM turn_run WHERE ${where.join(" AND ")} GROUP BY turn${having.length === 0 ? "" : ` HAVING ${having.join(" AND ")}`} ORDER BY 2 DESC, turn DESC LIMIT ?`,
+      )
+      .all(...args, count)
+      .map((r) => ({ turn: r.turn, received: r.received, under: [...new Set([r.turn, ...(JSON.parse(r.held) as string[])])] }));
+  }
+
+  /**
+   * Every turn folder his runs played in, the oldest first: its chat, its session and the turn its records' scope names (a continue's
+   * own held turn, where its run played). A turn a migration carried has none.
+   */
+  playedFolders(user: string): { chat: string; session: string; turn: string }[] {
+    return this.db
+      .query<{ chat: string; session: string; turn: string }, [string, string]>("SELECT chat, session, COALESCE(held, turn) AS turn FROM turn_run WHERE user = ? AND session <> ? GROUP BY chat, session, COALESCE(held, turn) ORDER BY min(received), 3")
+      .all(user, CARRIED_SESSION);
   }
 
   /**

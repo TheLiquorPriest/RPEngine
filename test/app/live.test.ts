@@ -199,14 +199,18 @@ describe("the live socket", () => {
     expect(new Set(eventsOf(sent).map((e) => (isRecord(e) ? e.kind : null)))).toEqual(new Set(Object.keys(LIVE_KINDS)));
   });
 
-  test("a trace record with RPH's new fields, a tool's permission and a call's start, reaches a page whole", async () => {
-    // Records as RPH gives them, typed by RPH's own trace types: a call's start in its tool calls, the permission a write ran under, the pictures a request could not carry.
+  test("a trace record with RPH's new fields, a tool's permission and a call's start, a request by part and what an agent did to its window, reaches a page whole", async () => {
+    // Records as RPH gives them, typed by RPH's own trace types: a call's start in its tool calls, the permission a write ran under, the pictures a request could not carry; and what RPH tells of the use of the models: what an agent's calls are for and what it was handed, a request by part, what a call asked of the cache, and a change to an agent's own window.
     const usage = { calls: 1, input: 40, cacheRead: 0, cacheWrite: 0, output: 12 };
     const records: TraceRecord[] = [
       { ...RECORD, seq: 2, event: { kind: "call_ended", call: 1, model: "model-harbor", text: "", toolCalls: [{ id: "call-1", name: "ledger_write", args: { entry: "Two casks short." }, began: 1_700 }, { id: "call-2", name: "ledger_read", args: {} }], stop: "toolUse", usage, ms: 900 } },
       { ...RECORD, seq: 3, event: { kind: "tool_ended", callId: "call-1", tool: "ledger_write", result: { content: [{ type: "text", text: "Written." }] }, clean: true, endedRun: false, ms: 4, permission: { lane: "ledger", setting: "confirm", answer: { go: false, reason: "Not tonight." } } } },
       { ...RECORD, seq: 4, event: { kind: "tool_ended", callId: "call-2", tool: "web_fetch", result: { content: [{ type: "text", text: "Fetched." }] }, clean: true, endedRun: false, ms: 9, permission: { lane: "external", setting: "auto" } } },
       { ...RECORD, seq: 5, event: { kind: "prompt_notices", notices: [], pictures: [{ message: 3, count: 2 }] } },
+      { ...RECORD, seq: 6, event: { kind: "agent_started", definition: "tallyman", connection: "conn-harbor", model: "model-harbor", session: "session-quay", given: ["ledger:week"], operation: "sub", for: "Count the casks.", sent: [{ name: "ledger:week", tokens: 310, from: "caller" }], api: "harbor-messages" } },
+      { ...RECORD, seq: 7, event: { kind: "call_started", call: 1, connection: "conn-harbor", model: "model-harbor", messages: 2, tools: 1, toolTokens: 90, openingTokens: 400, parts: [{ part: "opening", chars: 1_600, tokens: 400 }, { part: "given", name: "ledger:week", chars: 1_240, tokens: 310 }, { part: "brief", chars: 64, tokens: 16 }], sinceLast: 2_500 } },
+      { ...RECORD, seq: 8, event: { kind: "call_ended", call: 1, model: "model-harbor", text: "Two short.", toolCalls: [], stop: "stop", usage, ms: 700, cache: { asked: "short", marks: [{ at: "system", index: 0, lifetime: "short" }], cold: true, cause: "lapsed" } } },
+      { ...RECORD, seq: 9, event: { kind: "window", action: "let_go", items: [{ id: "call:call-2", tokens: 1_200 }], sparedTokens: 1_200, costTokens: 1_500 } },
     ];
     const p = await page(server, token);
     const following = p.next("following");

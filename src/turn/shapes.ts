@@ -5,7 +5,7 @@
 // generated types.
 
 import type { ConsentGrant, FindStopped, GapCheck, LocatedSlices, PromptMapEdit, RebuiltMessage, ShownSlice } from "rp-harness/contract";
-import { agentRef, type Exactly, type Holds, type Infer, limitHit, type Mutually, presetRef, promptNotice, replyError, ruleFiring, shape, traceRecord, usage } from "../app";
+import { agentRef, type Exactly, type Holds, type Infer, jobRow, limitHit, type Mutually, presetRef, promptNotice, replyError, ruleFiring, shape, traceRecord, usage } from "../app";
 import type { NodeView, ValuesShown } from "../store";
 import type { AskedLine } from "./requests";
 import type { NotGiven, RunKind, RunState, StoppedBy } from "./runs";
@@ -70,7 +70,8 @@ const rowFields = {
   status: field(runState, "Running while a run of it goes on; else how its reply's run ended (its latest run that is not a Settle now run, which writes nothing to the chat and is listed among its runs with its own end)."),
   marks: field(shape.list(turnMark), "Its marks, in the order they were set; none for a turn that carries none."),
   timings: moments,
-  usage: field(usage, "Every agent of its run together: model calls and tokens."),
+  usage: field(usage, "Every agent of its runs together: model calls and tokens. The jobs it started are not among them: each has its own."),
+  jobs: field(shape.list(jobRow), "The jobs its runs started, the first started first, each by its row as a list of jobs shows it, with what it spent as RPH counts it; none for a turn that started none, or whose jobs' records are no longer kept."),
 } as const;
 
 export const chatsReply = shape.named(

@@ -67,12 +67,13 @@ import { STORE_AREAS } from "./store-areas";
 import { unasked } from "../store/away";
 import { afterTurns } from "../store/turn-reads";
 import { RunTimes } from "./spans";
-import { globalConfig, turnSettings } from "./settings";
+import { globalConfig, turnSettings, usageRowsKeptDays } from "./settings";
 import { SinceKept } from "./since";
 import { closedScenesAt, countedOn, scenesOf, stagesAt } from "./stage";
 import { guidanceTexts } from "./texts";
 import { type TurnTrace, turnTrace } from "./trace";
 import { agentNaming, characterName, type MigratedSource, NO_SESSION, turnErrorWords, TurnLane } from "./turns";
+import { CallRows } from "./usage";
 
 /**
  * RPE's file port for the one user it serves, that user read each time the port is asked, since it may
@@ -341,6 +342,8 @@ export interface Turns {
   /** The marks each turn carries apart from its run's status. */
   marks: TurnMarks;
   trace: TurnTrace;
+  /** Each model call as a row of its own, and what each agent was handed (`usage.ts`): what a turn's use and the Usage page read. */
+  calls: CallRows;
   lore: Lore;
   /** A chat's secrecy settings, as the turn's start records them and the lore's secrecy lane reads them. */
   secretSettings: SecretSettingsFor;
@@ -416,6 +419,8 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
     (chat, layout, prompt) => options.lumiverse()?.hints?.named(chat, layout, prompt) ?? layout,
   );
   const runs = new Runs(app.db, app.writes);
+  // Each model call's row, written from the trace's records as they pass (`usage.ts`).
+  const calls = new CallRows(app.db, app.writes, app.log);
   const requests = new Requests(app.db, app.writes, (chat, waiting) => REQUESTS_KIND.publish(app.live, chat, { waiting }));
   const marks = new TurnMarks(app.db, app.writes);
   const since = new SinceKept(app.db);
@@ -520,10 +525,12 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
   // The story's counts work out the history window as the prompt's is cut, on the chat's own settings.
   facts.add(storyFacts({ store, window: async (scope) => (await turnSettings(files, scope, app.log)).window, settings: global.numbers(STORY_FACT_SETTING_DEFS) }));
   // A press of an action the turn was told is answered the moment an `act` of that action ends in it.
-  const trace = turnTrace({ live: app.live, files, runs: new RunTimes(runs, (user, turn, actions) => void app.writes.run((db) => requests.answer(db, user, turn, actions), "keeping the presses a turn acted on").catch((error: unknown) => app.log.error("The presses a turn acted on could not be kept.", { turn, error: error instanceof Error ? error.message : String(error) }))), log: app.log });
+  const trace = turnTrace({ live: app.live, files, runs: new RunTimes(runs, (user, turn, actions) => void app.writes.run((db) => requests.answer(db, user, turn, actions), "keeping the presses a turn acted on").catch((error: unknown) => app.log.error("The presses a turn acted on could not be kept.", { turn, error: error instanceof Error ? error.message : String(error) }))), calls, log: app.log });
   app.kept.add("Turn runs going on", () => ({ count: runs.going }));
   app.kept.add("Turn folders the trace is writing to", () => ({ count: trace.held().folders }));
   app.kept.add("Trace records not yet written", () => ({ count: trace.held().writes }));
+  app.kept.add("Runs whose model calls are being counted", () => ({ count: calls.held().runs }));
+  app.kept.add("Rows of model calls not yet written", () => ({ count: calls.held().writes }));
   // The chat port's reads of Lumiverse; one that cannot be made fails in the words of the turn-errors part in force for the chat.
   const chatNow = async (scope: Scope): Promise<ChatReads> => {
     const parts = options.lumiverse();
@@ -723,7 +730,8 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
       await Promise.all([stateIndex.forget(user, chat), meaning.dropChat(user, chat)]);
     },
     // The older turn folders, and with them the prompt each of their turns carried and where its slices were (plan §5.5, App. B): kept
-    // for as many of the chat's newest turns as its folders are, a turn going on kept whatever its age.
+    // for as many of the chat's newest turns as its folders are, a turn going on kept whatever its age. Then the rows of his model
+    // calls past the days `usage.rowsKeptDays` keeps them, where he set any (shipped: kept for good), whichever chat made them.
     pruneTurns: async (user, chat, spare) => {
       const pruned = await pruneChat({ files: app.paths.files, chats }, user, chat, spare);
       const folders = chats.folders(user, chat);
@@ -731,6 +739,12 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
         const { turnFolders } = await retentionOf({ files: app.paths.files, character: folders.character, chat: folders.chat });
         const going = new Set(runs.ofChat(user, chat).map((r) => r.turn));
         await app.writes.run((db) => prompts.prune(db, user, chat, turnFolders, going), "pruning the prompts of older turns");
+      }
+      const keptDays = usageRowsKeptDays(globalConfig(app.paths.files, app.log));
+      if (keptDays !== null) {
+        await calls.prune(user, clock.now() - keptDays * 86_400_000).catch((error: unknown) => {
+          if (!(error instanceof WritesClosed)) app.log.error("The rows of model calls past the days usage.rowsKeptDays keeps could not be removed; the next turn's end tries again.", { error: error instanceof Error ? error.message : String(error) });
+        });
       }
       return pruned;
     },
@@ -765,5 +779,5 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
   }
   const secretMarks = (at: LoreScope): Promise<LinesPart | undefined> => secretMarkLines(loadGuidance(files, chatLevels(at)));
   const given = (scope: Scope, agent: AgentRef, refs: readonly string[], moment: AttachMoment) => givenViews(eventsDeps, joined(scope), agent, refs, moment);
-  return { lane, store, harness, env, facts, files, chats, take, place, prompts, runs, requests, approvals, writes: app.writes, marks, trace, lore, secretSettings, secretMarks, loreIndex, notes, suggestions, projection, meaning, stateIndex, given, sources, placeSources, castKnowledge };
+  return { lane, store, harness, env, facts, files, chats, take, place, prompts, runs, requests, approvals, writes: app.writes, marks, trace, calls, lore, secretSettings, secretMarks, loreIndex, notes, suggestions, projection, meaning, stateIndex, given, sources, placeSources, castKnowledge };
 }

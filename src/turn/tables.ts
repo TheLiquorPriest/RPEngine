@@ -11,7 +11,8 @@
 // `rule_firing`: each of a turn's, or of a job the user started, which belongs to no turn), what else RPH told RPE about the run
 // (`turn_told`: suggestions, attachments asked for, drops, the release and the end), what the player asked for beside his words,
 // kept with the turn that answered it (`request`), what a comparison of a chat's path found (`since_found`), which of these a turn
-// was told (`since_told`), and the marks each turn carries (`turn_mark`). A job's whole record is one row of the store area's `job`.
+// was told (`since_told`), the marks each turn carries (`turn_mark`), each model call as a row of its own (`call`) and what each
+// agent was handed as it started (`agent_sent`). A job's whole record is one row of the store area's `job`.
 
 export type TableStep = { readonly version: number; readonly name: string; readonly sql: string };
 
@@ -585,6 +586,73 @@ CREATE TABLE request_told (
 );
 CREATE INDEX request_told_turn ON request_told (user, turn);
 ALTER TABLE request DROP COLUMN answered;
+`,
+  },
+  {
+    version: 26,
+    name: "each model call as a row of its own, and what each agent was handed",
+    // `call` (`usage.ts`): one row for each model call, written as its end comes down RPH's trace. Whose it was: its run, by RPH's own
+    // id for it (a job's run is the job's id), its agent's handle and definition, whom it plays, the job it worked for. Where its run
+    // played, as its records' scope named it: its chat (none for a job of no chat) and its turn (a continue's own held turn; none for a
+    // job of no turn). What it was for (`operation`, `purpose`) and on what (model, connection, the provider's API, effort). When its
+    // request went out and its answer ended, and the milliseconds since its agent's last request ended. Its tokens as RPH counts them
+    // (`input` holds what was read from and written to the cache). Its request by part and what it asked of the provider's cache, as
+    // JSON as the trace gives them, null where its record gave none. How it stopped, and its failure. Keyed by its run, its agent, its
+    // number and when it went out: a save before a compaction numbers its calls from 1 again under the agent's own handle.
+    // `agent_sent`: one row for each item an agent was handed as it started, in the order given: its name, its size in tokens, and who
+    // chose it. Neither table is tied to a turn the store holds: a row stays when its turn is swiped away or deleted. The run's own
+    // `usage` row stays as it is. Nothing kept before is changed: these two tables are made, and no row of any other is touched.
+    sql: `
+CREATE TABLE call (
+  user TEXT NOT NULL,
+  run TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  started INTEGER NOT NULL,
+  ended INTEGER NOT NULL,
+  chat TEXT,
+  turn TEXT,
+  job TEXT,
+  definition TEXT NOT NULL,
+  plays TEXT,
+  operation TEXT,
+  purpose TEXT,
+  model TEXT NOT NULL,
+  connection TEXT NOT NULL,
+  api TEXT,
+  effort TEXT,
+  since_last INTEGER,
+  input INTEGER NOT NULL,
+  cache_read INTEGER NOT NULL,
+  cache_write INTEGER NOT NULL,
+  output INTEGER NOT NULL,
+  reasoning INTEGER,
+  parts TEXT,
+  cache TEXT,
+  stop TEXT NOT NULL,
+  error TEXT,
+  PRIMARY KEY (user, run, agent, n, started)
+);
+CREATE INDEX call_started ON call (user, started);
+CREATE INDEX call_chat ON call (user, chat, started);
+CREATE INDEX call_turn ON call (user, turn) WHERE turn IS NOT NULL;
+CREATE TABLE agent_sent (
+  user TEXT NOT NULL,
+  run TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  started INTEGER NOT NULL,
+  ord INTEGER NOT NULL,
+  chat TEXT,
+  turn TEXT,
+  job TEXT,
+  definition TEXT NOT NULL,
+  name TEXT NOT NULL,
+  tokens INTEGER NOT NULL,
+  chosen TEXT NOT NULL,
+  PRIMARY KEY (user, run, agent, started, ord)
+);
+CREATE INDEX agent_sent_started ON agent_sent (user, started);
+CREATE INDEX agent_sent_turn ON agent_sent (user, turn) WHERE turn IS NOT NULL;
 `,
   },
 ];

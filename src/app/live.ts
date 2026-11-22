@@ -248,17 +248,76 @@ const runOutcome = shape.named(
   "How a run ended, whether a reply was released, the limit or the failure, and what every agent of it spent.",
   shape.object({ status: shape.oneOf("released", "no-reply", "stopped", "limit", "failed"), released: shape.yesNo(), limit: opt(limitHit), error: opt(replyError), usage }),
 );
+export const agentOperation = shape.named(
+  "AgentOperation",
+  "What an agent's calls are for: a lead's turn, a sub-agent's work, an instance of a task, the reply's writer, a job's agent, a compaction's summary, the save before one, a judging model's question, a tag check's turn, a reader's answer about what it read, a read that keeps the provider's cache warm.",
+  shape.oneOf("lead", "sub", "task", "writer", "job", "compaction", "save", "judge", "tag-check", "reader", "warm"),
+);
+export const sentItem = shape.named(
+  "SentItem",
+  "One item an agent was handed as it started: its name, its size in tokens by RPH's own estimate, and who chose it: its definition's given, the call that started it, a file pinned for it, its definition's opening, or an item given again as a message continues the agent, its text having changed.",
+  shape.object({ name: T, tokens: N, from: shape.oneOf("definition", "caller", "pin", "opening", "again") }),
+);
+export const requestPartKind = shape.named(
+  "RequestPartKind",
+  "A part of a model call's request: the agent's opening block, its tools as declared, the line that frames the chat's prompt, the chat's prompt, what the session carries, the briefing, an item given by name, the brief, a rule's text, a reminder; and of the agent's own work what it said, its thinking, its tool calls, their results, and a compaction's summary of its older work.",
+  shape.oneOf("opening", "tools", "frame", "prompt", "carry", "briefing", "given", "brief", "rule", "reminder", "said", "thinking", "calls", "results", "summary"),
+);
+export const requestPart = shape.named(
+  "RequestPart",
+  "One part of a model call's request, in characters and in tokens by RPH's own estimate. Its name says which: for the prompt, the kind of the slice its text is in; for the briefing, its block; for an item given, the item; for tool calls and results, the tool.",
+  shape.object({ part: requestPartKind, name: opt(T), chars: N, tokens: N }),
+);
+export const callCache = shape.named(
+  "CallCache",
+  "What a model call asked of its provider's cache, and what came of it: the lifetime asked (none, the short one, the long one), where the request placed its marks, and, where the call read nothing from the cache though its agent had sent this front before (cold), why: more time had passed since its last request than the lifetime that request asked (lapsed), or something the provider keys its cache on changed (changed).",
+  shape.object({
+    asked: shape.oneOf("none", "short", "long"),
+    marks: opt(shape.list(shape.object({ at: shape.oneOf("system", "tools", "messages"), index: N, lifetime: shape.oneOf("short", "long") }))),
+    cold: opt(shape.literal(true)),
+    cause: opt(shape.oneOf("lapsed", "changed")),
+  }),
+);
 const traceEvent = shape.named(
   "TraceEvent",
   "What RPH did; each kind's fields are the facts of it.",
   shape.union(
     shape.object({ kind: shape.literal("run_started"), run: shape.oneOf("turn", "job", "talk"), turn: opt(shape.named("TurnKind", "What a generation asks for.", shape.oneOf("new", "swipe", "regenerate", "continue", "impersonate"))), lead: T }),
-    shape.object({ kind: shape.literal("agent_started"), definition: T, connection: T, model: T, effort: opt(effort), set: opt(effort), session: T, given: shape.list(T), tools: opt(shape.object({ tokens: N, most: N })), judges: opt(shape.object({ rule: T, agent: T })) }),
+    shape.object({
+      kind: shape.literal("agent_started"),
+      definition: T,
+      connection: T,
+      model: T,
+      effort: opt(effort),
+      set: opt(effort),
+      session: T,
+      given: shape.list(T),
+      tools: opt(shape.object({ tokens: N, most: N })),
+      judges: opt(shape.object({ rule: T, agent: T })),
+      operation: opt(agentOperation, "What its calls are for; absent in a record made before RPH named it."),
+      for: opt(T, "The purpose it was started for, where one is known."),
+      sent: opt(shape.list(sentItem), "Each item it was handed, with its size and who chose it; `given` names them."),
+      api: opt(T, "The model layer's name for the API its connection's provider speaks."),
+    }),
     shape.object({ kind: shape.literal("tool_unheld"), tool: T, definition: T, reason: shape.oneOf("unregistered", "shadowed", "withdrawn") }),
     shape.object({ kind: shape.literal("intent_began") }),
     shape.object({ kind: shape.literal("intent"), text: T }),
-    shape.object({ kind: shape.literal("call_started"), call: N, connection: T, model: T, sampling: opt(sampling), maxTokens: opt(N), messages: N, tools: N, request: opt(T), toolTokens: opt(N), openingTokens: opt(N) }),
-    shape.object({ kind: shape.literal("call_ended"), call: N, model: T, text: T, thinking: opt(T), toolCalls: shape.list(toolCall), stop: T, usage, ms: N, error: opt(T) }),
+    shape.object({
+      kind: shape.literal("call_started"),
+      call: N,
+      connection: T,
+      model: T,
+      sampling: opt(sampling),
+      maxTokens: opt(N),
+      messages: N,
+      tools: N,
+      request: opt(T),
+      toolTokens: opt(N),
+      openingTokens: opt(N),
+      parts: opt(shape.list(requestPart), "The request by part, whose characters add up to the whole request."),
+      sinceLast: opt(N, "Milliseconds since this agent's last request ended; absent on its first."),
+    }),
+    shape.object({ kind: shape.literal("call_ended"), call: N, model: T, text: T, thinking: opt(T), toolCalls: shape.list(toolCall), stop: T, usage, ms: N, error: opt(T), cache: opt(callCache) }),
     shape.object({ kind: shape.literal("call_failed"), call: N, failure: callFailureKind, words: T, at: callBreakPoint, status: opt(N), tries: N, retries: N, retried: shape.yesNo(), wait: opt(N), asked: opt(N) }),
     shape.object({ kind: shape.literal("connection_wait"), connection: T, for: shape.oneOf("minute", "place"), ms: opt(N) }),
     shape.object({ kind: shape.literal("waiting"), for: shape.oneOf("tool", "agent"), callId: T, tool: T, ms: opt(N) }),
@@ -299,6 +358,13 @@ const traceEvent = shape.named(
       before: N,
       after: N,
       keptTurns: opt(N),
+    }),
+    shape.object({
+      kind: shape.literal("window"),
+      action: shape.oneOf("let_go", "note", "restore", "handoff"),
+      items: shape.list(shape.object({ id: T, tokens: N })),
+      sparedTokens: N,
+      costTokens: N,
     }),
     shape.object({
       kind: shape.literal("session"),

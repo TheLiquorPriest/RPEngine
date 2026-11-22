@@ -13,7 +13,7 @@ export interface AgentWindow {
   definition: string;
   connection: string;
   model: string;
-  /** Tokens its last answered call held (what went in, new, read from the cache or written to it); null before a call was answered. */
+  /** Tokens its last answered call held: what went in, whose count already holds what was read from the cache and written to it; null before a call was answered. */
   held: number | null;
   /** The model's window in tokens; null where nobody knows it. */
   window: number | null;
@@ -49,7 +49,7 @@ function windowOfAgent(id: string, agent: AgentNode, run: RunNode, windowOf: (co
     connection = step.sent.connection;
     model = step.sent.model;
     if (step.answer !== null) {
-      held = step.answer.usage.input + step.answer.usage.cacheRead + step.answer.usage.cacheWrite;
+      held = step.answer.usage.input;
       reserve = step.sent.maxTokens ?? null;
     }
   }

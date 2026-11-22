@@ -36,6 +36,8 @@
 //     receiptTokens: 1500        tokens a tool that writes answers with at most, as a receipt: what it wrote, under which ids, and what
 //                                did not add up; the whole answer is kept in a file of the turn the receipt names; null: every tool
 //                                answers whole
+//   usage:
+//     rowsKeptDays: ~            days the row of each model call is kept (global level only); null: for good
 //
 // With them, the settings of the areas the turn lane hands a chat's work to, each group declared by its
 // area (`cast:`, `story:`, `worldState:`, `engine:`): read here for the chat, at every level. The areas
@@ -402,6 +404,19 @@ const DEFS = {
     about: "The most jobs one page of a list of jobs may ask for.",
     effect: "use",
   },
+  usageRowsKept: {
+    key: "usage.rowsKeptDays",
+    default: null,
+    takes: { type: "whole", least: 0 },
+    advice: [{ below: 7, says: "Under a week of rows the Usage page has no earlier week to compare a week with; at 0 every row goes as its turn ends, and the pages that read them show nothing." }],
+    orNone: true,
+    none: "kept for good",
+    levels: ["shipped", "global"],
+    perConnection: false,
+    name: "Rows of model calls kept",
+    about: "Days RPE keeps the row of each model call (its tokens, its request by part, what it asked of the provider's cache) and of what each agent was handed, which the Usage page and a turn's use read. After a turn, the rows of calls that began longer ago are removed; what each run spent in all stays with its turn. None: the rows are kept for good.",
+    effect: "use",
+  },
   requestsTextMost: {
     key: "turn.maxRequestChars",
     default: TURN_DEFAULTS.requestsTextMost,
@@ -485,6 +500,11 @@ export const TURN_SETTINGS: readonly Setting[] = [...Object.values(DEFS), ...MAP
 /** A list of jobs' page when the caller names none, and the most one page may ask (`jobs.page`, `jobs.maxPage`), as `read` sets them. */
 export function jobsPage(read: ConfigRead): { default: number; most: number } {
   return { default: read.value(DEFS.jobsPage) as number, most: read.value(DEFS.jobsPageMost) as number };
+}
+
+/** The days the rows of model calls are kept (`usage.rowsKeptDays`), as `read` sets it at the levels every chat shares; null: for good. */
+export function usageRowsKeptDays(read: ConfigRead): number | null {
+  return read.value(DEFS.usageRowsKept) as number | null;
 }
 
 /** The turn's settings for a scope, as its levels' config files set them over the defaults. */

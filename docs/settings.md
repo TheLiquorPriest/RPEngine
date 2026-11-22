@@ -144,6 +144,7 @@ What each agent thinks at and may spend, its tools, and how its sessions are kep
 | Setting | Default | Where | In force | Appendix D.1 | What it does |
 |---|---|---|---|---|---|
 | `usage.keptRuns` | `1000` | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Runs whose usage is kept: Finished runs whose calls and tokens can still be asked for, a restart between; past it the oldest goes. |
+| `usage.rowsKeptDays` | none (kept for good) | RPE-global.yml | at its next use | beyond Appendix D.1, for the owner's approval | Rows of model calls kept: Days RPE keeps the row of each model call (its tokens, its request by part, what it asked of the provider's cache) and of what each agent was handed, which the Usage page and a turn's use read. After a turn, the rows of calls that began longer ago are removed; what each run spent in all stays with its turn. None: the rows are kept for good. Below 7: Under a week of rows the Usage page has no earlier week to compare a week with; at 0 every row goes as its turn ends, and the pages that read them show nothing. |
 
 ## Turns and replies
 

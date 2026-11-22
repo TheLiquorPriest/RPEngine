@@ -15,7 +15,7 @@
 
 import type { JobLimits, JobRefusal, JobState, JobView, RunScope, Scope, Usage, UserScope } from "rp-harness/contract";
 import { loadGuidance } from "../app/guidance";
-import { agentRef, type Exactly, type Holds, type Infer, jobRow, jobView, route, RouteError, shape, traceRecord, usage } from "../app";
+import { agentOperation, agentRef, type Exactly, type Holds, type Infer, jobRow, jobView, route, RouteError, shape, traceRecord, usage } from "../app";
 import { type ConfigRead, portTexts, readConfig } from "../app/config-read";
 import { harnessSettings } from "../app/setting-list";
 import { toldRows } from "./events";
@@ -123,7 +123,11 @@ const CHARACTER_DEFINITION = "character";
 const takeInAsk = shape.named("TakeInAsk", "The character whose own agent is to take in what it has perceived and not yet taken in, by its name as the cast holds it.", shape.object({ character: shape.text({ blank: false }) }));
 export const jobReply = shape.named("JobReply", "A job as it stands after the call.", shape.object({ job: jobView }));
 
-const runUsage = shape.named("RunUsage", "What a run spent, in all and by agent.", shape.object({ run: T, total: usage, agents: shape.list(shape.object({ agent: agentRef, usage })) }));
+const runUsage = shape.named(
+  "RunUsage",
+  "What a run spent, in all, by agent, and by what its agents' calls were for (an agent whose start named none counts in no operation; absent for a run kept before RPH split them).",
+  shape.object({ run: T, total: usage, agents: shape.list(shape.object({ agent: agentRef, usage })), operations: opt(shape.list(shape.object({ operation: agentOperation, usage }))) }),
+);
 const windowGauge = shape.named("WindowGauge", "How full an agent's context is: the tokens it holds, its model's window, and the room kept for its answer.", shape.object({ used: N, window: N, reserve: N }));
 
 const jobShownReply = shape.named(

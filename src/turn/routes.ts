@@ -1,7 +1,7 @@
 // The routes the Turn and World pages read (plan §14), declared in the route form (`src/app/routes.ts`)
 // with the shapes of `./shapes.ts`, so that the pages' types and the API reference are written from them:
 // the chats RPE played, then those its store holds that it has not (a migration's);
-// a chat's turns newest first, each with what its runs spent together, a page as long as the settings
+// a chat's turns newest first, each with what its runs spent together and the jobs they started, a page as long as the settings
 // say; one turn, or the newest on the chat's path in one read, with its intent record, what went to the
 // chat, the lore of its prompt, its trace, each of its runs (the first, each continue, each Settle now)
 // with its own trace and the request files the harness kept for it, its timings with intake's steps and
@@ -16,7 +16,8 @@
 // id answers a turn joined to another (a continue's held turn) as a fact: the turn it joined (`joined`).
 
 import type { AgentRef, Scope, TraceRecord, Usage } from "rp-harness/contract";
-import { route, RouteError, shape } from "../app";
+import { type Infer, jobRow, route, RouteError, shape } from "../app";
+import type { ConfigRead } from "../app/config-read";
 import { marksOf } from "../quests/record";
 import { isRecord, type JsonValue } from "../shared/json";
 import { type ChangeRow, JoinedTurnError, type NodeView, type ValuesShown } from "../store";
@@ -24,9 +25,10 @@ import { storyAt } from "../story/path";
 import { StoryRecord } from "../story/record";
 import { toldOf, toldRows } from "./events";
 import { TURN_FILES } from "./folder";
+import { jobRowOf, jobsOfTurns } from "./jobs";
 import type { Turns } from "./lane";
 import { turnRecordFields } from "./record";
-import { CARRIED_SESSION, type RunRecord } from "./runs";
+import { CARRIED_SESSION, playedUnder, type RunRecord } from "./runs";
 import { turnSettings } from "./settings";
 import { givenRoutes } from "./given-routes";
 import { liveRoutes } from "./live-routes";
@@ -49,6 +51,8 @@ export interface TurnRoutesDeps {
   turns: Turns;
   /** A chat's name in Lumiverse; null when it cannot be read. */
   chatName(chat: string): Promise<string | null>;
+  /** The levels every chat shares, read now: how much of a job's brief a list shows. */
+  shared(): ConfigRead;
 }
 
 /** Strings among a value's items; none when it is no list. */
@@ -224,7 +228,7 @@ export function turnRoutes(deps: TurnRoutesDeps) {
    * now run's own times are among its runs). Its state is running while a run of it goes on, else its reply's: a Settle now run writes
    * nothing to the chat, so how it ended is its own, said among the turn's runs, and never what became of the turn's reply.
    */
-  const summary = (user: string, chat: string, r: RunRecord) => {
+  const summary = (user: string, chat: string, r: RunRecord, jobs: ReadonlyMap<string, Infer<typeof jobRow>[]>) => {
     const store = turns.store.user(user);
     const row = store.turn(r.turn);
     const onPath = r.status === "running" || store.path(chat).some((e) => e.turn === r.turn);
@@ -239,7 +243,28 @@ export function turnRoutes(deps: TurnRoutesDeps) {
       marks: turns.marks.ofTurn(user, r.turn),
       timings: momentsOf(said),
       usage: spent(all),
+      jobs: playedUnder(r.turn, all)
+        .flatMap((under) => jobs.get(under) ?? [])
+        .sort((a, b) => a.started - b.started || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     };
+  };
+
+  /**
+   * The jobs started under these turns (`playedUnder`: a turn, and the held turn of each continue that joined it), by the turn each
+   * was started under, each by its row as a list of jobs shows it: a job is tied to its turn through its own record, read once for
+   * all the turns a reply lists.
+   */
+  const jobsUnder = (user: string, under: readonly string[]): Map<string, Infer<typeof jobRow>[]> => {
+    const shared = deps.shared();
+    const by = new Map<string, Infer<typeof jobRow>[]>();
+    for (const job of jobsOfTurns(turns.store.db, user, under)) {
+      const turn = job.scope.turn;
+      if (turn === undefined) continue;
+      const of = by.get(turn);
+      if (of === undefined) by.set(turn, [jobRowOf(job, shared)]);
+      else of.push(jobRowOf(job, shared));
+    }
+    return by;
   };
 
   /**
@@ -302,14 +327,14 @@ export function turnRoutes(deps: TurnRoutesDeps) {
   const turnRead = async (user: string, chat: string, turn: string, run: string | undefined, from: number) => {
     const r = turnOf(user, chat, turn);
     // Its runs' records, each kept in the folder it played in: a continue that joined this turn played in its own held turn's.
-    const folders = new Set([r.turn, ...turns.runs.ofTurn(user, r.turn).flatMap((each) => (each.held !== null && each.held !== r.turn ? [each.held] : []))]);
-    const records = r.session === CARRIED_SESSION ? [] : (await Promise.all([...folders].map((each) => turns.trace.records({ user, chat: r.chat, session: r.session, turn: each })))).flat().sort((a, b) => a.at - b.at || a.seq - b.seq);
+    const folders = playedUnder(r.turn, turns.runs.ofTurn(user, r.turn));
+    const records = r.session === CARRIED_SESSION ? [] : (await Promise.all(folders.map((each) => turns.trace.records({ user, chat: r.chat, session: r.session, turn: each })))).flat().sort((a, b) => a.at - b.at || a.seq - b.seq);
     const runs = byRun(records);
     const within = readFrom(r.turn, runs, run, turns.runs.ofTurn(user, r.turn).find((each) => each.traceRun !== null)?.traceRun ?? undefined, from);
     // What went to the chat is the reply's: a Settle now run writes nothing there.
     const said = turns.runs.reply(user, r.turn) ?? r;
     return {
-      ...summary(user, chat, r),
+      ...summary(user, chat, r, jobsUnder(user, folders)),
       chat: r.chat,
       intent: turns.store.user(user).turn(r.turn)?.intent ?? null,
       reply: { text: said.reply, progress: [...said.progress] },
@@ -392,7 +417,7 @@ export function turnRoutes(deps: TurnRoutesDeps) {
       path: "/api/v1/chats/:chat/turns",
       access: "page",
       group: "turns",
-      does: "A chat's turns, newest first, each with what its runs spent together and each of its runs by itself (its kind, where it stands, its error, its moments and its own spend); `before` is a turn's id, and older ones follow it. The settings `turns.page` and `turns.maxPage` give a page's length.",
+      does: "A chat's turns, newest first, each with what its runs spent together, the jobs its runs started with what each spent, and each of its runs by itself (its kind, where it stands, its error, its moments and its own spend); `before` is a turn's id, and older ones follow it. The settings `turns.page` and `turns.maxPage` give a page's length.",
       query: {
         limit: shape.optional(shape.whole({ least: 1 }), "How many turns to give: the setting `turns.page` when left out, and at most `turns.maxPage`."),
         before: shape.optional(shape.turnId(), "A turn's id: the turns older than it are given."),
@@ -404,12 +429,14 @@ export function turnRoutes(deps: TurnRoutesDeps) {
         const limit = Math.min(query.limit ?? turnsPage.size, turnsPage.most);
         if (query.before !== undefined) notJoined(user, params.chat, query.before);
         const kept = turns.runs.ofChatKept(user, params.chat, limit + 1, query.before);
+        const listed = kept.slice(0, limit);
+        const jobs = jobsUnder(user, listed.flatMap((r) => playedUnder(r.turn, turns.runs.ofTurn(user, r.turn))));
         // Each turn with its runs one by one: the list says what a turn is and what became of its reply from the run that answered, and what a later run did beside it.
         const rowOf = (r: RunRecord) => ({
-          ...summary(user, params.chat, r),
+          ...summary(user, params.chat, r, jobs),
           runs: turns.runs.ofTurn(user, r.turn).map((run, i) => ({ nth: i + 1, kind: run.kind, status: run.status, error: run.error, timings: momentsOf(run), usage: run.usage ?? NO_USAGE })),
         });
-        return { turns: kept.slice(0, limit).map(rowOf), more: kept.length > limit };
+        return { turns: listed.map(rowOf), more: kept.length > limit };
       },
     }),
     route({
