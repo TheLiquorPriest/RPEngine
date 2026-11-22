@@ -18,7 +18,7 @@ import type { Database } from "bun:sqlite";
 import { mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { LinesPart } from "../app/guidance";
-import type { ActivatedLore, FactDef, FactValue, LoreEntry, Log, Scope } from "rp-harness/contract";
+import type { ActivatedLore, FactDef, FactValue, JsonValue, LoreEntry, Log, Scope, StorePort } from "rp-harness/contract";
 import { readText, writeWhole } from "../app/disk";
 import type { LoreSettingsFor } from "./chat-settings";
 import type { LoreWrites } from "./ids";
@@ -31,6 +31,7 @@ import type { LoreMap, LoreMapLine } from "./map";
 import { type OverlayRow, overlayNoted } from "./overlays";
 import type { HeldSecret } from "./secrets/character";
 import type { LoreBookListing, LorePath, WorldAt } from "./sources";
+import { isRecord } from "../shared/json";
 import type { WorldDoc } from "../shared/world";
 
 /** Every fixed value of the index, each a setting with this default. */
@@ -172,11 +173,61 @@ export interface LoreCounts {
   kinds: string[];
 }
 
-/** The next entries an indexing run is handed, and the counts the answer tells: `left` still to be handed to a run, `held` those another job has now. */
+/**
+ * The next entries an indexing run is handed, and the counts the answer tells: `left` the entries not indexed that no other job
+ * holds (the job's own plan's among them), `held` those another job has now, `planned` those of the job's own plan (`LoreIndex.plan`),
+ * which its batches hand out by number and this batch leaves out; absent where it has none.
+ */
 export interface LoreBatch {
   entries: IndexedEntry[];
   left: number;
   held: number;
+  planned?: number;
+}
+
+/** One numbered batch of a job's plan (plan 3.2 §7.5), as its entries stand now. */
+export interface PlannedBatch {
+  /** Its number, from 1. */
+  n: number;
+  /** How many entries it was cut with. */
+  count: number;
+  /** Its entries not indexed as they stand now that no other job holds, in the catalog's order: what opening it hands. */
+  entries: IndexedEntry[];
+  /** Its entries indexed as they stand now. */
+  indexed: number;
+  /** Its entries no longer in the chat's lore. */
+  gone: number;
+  /** Its entries another job holds now. */
+  held: number;
+}
+
+/** A job's list of the chat's lore, cut into numbered batches when it first asked (`LoreIndex.plan`), each as it stands now. */
+export interface LorePlan {
+  batches: PlannedBatch[];
+  /** The entries not indexed that another job held when the plan was cut, which it left out. */
+  held: number;
+}
+
+/** A plan as it is kept with its job: the chat it is of, the entries another job held when it was cut, and each batch's entries by id. */
+type KeptPlan = { chat: string; held: number; batches: string[][] };
+
+/** Where a job's plan is kept in RPH's store, by the job's id. */
+const PLANS = "rpe/lore-batches/";
+
+/** A job's key in the store: its id in base64url, since a key's segments take letters, digits, `.`, `_` and `-` only. */
+function planKey(job: string): string {
+  return `${PLANS}${Buffer.from(job, "utf8").toString("base64url")}`;
+}
+
+/** A kept plan read back: undefined for anything else. */
+function keptPlanOf(value: JsonValue | undefined): KeptPlan | undefined {
+  if (!isRecord(value) || typeof value.chat !== "string" || typeof value.held !== "number" || !Array.isArray(value.batches)) return undefined;
+  const batches: string[][] = [];
+  for (const ids of value.batches) {
+    if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string")) return undefined;
+    batches.push(ids as string[]);
+  }
+  return { chat: value.chat, held: value.held, batches };
 }
 
 /** What the table holds for one entry: a run's lines at each revision it was run at, newest first, and the user's own. */
@@ -241,6 +292,8 @@ export interface LoreIndexDeps {
   log?: Log;
   /** Whether the user's job is still going (waiting, held, running or asking): an entry handed to a job that has ended is handed out again. Absent, a job is taken to be going until it writes or `release`s. */
   jobRunning?: (user: string, job: string) => Promise<boolean>;
+  /** Where a job's plan is kept with the job, so that it outlives a restart (RPH's store): absent, it is kept while this index is. */
+  plans?: Pick<StorePort, "get" | "set">;
 }
 
 /** An entry Lumiverse activated for a turn's prompt, as the lore map read it: what the turn's folder lays out, reading nothing again. */
@@ -262,6 +315,9 @@ export class LoreIndex {
   readonly #kept = new Map<string, { user: string; chat: string }>();
   /** Entries handed to an indexing job, by where each is kept and its revision: the job's until it writes lines for them or ends. */
   readonly #claims = new Map<string, string>();
+  /** By user and job: the job's plan as kept, or null where it has none; and the plans being cut, so a job's two first asks cut one. */
+  readonly #plans = new Map<string, KeptPlan | null>();
+  readonly #cutting = new Map<string, Promise<KeptPlan>>();
   /** How many times this index has written lines (a run's or the user's own): the index's lines read before the last write are its lines no longer. */
   #linesWritten = 0;
   /**
@@ -477,17 +533,20 @@ export class LoreIndex {
    * The next entries no run has indexed as they stand now, in the catalog's order: at most `size` (the setting's when absent) and
    * at most the characters of text the chat's setting allows in one batch (one entry at least, however long). With `job`, the
    * batch is that job's: held for it until it writes lines for them or it ends, so a second job at the same time is handed the
-   * next entries and none is indexed twice at once. `left` counts the entries still to be handed to a run; `held`, those another
-   * job has now.
+   * next entries and none is indexed twice at once; and the entries of the job's own plan are left out (`planned`), since its
+   * numbered batches hand them out. `left` counts the entries not indexed that no other job holds; `held`, those another job has now.
    */
   async batch(at: LoreAt, size?: number, job?: string): Promise<LoreBatch> {
     const unindexed = (await this.entries(at)).filter((e) => !e.indexed);
+    const inPlan = new Set(job === undefined ? undefined : (await this.keptPlan(at, job))?.batches.flat());
     const going = new Map<string, boolean>();
     const free: IndexedEntry[] = [];
     let held = 0;
+    let planned = 0;
     for (const e of unindexed) {
       const by = this.#claims.get(claimOf(at.user, e));
       if (by !== undefined && by !== job && (await this.going(at.user, by, going))) held += 1;
+      else if (inPlan.has(e.id)) planned += 1;
       else free.push(e);
     }
     const set = await this.settingsAt(at);
@@ -499,7 +558,95 @@ export class LoreIndex {
       chars += e.text.length;
     }
     if (job !== undefined) for (const e of entries) this.#claims.set(claimOf(at.user, e), job);
-    return { entries, left: free.length, held };
+    return { entries, left: free.length + planned, held, ...(planned > 0 ? { planned } : {}) };
+  }
+
+  /**
+   * A job's list of the chat's lore cut into numbered batches (plan 3.2 §7.5): the entries not indexed as they stood when the job
+   * first asked that no other job held, in the catalog's order, each batch as `batch` cuts one (at most the setting's entries and
+   * characters, one entry at least). It is cut once and kept with the job, so its numbers stand while its entries are indexed and
+   * after a restart; each of its entries not indexed is held for the job, so no other job is handed one. Without a job (a preview,
+   * an agent no job started) it is cut for the asking, held for no one and kept nowhere. Each batch as its entries stand now.
+   */
+  async plan(at: LoreAt, job?: string): Promise<LorePlan> {
+    const entries = await this.entries(at);
+    const going = new Map<string, boolean>();
+    const kept = (job === undefined ? undefined : await this.keptPlan(at, job)) ?? (await this.cutOnce(at, entries, job, going));
+    const byId = new Map(entries.map((e) => [e.id, e]));
+    const batches: PlannedBatch[] = [];
+    for (const [i, ids] of kept.batches.entries()) {
+      const batch: PlannedBatch = { n: i + 1, count: ids.length, entries: [], indexed: 0, gone: 0, held: 0 };
+      for (const id of ids) {
+        const e = byId.get(id);
+        if (e === undefined) batch.gone += 1;
+        else if (e.indexed) batch.indexed += 1;
+        else {
+          const by = this.#claims.get(claimOf(at.user, e));
+          if (by !== undefined && by !== job && (await this.going(at.user, by, going))) batch.held += 1;
+          else batch.entries.push(e);
+        }
+      }
+      batches.push(batch);
+    }
+    if (job !== undefined) for (const b of batches) for (const e of b.entries) this.#claims.set(claimOf(at.user, e), job);
+    return { batches, held: kept.held };
+  }
+
+  /** The job's plan as kept, from memory or the store; undefined where it has none, or one of another chat. */
+  private async keptPlan(at: LoreAt, job: string): Promise<KeptPlan | undefined> {
+    const key = `${at.user}\u0000${job}`;
+    let plan = this.#plans.get(key);
+    if (plan === undefined) {
+      const read = keptPlanOf(await this.deps.plans?.get({ user: at.user }, planKey(job))) ?? null;
+      // A plan cut while the store was read is the job's.
+      plan = this.#plans.get(key) ?? read;
+      this.#plans.set(key, plan);
+    }
+    return plan === null || plan.chat !== at.chat ? undefined : plan;
+  }
+
+  /** A plan cut from the entries as they stand; a job's once however many of its agents ask at the same time, and kept with it. */
+  private async cutOnce(at: LoreAt, entries: readonly IndexedEntry[], job: string | undefined, going: Map<string, boolean>): Promise<KeptPlan> {
+    if (job === undefined) return await this.cut(at, entries, job, going);
+    const key = `${at.user}\u0000${job}`;
+    let cutting = this.#cutting.get(key);
+    if (cutting === undefined) {
+      cutting = (async () => {
+        const plan = await this.cut(at, entries, job, going);
+        this.#plans.set(key, plan);
+        await this.deps.plans?.set({ user: at.user }, planKey(job), plan);
+        return plan;
+      })().finally(() => this.#cutting.delete(key));
+      this.#cutting.set(key, cutting);
+    }
+    return await cutting;
+  }
+
+  /** The entries not indexed that no other job holds, in the catalog's order, cut into batches as `batch` cuts one; each held for `job` as it is cut. */
+  private async cut(at: LoreAt, entries: readonly IndexedEntry[], job: string | undefined, going: Map<string, boolean>): Promise<KeptPlan> {
+    const set = await this.settingsAt(at);
+    const batches: string[][] = [];
+    let held = 0;
+    let current: string[] = [];
+    let chars = 0;
+    for (const e of entries) {
+      if (e.indexed) continue;
+      const by = this.#claims.get(claimOf(at.user, e));
+      if (by !== undefined && by !== job && (await this.going(at.user, by, going))) {
+        held += 1;
+        continue;
+      }
+      if (current.length > 0 && (current.length >= Math.floor(set.batch) || chars + e.text.length > set.batchChars)) {
+        batches.push(current);
+        current = [];
+        chars = 0;
+      }
+      current.push(e.id);
+      chars += e.text.length;
+      if (job !== undefined) this.#claims.set(claimOf(at.user, e), job);
+    }
+    if (current.length > 0) batches.push(current);
+    return { chat: at.chat, held, batches };
   }
 
   /**

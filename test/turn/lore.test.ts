@@ -1,5 +1,6 @@
 // The lore index in the turn (plan §9.1 to §9.3): an indexing run the Author delegates to is given the
-// next batch of the chat's lore by the name its definition lists (`index:batch`), keeps its lines with
+// next batch of the chat's lore by the name its start attaches (`index:batch`, for the indexer's purpose
+// `batch`, since its `given:` hands a job its plan), keeps its lines with
 // `lore_index_write`, and is answered with the batch after; the Author marks an entry the story has moved
 // past with `story_record`'s overlay; and the next turn's briefing holds the lore map in full, each entry
 // worded by the lore's lines. Played through the stand-in Lumiverse on the scripted model, on a chat that
@@ -52,7 +53,7 @@ test("an indexing run is given the next batch by name and answered with the batc
   const b = (bed = await openTurnBed({
     off: ["rules/unsourced"],
     answers: [
-      { pieces: [{ text: "<intent>Have the keeper's book indexed first.</intent>" }, { call: "delegate", args: { agent: "indexer", brief: "Index the batch you are given." } }] },
+      { pieces: [{ text: "<intent>Have the keeper's book indexed first.</intent>" }, { call: "delegate", args: { agent: "indexer", brief: "Index the batch you are given.", for: "batch", attach: ["index:batch"] } }] },
       // The indexer keeps the lines of two of the three entries it was given, each for the revision its batch showed.
       (request) => {
         const given = textsOf(request);

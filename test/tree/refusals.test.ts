@@ -1,6 +1,6 @@
 // A write refused for where it is carries, for the words the tools answer with, where that writer may
 // write: an agent the notes folder and its turn's four folders, RPH itself the session's folder too,
-// and with no turn RPE knows, the notes folder alone. The words come from the shipped tree as laid.
+// and with no turn RPE knows (a job's), the notes folder and the session's `scratch/`. The words come from the shipped tree as laid.
 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -46,7 +46,7 @@ test("a path that is nowhere and outside every writable folder is refused with t
     if (!path.startsWith(session)) expect({ path, writable: (await refused(path, "harness")).writable }).toEqual({ path, writable: [notes, ...turnFolders, session] });
   }
   const noTurn = { user: scope.user, chat: scope.chat, session: scope.session };
-  expect((await refused("scratch/draft.md", agent, noTurn)).writable).toEqual([notes]);
+  expect((await refused("scratch/draft.md", agent, noTurn)).writable).toEqual([notes, `${session}scratch/`]);
   expect((await refused("@shipped/TURN.md", agent)).writable).toEqual([notes, ...turnFolders]);
 });
 
