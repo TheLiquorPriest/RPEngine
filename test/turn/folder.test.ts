@@ -137,7 +137,7 @@ describe("the turn's folder", () => {
     expect(await b.turns.files.read(firstFolder.scope, `${firstFolder.folder}${TURN_FILES.attempts}attempt-1.md`)).toMatchObject({ status: "missing" });
   });
 
-  test("the lore file holds the lore map, then each entry that activated for the prompt, in full", async () => {
+  test("the lore file holds the lore map, then each entry that activated for the prompt by its size and the file that holds its text, and no text", async () => {
     const b = await bed({ answers: [replying("Wren points down the stairs.")] });
     const content = "Whale oil is kept in the cellar under the lamp room, six barrels, the oldest nearest the door.";
     b.db.run("INSERT INTO world_books (id, name, user_id) VALUES (?, ?, ?)", "wb-keep", "Keeper's Book", USER);
@@ -148,8 +148,14 @@ describe("the turn's folder", () => {
 
     const { scope, folder } = await folderOf(b, turn.id);
     const lore = await text(b, scope, `${folder}${TURN_FILES.lore}`);
-    const id = /^- \[(e-\d+)\] The oil store \(by a key\) \(not indexed yet; keys: oil\)$/m.exec(lore)?.[1];
+    const id = /^- \[(e-\d+)\] The oil store, \d+ tokens \(by a key\) \(not indexed yet; keys: oil\)$/m.exec(lore)?.[1];
     expect(id).toBeDefined();
-    inOrder(lore, ["# Lore map", "### In the prompt", `- [${id}] The oil store (by a key) (not indexed yet; keys: oil)`, `## [${id}] The oil store, from Keeper's Book, activated by keyword\n\n${content}\n`]);
+    const cache = `${(await b.turns.files.places(scope)).session}cache/`;
+    inOrder(lore, ["# Lore map", "### In the prompt", `- [${id}] The oil store, `, "# The lore that activated for this prompt", `${cache}ACTIVATED-LORE.md`, `- [${id}] The oil store, from Keeper's Book, activated by keyword, `]);
+    // The entry's text is in the session's cache, written once by RPH, in the file its line names; the turn's own file holds none of it (plan 3.2 §6.2).
+    const file = new RegExp(`^- \\[${id}\\] The oil store, from Keeper's Book, activated by keyword, \\d+ tokens: (\\S+)$`, "m").exec(lore)?.[1] ?? "";
+    expect(file.startsWith(cache)).toBe(true);
+    expect(await text(b, scope, file)).toBe(content);
+    expect(lore).not.toContain(content);
   });
 });

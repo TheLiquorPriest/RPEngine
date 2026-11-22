@@ -58,6 +58,8 @@ async function openBed(): Promise<Bed> {
 }
 
 const tagged = (id: string, book: string | null, title: string, how: string | null): ActivatedEntry => ({ id, book, title, how });
+/** A row of a turn that kept no list of what its prompt held: nothing is said of its size, of how it stood or of what the lead did. */
+const UNSAID = { tokens: null, status: null, lead: null } as const;
 
 test("a turn's activated lore names each entry's lore id and Lumiverse id, in the tag's order, with how it activated or null", async () => {
   const b = await openBed();
@@ -73,12 +75,12 @@ test("a turn's activated lore names each entry's lore id and Lumiverse id, in th
     tagged("entry-slot", CARD.id, "Scene slot", "hybrid"),
   ]);
   expect(await b.ask(turn.id)).toEqual([
-    { id: "e-3", entry: "entry-lamp", book: ATLAS.id, title: "The lamp room", how: "keyword", receipt: null },
-    { id: "e-2", entry: "entry-shanty", book: SONGS.id, title: "The Lamplighter's Shanty", how: "vector", receipt: null },
-    { id: "e-1", entry: "entry-tide", book: ATLAS.id, title: "The tide bell", how: "constant", receipt: null },
-    { id: "e-4", entry: "entry-gull", book: ATLAS.id, title: "Gulls of the wall", how: "sticky", receipt: null },
-    { id: "e-5", entry: "entry-lamp-twin", book: "", title: "", how: null, receipt: null },
-    { id: "e-6", entry: "entry-slot", book: CARD.id, title: "Scene slot", how: null, receipt: null },
+    { id: "e-3", entry: "entry-lamp", book: ATLAS.id, title: "The lamp room", how: "keyword", receipt: null, ...UNSAID },
+    { id: "e-2", entry: "entry-shanty", book: SONGS.id, title: "The Lamplighter's Shanty", how: "vector", receipt: null, ...UNSAID },
+    { id: "e-1", entry: "entry-tide", book: ATLAS.id, title: "The tide bell", how: "constant", receipt: null, ...UNSAID },
+    { id: "e-4", entry: "entry-gull", book: ATLAS.id, title: "Gulls of the wall", how: "sticky", receipt: null, ...UNSAID },
+    { id: "e-5", entry: "entry-lamp-twin", book: "", title: "", how: null, receipt: null, ...UNSAID },
+    { id: "e-6", entry: "entry-slot", book: CARD.id, title: "Scene slot", how: null, receipt: null, ...UNSAID },
   ]);
   // The same ids as the lore map gives the same entries: asked of the lore itself over the same numbers and tag.
   const shelf = new Shelf(new Map([[USER, { books: [ATLAS, SONGS, CARD], entries: coastEntries(), attached: new Map() }]]));
@@ -121,8 +123,21 @@ test("the exported reader and the route give the same entries for a turn", async
   await b.keep(turn.id, CHAT, [tagged("entry-lamp", ATLAS.id, "The lamp room", "keyword"), tagged("entry-tide", null, "The tide bell", "sticky"), tagged("entry-gull", ATLAS.id, "Gulls", "nonsense")]);
   const read = await activatedLore(b.deps, USER, CHAT, turn.id);
   expect(read).toHaveLength(3);
-  expect(await b.ask(turn.id)).toEqual(read.map((entry) => ({ ...entry, receipt: null })));
+  expect(await b.ask(turn.id)).toEqual(read.map((entry) => ({ ...entry, receipt: null, ...UNSAID })));
   expect(await activatedLore(b.deps, USER, OTHER_CHAT, turn.id)).toEqual([]);
+});
+
+test("an entry says its size, how it stood against the turn before and what the lead did, where the turns tell it", async () => {
+  const b = await openBed();
+  const turn = await b.t.play();
+  await b.keep(turn.id, CHAT, [tagged("entry-lamp", ATLAS.id, "The lamp room", "keyword"), tagged("entry-tide", ATLAS.id, "The tide bell", "constant")]);
+  // The turns tell of the first entry alone: the other's row says nothing of it.
+  const [route] = loreRoutes({ ...b.deps, turns: { ...b.prompts.lore, held: async () => new Map([["e-1", { tokens: 412, status: "same", lead: "let_go" }]]) } });
+  const { entries } = await callRoute(route, { params: { chat: CHAT, turn: turn.id }, user: USER });
+  expect(entries.map((e) => [e.id, e.tokens, e.status, e.lead])).toEqual([
+    ["e-1", 412, "same", "let_go"],
+    ["e-2", null, null, null],
+  ]);
 });
 
 test("a turn joined to another is answered as a fact naming the turn it joined", async () => {

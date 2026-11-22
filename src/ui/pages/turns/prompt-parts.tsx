@@ -89,7 +89,21 @@ const RECEIPT_WORDS: Readonly<Record<NonNullable<TurnLoreRow["receipt"]>, string
   "not-found": "its text was not found in the prompt on arrival, so RPE's check could not be applied to it",
 };
 
-/** The lore Lumiverse activated for the turn's prompt, each entry by its map id, its book and its title, with how it activated or "not said" where the turn's tag does not say; an entry the check on receipt kept out or reworded says so. */
+const STATUS_WORDS: Readonly<Record<NonNullable<TurnLoreRow["status"]>, string>> = {
+  new: "new to this turn's prompt",
+  changed: "its text changed since the turn before",
+  same: "as the turn before",
+};
+
+const LEAD_WORDS: Readonly<Record<NonNullable<TurnLoreRow["lead"]>, string>> = {
+  kept: "the Author kept it whole",
+  let_go: "the Author let it go",
+};
+
+/**
+ * The lore Lumiverse activated for the turn's prompt, each entry by its map id, its book and its title, with how it activated or "not said" where the turn's tag does not say, its size,
+ * how it stood against the turn before and what the Author did with it; an entry the check on receipt kept out or reworded says so.
+ */
 export function LoreMapRows(props: { rows: readonly TurnLoreRow[] | null | undefined }) {
   const { rows } = props;
   if (rows === null || rows === undefined) return null;
@@ -101,12 +115,15 @@ export function LoreMapRows(props: { rows: readonly TurnLoreRow[] | null | undef
         {rows.map((row) => {
           const { receipt } = row;
           return (
-            <li key={row.id} data-receipt={receipt ?? undefined}>
+            <li key={row.id} data-receipt={receipt ?? undefined} data-status={row.status ?? undefined} data-lead={row.lead ?? undefined}>
               <code class="lre-id">{row.id}</code> {row.title}
               <span class="rpe-meta">
                 {" "}
-                ({row.book === "" ? "book not said" : `book ${row.book}`}; {row.how === null ? "not said how it activated" : HOW_WORDS[row.how]})
+                ({row.book === "" ? "book not said" : `book ${row.book}`}; {row.how === null ? "not said how it activated" : HOW_WORDS[row.how]}
+                {row.tokens === null ? "" : `; ${row.tokens.toLocaleString("en-US")} tokens`})
               </span>
+              {row.status === null ? null : <span class="rpe-meta"> · {STATUS_WORDS[row.status]}</span>}
+              {row.lead === null ? null : <span class="rpe-meta"> · {LEAD_WORDS[row.lead]}</span>}
               {receipt === null ? null : <span class="rpe-meta"> · {RECEIPT_WORDS[receipt]}</span>}
             </li>
           );
@@ -120,7 +137,7 @@ export function LoreMapRows(props: { rows: readonly TurnLoreRow[] | null | undef
 export const NAMED_PARTS: Readonly<Record<string, string>> = {
   "world-state.md": "The world state",
   "briefing.md": "The briefing, with the lore map and the story brief",
-  "active-wi-content.md": "The lore Lumiverse activated",
+  "active-wi-content.md": "The lore Lumiverse activated, by entry and file",
   "assembled-preset-prompt.md": "The assembled prompt",
   "PROMPT-MAP.md": "The prompt map as found",
   "persona.md": "The persona",

@@ -92,10 +92,11 @@ describe("the lore map in full", () => {
       leftOut: 1,
       // The gulls, the drowned crown, the switched-off rumor and the card's twin.
       notIndexed: 4,
-      // What activated, as the map read it, text and all: the turn's folder lays its lore file out from this, reading nothing again.
+      // What activated, as the map read it, text and all: the turn's folder lays its lore file out from this, reading nothing again. `whole` is
+      // the entry as the lead reads it in full, the story's notes after it: the text RPH keeps in the session's cache, so its file's name is told from it.
       activated: [
-        { id: "e-2", title: "The lamp room", source: "Reed Coast Atlas", how: "keyword", text: "Green glass and whale oil, kept burning by the night watch." },
-        { id: "e-3", title: GULL, source: "Reed Coast Atlas", how: "keyword", text: "Gulls nest on the harbor wall every spring and fight over the fish scraps." },
+        { id: "e-2", title: "The lamp room", source: "Reed Coast Atlas", how: "keyword", text: "Green glass and whale oil, kept burning by the night watch.", whole: "Green glass and whale oil, kept burning by the night watch.\n\nThe lamp was relit after the wreck.\n\nIts glass cracked in the storm." },
+        { id: "e-3", title: GULL, source: "Reed Coast Atlas", how: "keyword", text: "Gulls nest on the harbor wall every spring and fight over the fish scraps.", whole: "Gulls nest on the harbor wall every spring and fight over the fish scraps." },
       ],
     });
   });

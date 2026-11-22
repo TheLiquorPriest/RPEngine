@@ -126,11 +126,28 @@ export interface ActivatedEntry {
   title: string;
   /** How it activated, in Lumiverse's word, where Lumiverse said. */
   how: string | null;
+  /**
+   * Its text as the prompt carries it, after RPE's check of the lore on receipt, where the door found it in the prompt (`TagLore.text`):
+   * its macros resolved by Lumiverse, a secret worded as the prompt may say it. Absent where it was not found there, and for an entry
+   * heard after the request. What the turn's comparison hashes, and what RPH finds the entry in the lead's window by (plan 3.2 §6.2).
+   */
+  text?: string;
 }
 
 /** What the check of the lore on receipt did to one entry: kept it out of the prompt, worded it otherwise, or did not find its text there. */
 export const LORE_RECEIPTS = ["kept-out", "reworded", "not-found"] as const;
 export type LoreReceipt = (typeof LORE_RECEIPTS)[number];
+
+/**
+ * How an entry of a turn's prompt stood (plan 3.2 §6.1): the size of its text as the prompt carried it, in tokens (null where its text
+ * was not found there); against the prompt of the turn before, new, changed or as it was (null where that turn kept nothing to compare
+ * with); and what the turn's lead did with it by the end of its run, kept it whole or let it go (null where its trace is not kept).
+ */
+export interface LoreHeld {
+  tokens: number | null;
+  status: "new" | "changed" | "same" | null;
+  lead: "kept" | "let_go" | null;
+}
 
 /** What activated for each turn's prompt. */
 export interface LoreTurns {
@@ -144,6 +161,8 @@ export interface LoreTurns {
    * applied RPE's own verdict), or RPE holds no prompt for the turn. Absent where the host keeps none.
    */
   receipt?(user: string, chat: string, turn: string): Promise<ReadonlyMap<string, LoreReceipt> | null>;
+  /** How each entry of the prompt of `turn` stood, by the lore map's id; null where the turn kept no such list (one played before RPE kept any). Absent where the host keeps none. */
+  held?(user: string, chat: string, turn: string): Promise<ReadonlyMap<string, LoreHeld> | null>;
 }
 
 /**

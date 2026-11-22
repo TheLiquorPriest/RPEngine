@@ -79,6 +79,15 @@ CREATE INDEX turn_prompt_answered ON turn_prompt (user, chat, answered) WHERE an
 ALTER TABLE turn_prompt ADD COLUMN prompt TEXT;
 `,
   },
+  {
+    version: 5,
+    name: "the lore each scene's prompts have held, as each turn found it",
+    // Kept with the turn's request record and let go with it (plan 3.2 §6.1): each entry with the hash and the size of its text as the prompt
+    // carried it, how it stood against the turn before, and what the lead did with it. A turn kept before has none, and is compared with nothing.
+    sql: `
+ALTER TABLE turn_prompt ADD COLUMN scene TEXT;
+`,
+  },
 ];
 
 export const HARNESS_MIGRATIONS: readonly TableStep[] = [

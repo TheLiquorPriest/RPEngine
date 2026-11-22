@@ -19,7 +19,7 @@ import type { Fields, Guidance, LinesPart, TemplatePart } from "../app/guidance"
 import type { JsonValue, LiveApi, PromptMessage, Scope, TurnRequest } from "rp-harness/contract";
 import type { TaggedTurn } from "../adapter/lumiverse/provider";
 import type { CastView } from "../cast";
-import type { ActivatedRead } from "../lore/indexing";
+import type { ActivatedLore } from "rp-harness/contract";
 import { mergeTurnRecord, TURN_RECORD, type TreeFiles } from "../tree";
 
 /** The files, by their names in the turn's folder. */
@@ -93,6 +93,16 @@ export interface AlongsideDeps extends FolderDeps {
   live: Pick<LiveApi, "subscribe">;
 }
 
+/**
+ * An entry that activated for the turn's prompt, as the turn's lore file lists it (plan 3.2 §6.2): by the lore map's id, with the size
+ * of its text as the prompt carried it (none where it was not found there) and the file of the session's cache that holds its text as
+ * the lead reads it in full, by its path as agents read it (none where it could not be read).
+ */
+export interface FolderLore extends ActivatedLore {
+  tokens?: number;
+  file?: string;
+}
+
 export interface FolderAsk {
   scope: Scope & { turn: string };
   guidance: Guidance;
@@ -102,18 +112,20 @@ export interface FolderAsk {
   request: TurnRequest;
   /** The ids of the entries the lore map named in the Author's briefing, as the map writes them. */
   loreMap: readonly string[];
-  /** The entries that activated for the prompt, in the tag's order with the lore map's ids and how each activated, each with its text as the prompt carried it (none where it was not found there): the lore file is laid out from them, reading nothing again. */
-  lore: readonly ActivatedRead[];
+  /** The entries that activated for the prompt, in the tag's order: the lore file lists them, reading nothing again. Their texts are not in it: each is written once, in the session's cache, by RPH. */
+  lore: readonly FolderLore[];
+  /** The scene's list of activated lore in the session's cache (`ACTIVATED-LORE.md`), by its path as agents read it; absent where none was written. */
+  sceneList?: string;
   attempts: readonly Attempt[];
   /** The cast's views of those on stage, read at the turn's start (none where no scene is open); awaited when the folder is written. */
   cast: Promise<readonly CastFolder[]>;
   received: number;
 }
 
-/** The lore map as the briefing holds it, then each entry that activated for the prompt, its text as the prompt carried it (`FolderAsk.lore`). */
+/** The lore map as the briefing holds it, then each entry that activated for the prompt with its size and the file that holds its text (`FolderAsk.lore`), and the scene's list. */
 function loreFields(ask: FolderAsk, loreMap: string | undefined): Fields {
-  const entries = ask.lore.map((e) => ({ id: e.id, title: e.title, ...(e.source !== "" ? { source: e.source } : {}), ...(e.how !== undefined ? { how: e.how } : {}), ...(e.text !== undefined ? { text: e.text } : {}) }));
-  return { ...(loreMap !== undefined ? { lore_map: loreMap } : {}), entries };
+  const entries = ask.lore.map((e) => ({ id: e.id, title: e.title, ...(e.source !== "" ? { source: e.source } : {}), ...(e.how !== undefined ? { how: e.how } : {}), ...(e.tokens !== undefined ? { tokens: e.tokens } : {}), ...(e.file !== undefined ? { file: e.file } : {}) }));
+  return { ...(loreMap !== undefined ? { lore_map: loreMap } : {}), entries, ...(entries.length > 0 ? { listed: true } : {}), ...(ask.sceneList !== undefined ? { scene_list: ask.sceneList } : {}) };
 }
 
 /** What intake gives the turn's record (`turn.json`): the turn's facts as data, `received` among them, which retention orders folders by. */

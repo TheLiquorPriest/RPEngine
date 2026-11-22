@@ -1,14 +1,18 @@
-// The lore map the Author is given at the start of every turn (plan §9.2), in four parts:
-//   1. in the prompt: each entry that activated, with what the index says it is and defines;
+// The lore map the Author is given at the start of every turn (plan §9.2; plan 3.2 §6.2, §7.1), in five parts:
+//   1. in the prompt: each entry that activated, with what the index says it is and defines, how it
+//      stands against the turn before (new, changed, as it was) and what the lead did with it then;
 //   2. changed by the story: those of them the story has since outdated, with the overlays' notes;
 //   3. from the world's own lore: world entries whose keys come up in the recent messages;
 //   4. bound to the horizon: entries bound to who and what is on the horizon that did not activate,
 //      the player's character's first, then each character present's, then the place's, up to a limit,
-//      with a count of any left out.
-// An entry no run has indexed as it stands shows its keys. The map is made from ids, keys and bindings
-// alone; nothing in it is ranked or judged by code. Its layout is the shipped prompt part
+//      with a count of any left out;
+//   5. gone: what the prompt of the turn before held that this one does not.
+// An entry no run has indexed as it stands shows its keys. Every line says the size of what it names,
+// where the asker counts. The map is made from ids, keys, bindings and what each turn's prompt held;
+// nothing in it is ranked or judged by code. Its layout is the shipped prompt part
 // `.prompts/lore-map.md`, and each entry's line is a line of `.prompts/lore-answers.md`; these are the
-// fields they lay out. `Lore.loreMap` gives the first form, parts 1 and 3 by id and title alone.
+// fields they lay out. `Lore.loreMap` gives the first form, parts 1 and 3 by id and title alone; how an
+// entry stands against the turn before is the turn lane's to say (`turn/lore-kept.ts`).
 
 import type { Fields, LinesPart } from "../app/guidance";
 import type { ActivatedLore, JsonObject } from "rp-harness/contract";
@@ -40,6 +44,14 @@ export interface LoreMapLine {
   bound?: string[];
   /** The secrets it holds, each by the id a perception names and who holds it. */
   secrets?: { id: string; holders: string[] }[];
+  /** Its size in tokens: for an entry that activated, of its text as the prompt carried it; for another, of its text as the lore holds it. Absent where nobody counted. */
+  tokens?: number;
+  /** For an entry that activated: how it stands against the prompt of the turn before (plan 3.2 §6.1); absent where that prompt is not kept. */
+  status?: "new" | "changed" | "same";
+  /** For an entry the prompt of the turn before held too: whether the lead kept it whole then, or let it go; absent where that is not known. */
+  before?: "kept" | "let_go";
+  /** It starts this turn let go, as its one line: the lead let it go last turn, its text stands, and the user lets that choice stand (`lore.choiceStands`). */
+  letGo?: boolean;
 }
 
 export interface LoreMap {
@@ -55,6 +67,8 @@ export interface LoreMap {
   leftOut?: number;
   /** How many entries of the chat's lore no run has indexed as they stand. */
   notIndexed?: number;
+  /** Entries the prompt of the turn before held that this turn's does not, each by its id, its title and its size. Absent from the first form. */
+  gone?: LoreMapLine[];
 }
 
 /**
@@ -72,6 +86,7 @@ export interface LoreMapFields {
   changed?: LoreMapPart;
   world?: LoreMapPart;
   bound?: LoreMapPart & { left_out?: number };
+  gone?: LoreMapPart;
   not_indexed?: number;
 }
 
@@ -97,6 +112,14 @@ function lineFields(lines: LinesPart | undefined, l: LoreMapLine): Fields {
     how_vector: l.how === "vector" ? true : undefined,
     how_sticky: l.how === "sticky" ? true : undefined,
     stale: l.stale,
+    tokens: l.tokens,
+    // How it stands against the turn before, a flag for each, and what the lead did with it then.
+    is_new: l.status === "new" ? true : undefined,
+    is_changed: l.status === "changed" ? true : undefined,
+    is_same: l.status === "same" ? true : undefined,
+    kept_last_turn: l.before === "kept" ? true : undefined,
+    let_go_last_turn: l.before === "let_go" ? true : undefined,
+    starts_let_go: l.letGo === true ? true : undefined,
   };
 }
 
@@ -107,7 +130,7 @@ function entryOf(fields: Fields): JsonObject {
 
 /**
  * The map's fields. With the lore's lines in force for the chat, each entry's line is that part's line
- * for it (`map_in_prompt`, `map_changed`, `map_world`, `map_bound`); without them, each part carries its
+ * for it (`map_in_prompt`, `map_changed`, `map_world`, `map_bound`, `map_gone`); without them, each part carries its
  * entries' fields and `lore-map.md` lays out each entry itself.
  */
 export function loreMapFields(map: LoreMap, lines?: LinesPart): LoreMapFields {
@@ -120,12 +143,14 @@ export function loreMapFields(map: LoreMap, lines?: LinesPart): LoreMapFields {
   const changed = part(map.changed, "map_changed");
   const world = part(map.world, "map_world");
   const bound = part(map.bound, "map_bound");
+  const gone = part(map.gone, "map_gone");
   const leftOut = map.leftOut ?? 0;
   return {
     ...(shown(inPrompt) ? { in_prompt: inPrompt } : {}),
     ...(shown(changed) ? { changed } : {}),
     ...(shown(world) ? { world } : {}),
     ...(shown(bound) || leftOut > 0 ? { bound: { ...bound, ...(leftOut > 0 ? { left_out: leftOut } : {}) } } : {}),
+    ...(shown(gone) ? { gone } : {}),
     ...((map.notIndexed ?? 0) > 0 ? { not_indexed: map.notIndexed } : {}),
   };
 }

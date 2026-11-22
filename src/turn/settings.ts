@@ -36,6 +36,10 @@
 //     receiptTokens: 1500        tokens a tool that writes answers with at most, as a receipt: what it wrote, under which ids, and what
 //                                did not add up; the whole answer is kept in a file of the turn the receipt names; null: every tool
 //                                answers whole
+//   lore:
+//     choiceStands: false        the lore entries the Author let go last turn, whose text has not changed since, start the next turn
+//                                let go, each as its one line, to come back whole when it asks; false: every turn starts with every
+//                                entry whole
 //   usage:
 //     rowsKeptDays: ~            days the row of each model call is kept (global level only); null: for good
 //     weights:                   what each kind of token counts in the weighted figure, a token sent fresh counting 1 (global
@@ -146,6 +150,8 @@ export interface TurnSettings {
   gapSnippet: number;
   /** Tokens a tool that writes answers with at most, as a receipt whose whole answer is kept in a file of the turn (`tools.receiptTokens`, plan §5.2); null: every tool answers whole. */
   receiptTokens: number | null;
+  /** Whether the lead's choice of the lore stands into the next turn (`lore.choiceStands`, plan 3.2 §6.1): the entries it let go last turn, their text unchanged, start the turn let go. */
+  choiceStands: boolean;
   /** What a write to each lane does (`permissions.<lane>`), and a call of a tool outside RPE (`external`): the user's, per chat, read at every level. */
   permissions: Readonly<Record<"story" | "engine" | "external", LanePermission>>;
 }
@@ -207,6 +213,8 @@ export const TURN_DEFAULTS: Readonly<TurnSettings> = Object.freeze({
   gapSnippet: 240,
   // The plan's §5.2: a receipt of a call of a few dozen operations, its ids and its report lines, fits it; the answers it replaces ran to tens of thousands of characters.
   receiptTokens: 1500,
+  // The plan's §6.1: off as shipped, so a turn starts with every activated entry whole unless the user says the Author's choice stands.
+  choiceStands: false,
   // Appendix D.1: "Write permission, each lane: Auto"; the external tier has its own, with the same three values.
   permissions: { story: "auto", engine: "auto", external: "auto" } satisfies TurnSettings["permissions"],
 });
@@ -473,6 +481,15 @@ const DEFS = {
     about: "The most tokens a tool that writes answers with: a receipt of what it wrote and under which ids, with each thing that did not add up in a line. The whole answer is kept in a file of the turn, which the receipt names and the agent reads with its file tool; a receipt past the size says how many ids it left to that file, and no report line is ever cut. None: every tool answers whole, giving back what it was sent and how each thing now stands.",
     effect: "turn",
   },
+  choiceStands: {
+    key: "lore.choiceStands",
+    default: TURN_DEFAULTS.choiceStands,
+    takes: { type: "yesNo" },
+    perConnection: false,
+    name: "The Author's choice of lore stands",
+    about: "Each turn the Author keeps the activated lore entries its reply needs and may let the others go, each to one line it can open again. On: an entry it let go last turn, whose text has not changed since, starts the next turn let go, so it is not sent whole again; the Author brings it back whole when it wants it. Off: every turn starts with every activated entry whole. An entry that is new or whose text changed always starts whole.",
+    effect: "turn",
+  },
   permissionStory: {
     key: "permissions.story",
     default: TURN_DEFAULTS.permissions.story,
@@ -625,6 +642,7 @@ export async function turnSettings(files: FilesPort, scope: Scope, log: Log): Pr
     storyNewest: read.value(DEFS.storyNewest) as StoryNewest,
     gapSnippet: read.value(DEFS.gapSnippet) as number,
     receiptTokens: read.value(DEFS.receiptTokens) as number | null,
+    choiceStands: read.value(DEFS.choiceStands) === true,
     permissions: {
       story: read.value(DEFS.permissionStory) as LanePermission,
       engine: read.value(DEFS.permissionEngine) as LanePermission,

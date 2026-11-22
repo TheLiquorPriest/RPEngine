@@ -44,6 +44,10 @@ export interface TurnPrompts extends PromptPort {
   answeredText(user: string, chat: string, message: string, hash: string): string | null;
   /** Joins lore Lumiverse said activated for a turn's generation, heard after its request was kept, to the turn's record; inside a queued write. */
   addLore(db: Database, user: string, turn: string, lore: readonly ActivatedEntry[]): void;
+  /** Keeps with a turn's request record the lore its scene's prompts have held, as the turn found it (`lore-kept.ts` `SceneKept`); inside a queued write. */
+  keepScene(db: Database, user: string, turn: string, scene: unknown): void;
+  /** That list as a turn of the chat kept it, as its row holds it (read with `sceneRead`); null where RPE holds no prompt for the turn, or it kept none. */
+  scene(user: string, chat: string, turn: string): unknown;
   /** The messages Lumiverse's memory stands in for with a summary in the chat's latest prompt. */
   summarized(user: string, chat: string): ReadonlySet<string>;
   /** The receipt's cut (`Cut`, as JSON) the chat's latest kept prompt carried; null where no prompt of the chat is kept. */
@@ -141,6 +145,20 @@ export function turnPrompts(db: Database, writes: Writes, now: () => number, wri
       const had = JSON.parse(row.lore) as ActivatedEntry[];
       const known = new Set(had.map((e) => e.id));
       into.run("UPDATE turn_prompt SET lore = ? WHERE user = ? AND turn = ?", [JSON.stringify([...had, ...lore.filter((e) => !known.has(e.id))]), user, turn]);
+    },
+
+    keepScene(into, user, turn, scene) {
+      into.run("UPDATE turn_prompt SET scene = ? WHERE user = ? AND turn = ?", [JSON.stringify(scene), user, turn]);
+    },
+    scene(user, chat, turn) {
+      const row = db.query<{ scene: string | null }, [string, string, string]>("SELECT scene FROM turn_prompt WHERE user = ? AND chat = ? AND turn = ?").get(user, chat, turn);
+      if (row === null || row.scene === null) return null;
+      try {
+        return JSON.parse(row.scene) as unknown;
+      } catch {
+        // A row that does not parse holds nothing to compare with.
+        return null;
+      }
     },
 
     summarized(user, chat) {

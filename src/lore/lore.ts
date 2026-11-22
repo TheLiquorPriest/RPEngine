@@ -114,6 +114,8 @@ export interface LoreMapAsk extends LoreAt {
   texts: ScannedTexts;
   /** How the user's Lumiverse matches keys; its defaults when absent. */
   matching?: KeyMatching;
+  /** How the asker counts a text's tokens. With it, each entry the map shows says the size of its text as the lead reads it in full (plan 3.2 §7.1); absent, no line says a size. */
+  tokens?: (text: string) => number;
 }
 
 /** How an entry activated, in the words of the contract; anything else Lumiverse says is left unsaid. */
@@ -783,7 +785,10 @@ export class Lore {
     return { secrets: (await this.bookReads(at, world, s, person.id, new HoldersAt(world))).held(), budget: s.lore.heldBudget };
   }
 
-  /** Activated entries by RPE's ids, titled as reading them titles them, with their books' names (none where the book cannot be read) and how each activated. */
+  /**
+   * Activated entries by RPE's ids, titled as reading them titles them, with their books' names (none where the book cannot be read), how
+   * each activated, and its text as the prompt carried it where the tag holds it (`carried`: RPH finds the entry in the lead's window by it).
+   */
   private async named(user: string, entries: readonly ActivatedEntry[], titleWords: number): Promise<ActivatedLore[]> {
     const numbers = await this.numbers.of(user, entries.map((e) => e.id));
     const bookIds = [...new Set(entries.flatMap((e) => (e.book === null ? [] : [e.book])))];
@@ -799,7 +804,7 @@ export class Lore {
           if (row !== null) title = bookTitle(row, titleWords);
         }
         const how = HOWS.find((h) => h === e.how);
-        return { id: bookEntryId(n), source: e.book === null ? "" : (names.get(e.book) ?? ""), title, ...(how === undefined ? {} : { how }) };
+        return { id: bookEntryId(n), source: e.book === null ? "" : (names.get(e.book) ?? ""), title, ...(how === undefined ? {} : { how }), ...(typeof e.text === "string" ? { carried: e.text } : {}) };
       }),
     );
     return out.filter((a): a is ActivatedLore => a !== null);

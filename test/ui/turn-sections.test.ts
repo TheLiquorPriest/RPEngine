@@ -42,12 +42,33 @@ describe("the Turn page's sections", () => {
   });
 
   test("an activated entry whose tag gives no way shows 'not said'", () => {
-    const text = view(turnAt(), { loreRows: [{ id: "e-12", entry: "ent", book: "", title: "The lamp", how: null, receipt: "kept-out" }, { id: "e-13", entry: "ent2", book: "bk", title: "The tide", how: "keyword", receipt: null }] });
+    const unsaid = { tokens: null, status: null, lead: null } as const;
+    const text = view(turnAt(), { loreRows: [{ id: "e-12", entry: "ent", book: "", title: "The lamp", how: null, receipt: "kept-out", ...unsaid }, { id: "e-13", entry: "ent2", book: "bk", title: "The tide", how: "keyword", receipt: null, ...unsaid }] });
     expect(text).toContain("e-12");
-    expect(text).toContain("book not said; not said how it activated");
-    expect(text).toContain("book bk; by a key");
+    expect(text).toContain("book not said; not said how it activated)");
+    expect(text).toContain("book bk; by a key)");
     expect(text).toContain("kept out: RPE's check on the prompt's arrival took it out");
     expect(text.match(/kept out:/g)).toHaveLength(1);
+    // A turn that kept no list of what its prompt held says nothing of size, of the turn before or of the Author's choice.
+    expect(text).not.toContain("tokens");
+    expect(text).not.toContain("the turn before");
+  });
+
+  test("an activated entry shows its size, how it stood against the turn before and what the Author did with it", () => {
+    const text = view(turnAt(), {
+      loreRows: [
+        { id: "e-12", entry: "ent", book: "bk", title: "The lamp", how: "constant", receipt: null, tokens: 1840, status: "same", lead: "let_go" },
+        { id: "e-13", entry: "ent2", book: "bk", title: "The tide", how: "keyword", receipt: null, tokens: 212, status: "new", lead: "kept" },
+        { id: "e-14", entry: "ent3", book: "bk", title: "The gulls", how: "keyword", receipt: null, tokens: 90, status: "changed", lead: null },
+      ],
+    });
+    expect(text).toContain("book bk; always on; 1,840 tokens)");
+    expect(text).toContain("as the turn before");
+    expect(text).toContain("the Author let it go");
+    expect(text).toContain("new to this turn's prompt");
+    expect(text).toContain("the Author kept it whole");
+    expect(text).toContain("its text changed since the turn before");
+    expect(text.match(/the Author (kept|let)/g)).toHaveLength(2);
   });
 
   test("a turn shows what he asked for, the Author's record with its decision line, and the tools it found", () => {

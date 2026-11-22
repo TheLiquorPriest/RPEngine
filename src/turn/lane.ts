@@ -57,6 +57,8 @@ import { FactsRegistry, turnFacts } from "./facts";
 import { JOB_KIND, jobRowOf } from "./jobs";
 import { kvStore, servedUser, storeUsers, type Writes } from "./kv";
 import { PROMPT_MAP_FILE, PROMPT_MAP_FILENAME, type TurnPrompts, turnPrompts } from "./prompt";
+import { type LeadChoice, leadChoices, sceneRead } from "./lore-kept";
+import type { LoreTurns } from "../lore/sources";
 import { TurnMarks } from "./marks";
 import { FOLDER_KIND } from "./live-routes";
 import { Requests, REQUESTS_KIND } from "./requests";
@@ -332,6 +334,8 @@ export interface Turns {
   take: ChatTaker["take"];
   place: ChatTaker["place"];
   prompts: TurnPrompts;
+  /** What activated for each turn's prompt, as the lore's routes ask for it: the prompts' own, with how each entry of a turn's prompt stood (`LoreTurns.held`). */
+  loreTurns: LoreTurns;
   runs: Runs;
   /** What he asks for beside his words, waiting or kept with the turn that answered it. */
   requests: Requests;
@@ -715,6 +719,7 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
     writes: app.writes,
     files,
     chats,
+    kept: (scope) => trace.kept(scope),
     place,
     prompts,
     lore,
@@ -781,5 +786,23 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
   }
   const secretMarks = (at: LoreScope): Promise<LinesPart | undefined> => secretMarkLines(loadGuidance(files, chatLevels(at)));
   const given = (scope: Scope, agent: AgentRef, refs: readonly string[], moment: AttachMoment) => givenViews(eventsDeps, joined(scope), agent, refs, moment);
-  return { lane, store, harness, env, facts, files, chats, take, place, prompts, runs, requests, approvals, writes: app.writes, marks, trace, calls, lore, secretSettings, secretMarks, loreIndex, notes, suggestions, projection, meaning, stateIndex, given, sources, placeSources, castKnowledge };
+  // How each entry of a turn's prompt stood, for the Turn page: from the list the turn kept with its request, and what its lead did to its own window, read from the trace its folder keeps.
+  const loreTurns: LoreTurns = {
+    ...prompts.lore,
+    held: async (user, chat, turn) => {
+      const kept = sceneRead(prompts.scene(user, chat, turn));
+      if (kept === null) return null;
+      const here = kept.entries.filter((e) => e.here);
+      const scope = { user, chat, session: kept.session, turn };
+      const settings = await turnSettings(files, scope, app.log);
+      let did: Map<string, LeadChoice> | null = null;
+      try {
+        did = leadChoices(await trace.kept(scope), here.map((e) => e.id));
+      } catch (error) {
+        app.log.warn("A turn's trace could not be read for what its lead did with the lore.", { chat, turn, error: error instanceof Error ? error.message : String(error) });
+      }
+      return new Map(here.map((e) => [e.id, { tokens: e.hash === null ? null : Math.ceil(e.chars / settings.charsPerToken), status: e.status === "gone" ? null : e.status, lead: did?.get(e.id) ?? null }] as const));
+    },
+  };
+  return { lane, store, harness, env, facts, files, chats, take, place, prompts, loreTurns, runs, requests, approvals, writes: app.writes, marks, trace, calls, lore, secretSettings, secretMarks, loreIndex, notes, suggestions, projection, meaning, stateIndex, given, sources, placeSources, castKnowledge };
 }
