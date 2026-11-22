@@ -264,13 +264,14 @@ test("the trace never waits for a row: a write that fails is logged, and the rec
   // Each record was taken at once; the writes failed after.
   await calls.settled();
   expect(calls.held()).toEqual({ runs: 0, writes: 0 });
+  const lost = "A model call's row could not be kept. Its run's kept trace still holds the call; Read them in adds it only where its turn or job has no row at all.";
   expect(b.logged.map((l) => [l.message, l.fields?.run, l.fields?.error])).toEqual([
-    ["A model call's row could not be kept; reading the turn's kept trace in brings it back.", RUN, "the disk is full"],
-    ["A model call's row could not be kept; reading the turn's kept trace in brings it back.", RUN, "the disk is full"],
-    ["A model call's row could not be kept; reading the turn's kept trace in brings it back.", RUN, "the disk is full"],
-    ["A model call's row could not be kept; reading the turn's kept trace in brings it back.", RUN, "the disk is full"],
-    ["A model call's row could not be kept; reading the turn's kept trace in brings it back.", RUN, "the disk is full"],
-    ["A model call's row could not be kept; reading the turn's kept trace in brings it back.", JOB, "the disk is full"],
+    [lost, RUN, "the disk is full"],
+    [lost, RUN, "the disk is full"],
+    [lost, RUN, "the disk is full"],
+    [lost, RUN, "the disk is full"],
+    [lost, RUN, "the disk is full"],
+    [lost, JOB, "the disk is full"],
   ]);
 });
 

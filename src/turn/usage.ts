@@ -1,8 +1,8 @@
 // The use of the models, call by call (plan Appendix B, `call` and `agent_sent`): a row for each model call an agent made (whose it
 // was, what it was for, on what, when, its tokens, its request by part and what it asked of the provider's cache), and a row for each
 // item an agent was handed as it started, both written from RPH's trace as its records pass. The trace never waits for a row: each is
-// queued on the application's write queue as its record passes, and a write that fails is logged and costs that row alone, which
-// reading the turn's kept trace in brings back (`readIn`).
+// queued on the application's write queue as its record passes, and a write that fails is logged and costs that row alone. The call
+// stays in the trace its run keeps; a reading in (`readIn`, on the Usage page's press) adds it only where its turn or job has no row.
 //
 // A row is keyed by its run (RPH's own id for it; a job's run is the job's id), its agent's handle, the call's number and when its
 // request went out, and carries its chat and the turn its run played in as its records' scope named them (a continue's own held
@@ -439,7 +439,7 @@ export class CallRows {
    * cannot be made or written is logged, its record going on to the live view and the turn's folder as every other does.
    */
   record(record: TraceRecord): void {
-    const lost = (error: unknown): void => this.log.error("A model call's row could not be kept; reading the turn's kept trace in brings it back.", { run: record.run, error: error instanceof Error ? error.message : String(error) });
+    const lost = (error: unknown): void => this.log.error("A model call's row could not be kept. Its run's kept trace still holds the call; Read them in adds it only where its turn or job has no row at all.", { run: record.run, error: error instanceof Error ? error.message : String(error) });
     try {
       const rows = this.#live.take(record);
       if (rows === null) return;
