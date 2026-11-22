@@ -32,7 +32,7 @@ import { IFACE_DEFAULTS } from "../iface/kit";
 import { nearestOf } from "../iface/reading";
 import { type Provenance, provenanceData } from "../iface/source";
 import { type Beat, beatsAt, resolveBeats } from "./beats";
-import { baseView, type CastCall, type CastReading, type CastToolSpec, growthOver, itemView, nearIds, readingOr, sourceView, whoView } from "./kit";
+import { baseView, type CastCall, type CastReading, type CastToolSpec, growthOver, itemView, nearIds, nearOf, readingOr, sourceView, whoView } from "./kit";
 import { LORE_STAMP, PROVENANCE_READS, readSource, shownReads, sourceLines, stampOn } from "./source";
 import {
   addCharacter,
@@ -404,7 +404,8 @@ async function readOp(r: Reading, n: number, raw: JsonValue): Promise<OpRead> {
         if (found !== null && "id" in found) planned.person = found.id;
         else {
           const names = ctx === null ? [] : Object.values(ctx.state.entities).map((e) => e.name);
-          out.unread.push({ line: "no_person", fields: { n, op, field: "person", said: value.person, near: textOf(nearestOf(value.person, names, IFACE_DEFAULTS).slice(0, IFACE_DEFAULTS.nearMatches)) } });
+          const near = nearOf(r.call);
+          out.unread.push({ line: "no_person", fields: { n, op, field: "person", said: value.person, near: textOf(nearestOf(value.person, names, near).slice(0, near.nearMatches)) } });
         }
       } else if (held === null && ctx !== null) {
         const found = personNamed(ctx, character.name);
@@ -431,7 +432,7 @@ async function readOp(r: Reading, n: number, raw: JsonValue): Promise<OpRead> {
         planned.source = { kind, ref, now: null };
       } else {
         const now = await r.read(kind, ref);
-        if (now === null) return unreadable({ line: "no_source", fields: { n, op, kind, id: ref, near: textOf(nearIds(ref, boundAnywhere(r.call, r.cast, kind))) } });
+        if (now === null) return unreadable({ line: "no_source", fields: { n, op, kind, id: ref, near: textOf(nearIds(ref, boundAnywhere(r.call, r.cast, kind), nearOf(r.call))) } });
         bound.set(key, { kind, ref, now });
         planned.source = { kind, ref, now };
       }
@@ -509,7 +510,7 @@ async function readOp(r: Reading, n: number, raw: JsonValue): Promise<OpRead> {
       if (id !== undefined) {
         const found = r.cast.record.items.get(id as string);
         if (found === undefined || found.part !== name || found.character !== character.id) {
-          const near = nearIds(String(id), r.cast.record.of(character.id, name, true).map((i) => i.id));
+          const near = nearIds(String(id), r.cast.record.of(character.id, name, true).map((i) => i.id), nearOf(r.call));
           return unreadable({ line: "unknown_id", fields: { n, op, who: character.name, part: name, id: JSON.stringify(id), near: textOf(near) } });
         }
         item = found;
@@ -519,7 +520,7 @@ async function readOp(r: Reading, n: number, raw: JsonValue): Promise<OpRead> {
         const beats = r.beats();
         if (beats !== null) {
           const { linked, unknown } = resolveBeats(beats, planned.value.beats as string[]);
-          for (const said of unknown) out.unread.push({ line: "unknown_beat", fields: { n, op, field: "beats", id: said, near: textOf(nearIds(said, beats.map((b) => b.id))) }, kept: true });
+          for (const said of unknown) out.unread.push({ line: "unknown_beat", fields: { n, op, field: "beats", id: said, near: textOf(nearIds(said, beats.map((b) => b.id), nearOf(r.call))) }, kept: true });
           if (linked.length > 0) planned.value.beats = linked;
           else delete planned.value.beats;
         }

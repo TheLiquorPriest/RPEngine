@@ -11,10 +11,9 @@ import { placeOfEntity } from "../engine/scope";
 import { findPlaces } from "../engine/places-in-play";
 import type { ReadContext } from "../engine/registry";
 import { writtenTime } from "../engine/time";
-import { IFACE_DEFAULTS } from "../iface/kit";
 import { isFound, Reading } from "../iface/reading";
 import type { Database } from "bun:sqlite";
-import type { CastCall } from "./kit";
+import { type CastCall, nearOf } from "./kit";
 import { type CastItem, charactersOf, findCharacter, nameKey } from "./record";
 import { personNamed } from "./secrets";
 
@@ -30,7 +29,7 @@ export function namesIn(call: CastCall): (said: string) => Named {
   let reading: Reading | null | undefined;
   return (said) => {
     if (reading === undefined) {
-      const made = Reading.of({ scope: call.scope, agent: call.agent, lines: call.lines, deps: { store: call.deps.store.user(call.scope.user), env: call.deps.store.env }, settings: { nearMatches: IFACE_DEFAULTS.nearMatches, nearDistance: IFACE_DEFAULTS.nearDistance } });
+      const made = Reading.of({ scope: call.scope, agent: call.agent, lines: call.lines, deps: { store: call.deps.store.user(call.scope.user), env: call.deps.store.env }, settings: nearOf(call) });
       reading = made instanceof Reading ? made : null;
     }
     if (reading === null) return { near: [] };

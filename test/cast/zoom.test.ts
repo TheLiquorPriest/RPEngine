@@ -2,8 +2,9 @@
 // size, a line for what waits, and an outline of the rest of its record with sizes; `self_read` opens the rest, a part at a time,
 // for the character the calling agent plays and for no one else, from what the character may know; `cast_query` answers by gist
 // for the omniscient side. With no size set and no outline named, a character is handed what it was handed before there were
-// sizes. A batch of a take-in (plan 3.2 §6.5) opens by its range of ids, whatever was struck since its plan was read. Played on the
-// cast's invented chat. Every name and every word here is made up.
+// sizes. A batch of a take-in (plan 3.2 §6.5) opens by its range of ids, whatever was struck since its plan was read. What is not
+// there is answered with as many near matches as the chat's setting says. Played on the cast's invented chat. Every name and every
+// word here is made up.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { TemplatePart } from "../../src/app/guidance";
@@ -14,6 +15,7 @@ import { type CastViewInput, type CastViewName, castViews, type Layout } from ".
 import { CAST_START_DEFAULTS, castClock } from "../../src/cast/kit";
 import { takeInViews } from "../../src/cast/take-in";
 import { untakenSized } from "../../src/cast/zoom";
+import { IFACE_DEFAULTS } from "../../src/iface/kit";
 import { isRecord } from "../../src/shared/json";
 import { writeStory } from "../../src/story/record";
 import type { Store } from "../../src/store";
@@ -562,5 +564,22 @@ describe("a batch of a take-in", () => {
     expect((await b.call("remember", { memories: [{ text: "The door was bolted from outside.", gist: "Bolted in.", from: [ids[3] ?? ""] }] }, turn.id, BRAM)).error).toBeUndefined();
     await b.t.tie(turn);
     expect(batch()).toBe(`### What Bram has perceived and not yet taken in\n\nEvery perception of the batch ${ids[2]}..${ids[4]} has been taken in.`);
+  });
+});
+
+describe("near matches", () => {
+  test("self_read and cast_query list as many near matches as the chat's setting says (engine.nearMatches), and none at 0", async () => {
+    /** What each answers for a day, a scene, an id and a name that are not there, at a number of near matches. */
+    const asked = async (nearMatches: number): Promise<{ scenes: string[]; said: string[] }> => {
+      const { b, scenes } = await backlog({ near: { nearMatches, nearDistance: IFACE_DEFAULTS.nearDistance } });
+      const first = async (name: string, args: JsonObject, agent?: AgentRef): Promise<string> => texts(await b.call(name, args, null, agent))[0] ?? "";
+      return { scenes, said: [await first("self_read", { part: "perceptions", day: "Fri 7 Mar 2031" }, BRAM), await first("self_read", { part: "perceptions", scene: "The harbour" }, BRAM), await first("self_read", { part: "perceptions", id: "p-999" }, BRAM), await first("cast_query", { who: "Brahm" })] };
+    };
+    const one = await asked(1);
+    expect(one.said[0]).toMatch(/^Nothing in perceptions is of Fri 7 Mar 2031\. The nearest days it holds: [^,]+\.$/);
+    expect(one.said[1]).toBe(`Nothing in perceptions is of the scene The harbour: a scene is asked for by its id, as your outline names it. The latest scenes it holds: ${one.scenes[1]}.`);
+    expect(one.said[2]).toMatch(/^You have no "p-999" in perceptions\. The nearest you have: [^,]+\.$/);
+    expect(one.said[3]).toBe("There is no Brahm in the cast; the nearest names are Bram.");
+    expect((await asked(0)).said).toEqual(["Nothing in perceptions is of Fri 7 Mar 2031.", "Nothing in perceptions is of the scene The harbour: a scene is asked for by its id, as your outline names it.", 'You have no "p-999" in perceptions.', "There is no Brahm in the cast."]);
   });
 });

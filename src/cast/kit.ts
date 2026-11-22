@@ -10,7 +10,7 @@ import type { ConfigRead } from "../app/config-read";
 import type { NumberSettings, Setting } from "../app/setting-list";
 import { calendarOf, formatClock, formatDay, placeOffset } from "../engine/calendar";
 import { placeOfEntity } from "../engine/scope";
-import { type AreaCall, type AreaSpec, type AreaWords, IFACE_DEFAULTS, type LastUseKeeper, type Reply, type Writes } from "../iface/kit";
+import { type AreaCall, type AreaSpec, type AreaWords, IFACE_DEFAULTS, type IfaceSettings, type LastUseKeeper, type Reply, type Writes } from "../iface/kit";
 import type { ReceiptKeeper } from "../iface/receipt";
 import { nearestOf } from "../iface/reading";
 import { type GuidanceFiles, Lines } from "../iface/texts";
@@ -196,8 +196,18 @@ export interface CastDeps {
    * id alone: its title is the record's words, which `self_read` never gives the character. Absent: nothing is read by scene.
    */
   scenes?: (scope: { user: string; chat: string }, at: string | null, turns: readonly string[]) => ReadonlyMap<string, string | null>;
+  /** How an answer about a name, an id or a day that is not there offers the nearest (`engine.nearMatches`, `engine.nearDistance`), as the chat sets it for the engine's tools; the shipped values where absent. */
+  near?: NearSettings;
   /** Milliseconds since 1970, for a row's time; `Date.now` when absent. */
   now?: () => number;
+}
+
+/** How many near matches an answer lists, and how near a match must be. */
+export type NearSettings = Pick<IfaceSettings, "nearMatches" | "nearDistance">;
+
+/** How a call's answers offer near matches: the chat's settings for them, or the shipped values where the host gives none. */
+export function nearOf(call: Pick<CastCall, "deps">): NearSettings {
+  return call.deps.near ?? IFACE_DEFAULTS;
 }
 
 /** One call of a cast tool. */
@@ -306,9 +316,9 @@ export function readingOr(call: CastCall, reply: Reply): CastReading | null {
   };
 }
 
-/** The nearest of `ids` to what was said, no more than an answer about a name that is not there lists (`engine.nearMatches`): offered where an id is none of the character's. */
-export function nearIds(said: string, ids: readonly string[]): string[] {
-  return nearestOf(said, ids, IFACE_DEFAULTS).slice(0, IFACE_DEFAULTS.nearMatches);
+/** The nearest of `ids` to what was said, no more than an answer about a name that is not there lists (`near`, the chat's `engine.nearMatches`): offered where an id is none of the character's. */
+export function nearIds(said: string, ids: readonly string[], near: NearSettings): string[] {
+  return nearestOf(said, ids, near).slice(0, near.nearMatches);
 }
 
 // ---------------------------------------------------------------- what answers show
