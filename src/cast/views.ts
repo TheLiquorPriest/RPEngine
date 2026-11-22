@@ -41,6 +41,9 @@ export const CAST_VIEWS = {
   imported: "cast-imported",
   "game-side": "cast-game-side",
   history: "cast-history",
+  // The two the briefing lists for those on stage (plan 3.2 §6.7): the whole views stay for whoever asks for them by name.
+  "history-outline": "cast-history-outline",
+  "imported-outline": "cast-imported-outline",
 } as const;
 export type CastViewName = keyof typeof CAST_VIEWS;
 
@@ -239,6 +242,12 @@ export async function castViews(names: readonly string[], input: CastViewInput):
       const minds = waiting.find((f) => isRecord(f.fields.minds));
       const notes = minds === undefined ? undefined : mindsShown(minds.fields.minds as JsonObject, worldAt(input.store, input.user, input.turn, input.job ?? null, input.chat), clock);
       if (files !== undefined || notes !== undefined) fields = { ...head, ...(files !== undefined ? { files } : {}), ...(notes !== undefined ? { minds: notes } : {}) };
+    } else if (name === "imported-outline") {
+      // The same files, listed: each by its name and its size, and the older minds pack's notes as one more. Their text is the `imported` view's.
+      const waiting = importedFiles(record, character.id).filter((f) => !isFiled(f));
+      const files = listed(waiting.flatMap((f) => (isRecord(f.fields.minds) ? [] : [{ file: fileName(f), tokens: input.tokens(importedText(db, input.user, f) ?? "") }])));
+      const minds = waiting.find((f) => isRecord(f.fields.minds));
+      if (files !== undefined || minds !== undefined) fields = { ...head, ...(files !== undefined ? { files } : {}), ...(minds !== undefined ? { minds: { tokens: input.tokens(JSON.stringify(minds.fields.minds)) } } : {}) };
     } else if (name === "relationships:present") {
       const here = new Set(input.present.map(nameKey));
       here.delete(nameKey(character.name));
@@ -254,7 +263,7 @@ export async function castViews(names: readonly string[], input: CastViewInput):
         });
       const relationships = listed(shown);
       if (relationships !== undefined) fields = { ...head, relationships };
-    } else if (name === "history") {
+    } else if (name === "history" || name === "history-outline") {
       // The Author's record of their story, oldest first, each with its date in story time where the clock shows one, and each beat it is linked to with the words for when the story record has for it.
       const rows = record.of(character.id, "history");
       const history = listed(rows.map((h) => ({ ...h.fields, ...datedAt(clock, h.at) })));
@@ -265,7 +274,31 @@ export async function castViews(names: readonly string[], input: CastViewInput):
           const linked = (Array.isArray(ids) ? ids : []).flatMap((id): JsonObject[] => (typeof id === "string" ? [{ id, ...(typeof beats.get(id) === "string" ? { when: beats.get(id) as string } : {}) }] : []));
           if (linked.length > 0) item.linked = linked;
         }
-        fields = { ...head, history };
+        const layout = input.layouts[name];
+        if (name === "history") fields = { ...head, history };
+        else if (layout !== undefined) {
+          // The outline: the newest entries whole, oldest first, as many as its size holds; the earlier ones counted, with their size and
+          // whose they are, for the call that reads them. Showing more never takes less room, so how many fit is found by halving.
+          const all = history.items;
+          const sizeOf = (item: JsonObject): number => input.tokens(typeof item.text === "string" ? item.text : JSON.stringify(item));
+          const shown = (k: number): ViewFields => {
+            const earlier = all.slice(0, all.length - k);
+            return {
+              ...head,
+              // The items are laid out already (`listed`, with their beats): the newest `k` of them, as they are.
+              ...(k > 0 ? { history: { items: all.slice(all.length - k) } } : {}),
+              ...(earlier.length > 0 ? { earlier: { count: earlier.length, one: earlier.length === 1, tokens: earlier.reduce((n, item) => n + sizeOf(item), 0), who: character.name } } : {}),
+            };
+          };
+          let lo = 0;
+          let hi = all.length;
+          while (lo < hi) {
+            const mid = Math.ceil((lo + hi) / 2);
+            if (input.tokens(layout.render(shown(mid)).text) <= settings.outlineTokens) lo = mid;
+            else hi = mid - 1;
+          }
+          fields = shown(lo);
+        }
       }
     } else if (name === "game-side") {
       const side = gameSide(input.store, input.user, input.chat, input.turn, character);

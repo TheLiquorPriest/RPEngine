@@ -10,9 +10,10 @@ import { timeDue } from "../../src/store/due";
 import { factStore } from "../../src/store/facts";
 import { openStore } from "../../src/store/store";
 import { STORY_STORE_AREA } from "../../src/story";
+import type { WorldDoc } from "../../src/shared/world";
 import type { ChangeInput } from "../../src/store/types";
 import { renderView, wordLine, type ViewLine } from "../../src/store/words";
-import { WORLD_STATE_DEFAULTS, worldState, type DueSource, type MapText } from "../../src/store/world-state";
+import { WORLD_STATE_DEFAULTS, worldState, type DueSource, type MapText, type WorldStateSettings } from "../../src/store/world-state";
 import { engine, hand, hashOf, inventedWorld, make, pay, play, POV, registry, shown, SHIPPED_LAYOUT, SHIPPED_PART, testStore, tick, USER } from "./fixtures";
 import { bigWorld } from "./measure";
 
@@ -302,5 +303,90 @@ describe("what falls due in the world state", () => {
       expect(shown + left).toBe(all ?? -1);
     }
     expect(century.lines.at(-1)?.kind).toBe("left_out");
+  });
+});
+
+describe("a thing at hand that holds a great deal", () => {
+  type Entity = WorldDoc["entities"][string];
+  const thing = (id: string, kind: string, name: string, fields: Entity["fields"], relations: Entity["relations"] = []): Entity => ({ id, kind, name, tier: "background", fields, relations });
+
+  /**
+   * The invented world with, in the common room: an iron chest of `n` ledgers; a box of two spoons; a cart that carries Odile and a
+   * crate of `n` nails; and, on Wren, a sack of `n` letters.
+   */
+  function stocked(n: number): WorldDoc {
+    const world = inventedWorld();
+    const fill = (holder: string, stem: string, name: string): void => {
+      for (let i = 0; i < n; i++) world.entities[`${stem}_${i}`] = thing(`${stem}_${i}`, "item", `${name} ${i}`, { description: `Fixture ${name.toLowerCase()} number ${i}, kept dry and counted twice.` }, [{ type: "in", to: holder }]);
+    };
+    world.entities.chest = thing("chest", "container", "Iron chest", { place: "common_room", lock: "brass" });
+    fill("chest", "ledger", "Ledger");
+    world.entities.box = thing("box", "container", "Spoon box", { place: "common_room" });
+    for (const id of ["spoon_a", "spoon_b"]) world.entities[id] = thing(id, "item", `Spoon ${id.slice(-1)}`, {}, [{ type: "in", to: "box" }]);
+    world.entities.cart = thing("cart", "container", "Hand cart", { place: "common_room" });
+    world.entities.odile = { ...(world.entities.odile as Entity), fields: { place: "common_room" }, relations: [{ type: "on", to: "cart" }] };
+    world.entities.crate = thing("crate", "container", "Nail crate", {}, [{ type: "in", to: "cart" }]);
+    fill("crate", "nail", "Nail");
+    world.entities.sack = thing("sack", "container", "Post sack", {}, [{ type: "in", to: POV }]);
+    fill("sack", "letter", "Letter");
+    return world;
+  }
+
+  /** The world state at the second turn of a chat on `world`, as its lines. */
+  function atHand(world: WorldDoc, settings: Partial<WorldStateSettings> = {}, layout: string = SHIPPED_LAYOUT): string[] {
+    const ts = testStore({ world });
+    ts.s.createChat({ id: "c", revision: ts.revision });
+    play(ts.s, "c", "m1", "Wren looks around.", 1, []);
+    const t2 = ts.s.beginTurn({ chat: "c", kind: "normal" });
+    const block = worldState(ts.s, { chat: "c", turn: t2.id, layout, charsPerToken: 4, settings });
+    ts.store.close();
+    return block.text.split("\n").map((l) => l.trim());
+  }
+
+  const lineOf = (lines: string[], start: string): string => lines.find((l) => l.startsWith(start)) ?? "";
+
+  test("is given closed: its own line and values, what it holds by name, how large that is, and the query that opens it; a small one is given whole", () => {
+    const lines = atHand(stocked(40));
+    // The chest: its line counts what it holds and names the query; its own value stays; one line names the ledgers and their size.
+    expect(lineOf(lines, "Iron chest [chest]")).toMatch(/40 things.* \[opened by world_query at entity:chest\]$/);
+    expect(lines).toContain("· lock: brass");
+    const held = lineOf(lines, "· holds Ledger 0, Ledger 1, ");
+    for (const i of [2, 17, 39]) expect(held).toContain(`Ledger ${i}`);
+    expect(held.slice("· holds ".length, held.indexOf(" — ")).split(", ")).toHaveLength(40);
+    expect(Number(/— (\d+) tokens, not shown here/.exec(held)?.[1])).toBeGreaterThan(WORLD_STATE_DEFAULTS.foldTokens);
+    expect(lines.some((l) => l.startsWith("Ledger 7 [ledger_7]"))).toBe(false);
+    // The spoon box holds little: it is open.
+    expect(lineOf(lines, "Spoon box [box]")).not.toContain("opened by world_query");
+    expect(lines.some((l) => l.startsWith("Spoon a [spoon_a]"))).toBe(true);
+  });
+
+  test("nobody is closed, nor a thing that carries someone: the container inside it is, and what a person carries stays listed", () => {
+    const lines = atHand(stocked(40));
+    // Odile rides the cart: the cart stays open so she is seen, and its crate of nails is closed.
+    expect(lineOf(lines, "Hand cart [cart]")).not.toContain("opened by world_query");
+    expect(lines.some((l) => l.startsWith("Odile [odile]"))).toBe(true);
+    expect(lineOf(lines, "Nail crate [crate]")).toContain("[opened by world_query at entity:crate]");
+    expect(lines.some((l) => l.startsWith("Nail 3 [nail_3]"))).toBe(false);
+    // Wren carries a full sack: she is open, her satchel and cloak are listed, and the sack is closed.
+    expect(lineOf(lines, "Wren [wren]")).not.toContain("opened by world_query");
+    expect(lines.some((l) => l.startsWith("Grey cloak [cloak]"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("Knife [knife]"))).toBe(true);
+    expect(lineOf(lines, "Post sack [sack]")).toContain("[opened by world_query at entity:sack]");
+  });
+
+  test("the size is the setting's, and a layout with no folded line closes nothing", () => {
+    const world = stocked(40);
+    const roomy = atHand(world, { foldTokens: 1_000_000 });
+    expect(roomy.some((l) => l.startsWith("Ledger 39 [ledger_39]"))).toBe(true);
+    expect(roomy.some((l) => l.includes("not shown here"))).toBe(false);
+    // His own layout, written before the line existed: every thing at hand is given open.
+    const own = atHand(world, {}, SHIPPED_LAYOUT.replace(/^ {2}folded: .*\n/m, ""));
+    expect(own.some((l) => l.startsWith("Ledger 39 [ledger_39]"))).toBe(true);
+    expect(own.some((l) => l.startsWith("Nail 39 [nail_39]"))).toBe(true);
+    expect(lineOf(own, "Iron chest [chest]")).not.toContain("opened by world_query");
+    // And at nothing, every thing that holds anything is closed, the spoon box with them.
+    const none = atHand(world, { foldTokens: 0 });
+    expect(lineOf(none, "Spoon box [box]")).toContain("[opened by world_query at entity:box]");
+    expect(lineOf(none, "· holds Spoon a, Spoon b")).toContain("tokens, not shown here");
   });
 });

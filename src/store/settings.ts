@@ -34,6 +34,7 @@ export const STORE_SETTING_DEFS = {
 export const WORLD_STATE_SETTING_DEFS = {
   budget: { key: "worldState.tokens", default: WORLD_STATE_DEFAULTS.budget, takes: { type: "whole", least: 0 }, perConnection: false, name: "World state: everything else", about: "Tokens of the briefing's world state that everything but the horizon shares.", effect: "turn", row: "World state: everything else" },
   dueAhead: { key: "worldState.dueAheadMinutes", default: WORLD_STATE_DEFAULTS.dueAhead, takes: { type: "whole", least: 0 }, perConnection: false, name: "Time ahead listed as due", about: "Minutes of story time ahead that the world state's due section lists.", effect: "turn" },
+  foldTokens: { key: "worldState.foldTokens", default: WORLD_STATE_DEFAULTS.foldTokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "World state: what one thing holds", about: "Tokens the things inside one thing may take in the world state's horizon. A thing that holds more is given closed: its own line and values, what it holds by name, how large that is, and the query that opens it. People, places and what they hold directly are never closed.", effect: "turn" },
 } as const satisfies Record<keyof typeof WORLD_STATE_DEFAULTS, object>;
 
 /** The world documents' (`storedWorlds`), read once for every chat: the revisions held in memory. */
