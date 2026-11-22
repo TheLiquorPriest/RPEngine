@@ -449,6 +449,8 @@ function NoteView(props: { step: NoteStep; notices: NoticeLines }) {
       );
     case "effort_lowered":
       return <NoteHead icon="alert" title={`The provider refused effort ${event.asked} on ${event.connection} · ${event.model}: sent ${event.sent}`} />;
+    case "warm_unmade":
+      return <NoteHead icon="alert" title="No warm read of its requests can be made: its model thinks to a budget, and the read would not read the provider's cache as the request did" />;
     case "call_failed":
       return (
         <div class="lre-stack">

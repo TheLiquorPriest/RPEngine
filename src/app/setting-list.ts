@@ -169,11 +169,15 @@ export const SECTIONS: readonly { readonly title: string; readonly about: string
 /** The group of every setting of how a failed model call is made again. */
 const RETRY_GROUP = "When a call to the model fails";
 
+/** The group of every setting of what is asked of a provider's prompt cache (plan 3.2 §5.1). */
+const CACHE_GROUP = "The provider's prompt cache";
+
 /** The group the page shows a key in, and that group's section, by the longest start of the key named here (its first part, or more of it); for a key set per agent, `agents.` and its part after the definition. */
 const GROUPS: Readonly<Record<string, readonly [group: string, section: string]>> = {
   "agents.effort": ["Effort and limits, for each agent", "Agents"],
   "agents.limits": ["Effort and limits, for each agent", "Agents"],
   "agents.sampling": ["Sampling, for each agent", "Agents"],
+  "agents.cacheRetention": ["The prompt cache, for each agent", "Agents"],
   limits: ["Limits on a turn's work", "Agents"],
   compaction: ["Compaction", "Agents"],
   sessions: ["Sessions", "Agents"],
@@ -203,6 +207,10 @@ const GROUPS: Readonly<Record<string, readonly [group: string, section: string]>
   "calls.maxRetryWaitSeconds": [RETRY_GROUP, "Connections and model calls"],
   "calls.retryWaitAsAsked": [RETRY_GROUP, "Connections and model calls"],
   "calls.retryOn": [RETRY_GROUP, "Connections and model calls"],
+  "calls.cacheRetention": [CACHE_GROUP, "Connections and model calls"],
+  "calls.cacheFront": [CACHE_GROUP, "Connections and model calls"],
+  "calls.cacheWarm": [CACHE_GROUP, "Connections and model calls"],
+  "calls.cacheWarmMarginSeconds": [CACHE_GROUP, "Connections and model calls"],
   throttles: ["Calls at once", "Connections and model calls"],
   tokens: ["Counting tokens", "Connections and model calls"],
   embedding: ["Embeddings", "Connections and model calls"],

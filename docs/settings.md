@@ -57,6 +57,12 @@ What each agent thinks at and may spend, its tools, and how its sessions are kep
 | `agents.<definition>.sampling.presencePenalty` | none (the provider's own) | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Presence penalty: The presence penalty every call of this agent is made with, where its provider takes one; unset, its provider's own. Below -2: Most providers take a presence penalty from -2 to 2; one that takes less refuses the call. Above 2: Most providers take a presence penalty from -2 to 2; one that takes less refuses the call. |
 | `agents.<definition>.sampling.repetitionPenalty` | none (the provider's own) | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Repetition penalty: The repetition penalty every call of this agent is made with, where its provider takes one; unset, its provider's own. |
 
+### The prompt cache, for each agent
+
+| Setting | Default | Where | In force | Appendix D.1 | What it does |
+|---|---|---|---|---|---|
+| `agents.<definition>.cacheRetention` | none (as its connection's, else calls.cacheRetention) | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Prompt cache retention of an agent: How long a provider is asked to keep the prompts of this agent's calls (none, short, long or auto), in place of its connection's setting and calls.cacheRetention. Without it, those hold. |
+
 ### Limits on a turn's work
 
 | Setting | Default | Where | In force | Appendix D.1 | What it does |
@@ -243,6 +249,7 @@ Each connection's own values, how a model call is made, tried again and throttle
 | `connections.<connection>.effort` | none (as each agent's definition says) | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Effort on a connection: How hard every agent on this connection reasons, in place of its definition's effort; an agent's own effort setting stands over it. |
 | `connections.<connection>.jobs.atOnce` | none (no limit of its own) | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Jobs at once on a connection: Jobs on this connection that run at the same time. |
 | `connections.<connection>.jobs.perDay` | none (no limit of its own) | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Jobs in a day on a connection: Jobs on this connection that may be started in a day. Below 1: At 0 no job starts on this connection. |
+| `connections.<connection>.cacheRetention` | none (as calls.cacheRetention says) | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Prompt cache retention on a connection: How long this connection's provider is asked to keep a prompt, in place of calls.cacheRetention; an agent's own setting stands over it. Without it, calls.cacheRetention holds. |
 | `connections.<connection>.throttles.requestsPerMinute` | none (no limit) | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Requests a minute on a connection: Calls sent on this connection over any minute, across every agent, turn and job; one past it waits for room. |
 | `connections.<connection>.throttles.tokensPerMinute` | none (no limit) | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Tokens a minute on a connection: Tokens sent and written on this connection over any minute; a call waits for room, and one bigger than the whole minute is not made. |
 | `connections.<connection>.throttles.atOnce` | none (as every connection) | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Calls at once on a connection: Calls on this connection under way at the same time; one past it waits in line, first come first served. |
@@ -265,7 +272,6 @@ Each connection's own values, how a model call is made, tried again and throttle
 | `calls.signInWordsKeptSeconds` | `600` seconds | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Failed sign-in's words kept: Seconds the words of why a sign-in did not finish are kept to be shown. |
 | `calls.maxFailureChars` | `2000` characters | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Length of failure words: Characters of a provider's or a call's failure words that are kept; the rest is cut. |
 | `calls.minSecretChars` | `8` characters | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Length a secret is looked for at: Characters from which a key or a header's value is taken out of a provider's words wherever it stands; a shorter one is taken out where it stands as a word of its own. A key shorter than this is refused. |
-| `calls.cacheRetention` | `short` | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Prompt cache retention: How long a provider is asked to keep a prompt in its cache: none, short or long. |
 | `calls.toolRefusalMinutes` | `60` minutes | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Native tools tried again after: Minutes a connection's model that refused native tools is offered them as text; then native tools are tried again. |
 | `calls.effortRefusalMinutes` | `60` minutes | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Refused thinking level tried again after: Minutes a connection's model that refused a thinking level is sent the next level down it has at once; then the refused level is tried again. |
 
@@ -285,6 +291,15 @@ Each connection's own values, how a model call is made, tried again and throttle
 | `calls.retryOn.overloaded` | `true` | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Retry when the provider is busy: A call the provider turned away as overloaded or asked to slow down is made again. |
 | `calls.retryOn.server` | `true` | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Retry when the provider's server fails: A call that met a fault of the provider's server is made again. |
 | `calls.retryOn.other` | `true` | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Retry on any other failure: A call that failed in a way none of the kinds above names is made again. No credit, a key refused, a request the provider calls invalid or too long, and a call never sent are never made again. |
+
+### The provider's prompt cache
+
+| Setting | Default | Where | In force | Appendix D.1 | What it does |
+|---|---|---|---|---|---|
+| `calls.cacheRetention` | `auto` | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Prompt cache retention: How long a provider is asked to keep a prompt in its cache: none, short, long or auto. Auto asks the long lifetime of the front that turns share while the chat is in play (its last two turns began within that lifetime of each other) and the short one otherwise, and the short one of what changes each turn; on an API that takes one lifetime for the whole request, the long one while the chat is in play. |
+| `calls.cacheFront` | `true` | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Cache mark at the shared front: A turn's request carries a cache mark at the end of what it shares with the request the session's previous turn sent, so that the next turn reads that front from the provider's cache and does not write it again. On the APIs that take such marks. |
+| `calls.cacheWarm` | `true` | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Warm read before the cache lapses: An agent's request is read once more, asked for one token, when its call has run, or it has waited on others, to within the margin of the cache's lifetime: its next call then still reads the cache. The read is traced and counted as its own operation, warm. |
+| `calls.cacheWarmMarginSeconds` | none (a tenth of the lifetime, ten seconds at least) | RPE-global.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Margin of a warm read: Seconds before the cache's lifetime ends at which the warm read is made. Without it, the model layer's own rule: at nine tenths of the lifetime, ten seconds before its end at least. |
 
 ### Calls at once
 

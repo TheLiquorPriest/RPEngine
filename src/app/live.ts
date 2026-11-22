@@ -329,6 +329,7 @@ const traceEvent = shape.named(
     shape.object({ kind: shape.literal("waiting"), for: shape.oneOf("tool", "agent"), callId: T, tool: T, ms: opt(N) }),
     shape.object({ kind: shape.literal("connection_stand_in"), named: T, used: T }),
     shape.object({ kind: shape.literal("effort_lowered"), connection: T, model: T, asked: effort, sent: effort }),
+    shape.object({ kind: shape.literal("warm_unmade"), why: shape.oneOf("unreplayable") }),
     shape.object({ kind: shape.literal("tool_started"), callId: T, tool: T, args: shape.json(), via: opt(shape.literal("tool_use")) }),
     shape.object({ kind: shape.literal("tool_update"), callId: T, tool: T, partial: toolResult }),
     shape.object({ kind: shape.literal("tool_ended"), callId: T, tool: T, result: toolResult, clean: shape.yesNo(), endedRun: shape.yesNo(), ms: N, permission: opt(callPermission), refused: opt(callRefusal) }),
