@@ -44,6 +44,8 @@ const BEFORE = SHIPPED.filter((name) => name !== "outline");
 
 const FILLER = "The common room smelled of wet wool and tallow, and nobody at the long table looked up from their bowls. ".repeat(3).trim();
 const DAYS = ["Sat 1 Mar 2031", "Sun 2 Mar 2031", "Mon 3 Mar 2031", "Tue 4 Mar 2031"];
+/** The two scenes' titles as the Author wrote them: the story record's words, the omniscient side's account of what happened, which no reading of the character's may hold. */
+const TITLES = ["TITLE-SENTINEL Odile slips poison into the cup of the reeve", "TITLE-SENTINEL What the cellar hid"];
 
 interface Backlog {
   b: Bench;
@@ -68,7 +70,7 @@ async function backlog(more: Partial<CastDeps> = {}): Promise<Backlog> {
     if (day === 0) expect((await b.call("cast_update", { operations: [{ op: "cast", who: "Bram", as: "principal" }, { op: "cast", who: "Odile", as: "principal" }] }, turn.id)).error).toBeUndefined();
     if (day > 0) await b.t.writes.run(() => b.t.s.addChanges(turn.id, engine(tick(24 * 60))));
     if (day % 2 === 0) {
-      const [scene] = await b.t.writes.run(() => writeStory(b.t.store, { user: USER, chat: CHAT, turn: turn.id, by: "author", agent: "author-1", job: null }, [{ part: "scene", item: null, value: { title: day === 0 ? "Night watch" : "The cellar" } }]));
+      const [scene] = await b.t.writes.run(() => writeStory(b.t.store, { user: USER, chat: CHAT, turn: turn.id, by: "author", agent: "author-1", job: null }, [{ part: "scene", item: null, value: { title: TITLES[day / 2] ?? "" } }]));
       scenes.push(scene?.item ?? "");
     }
     const r = await b.call(
@@ -145,7 +147,7 @@ describe("what a character's own agent starts with", () => {
     // His newest are whole beside it, so the call for all that waits ends at the last one that does.
     expect(outline).toStartWith(`### The rest of Bram's record, in outline\n\nPerceived earlier and not yet taken in: ${waiting.length} perceptions, ${line?.[2]} tokens. self_read reads them: part perceptions, to ${end}; with how gist, each by what they came to know by it.\n`);
     expect(outline).toMatch(/^- Sat 1 Mar 2031: 3 perceptions, \d+ tokens\. self_read reads them: part perceptions, day Sat 1 Mar 2031\.$/m);
-    expect(outline).toMatch(new RegExp(`^  - Night watch \\[${scenes[0]}\\]: 3 perceptions, \\d+ tokens\\. self_read reads them: part perceptions, day Sat 1 Mar 2031, scene ${scenes[0]}\\.$`, "m"));
+    expect(outline).toMatch(new RegExp(`^  - Scene ${scenes[0]}: 3 perceptions, \\d+ tokens\\. self_read reads them: part perceptions, day Sat 1 Mar 2031, scene ${scenes[0]}\\.$`, "m"));
     expect(outline).toMatch(new RegExp(`^    - \\[${ids[1]}\\] \\d+ tokens, Moment 0-1: KNOWN-0-1 the cellar door was bolted from outside\\.$`, "m"));
     // A perception that noted nothing learned is listed by its moment alone: nothing of what reached Bram is put in a line.
     expect(outline).toMatch(new RegExp(`^    - \\[${ids[0]}\\] \\d+ tokens, Moment 0-0, corrected$`, "m"));
@@ -156,7 +158,7 @@ describe("what a character's own agent starts with", () => {
     // The day the cut falls in: its line counts the one that waits, and its call ends there, so that it brings that one and not the two Bram holds whole already.
     expect(shown).toEqual(ids.slice(10));
     expect(outline).toMatch(new RegExp(`^- Tue 4 Mar 2031: 1 perception, \\d+ tokens\\. self_read reads them: part perceptions, day Tue 4 Mar 2031, to ${end}\\.$`, "m"));
-    expect(outline).toMatch(new RegExp(`^  - The cellar \\[${scenes[1]}\\]: 1 perception, \\d+ tokens\\. self_read reads them: part perceptions, day Tue 4 Mar 2031, scene ${scenes[1]}, to ${end}\\.$`, "m"));
+    expect(outline).toMatch(new RegExp(`^  - Scene ${scenes[1]}: 1 perception, \\d+ tokens\\. self_read reads them: part perceptions, day Tue 4 Mar 2031, scene ${scenes[1]}, to ${end}\\.$`, "m"));
     const brought = dataOf(await b.call("self_read", { part: "perceptions", day: "Tue 4 Mar 2031", scene: scenes[1] ?? "", to: end }, null, BRAM)).perceptions as JsonObject[];
     expect(brought.map((p) => p.id)).toEqual([end]);
     // Each line's size is the size of what its call brings, whole.
@@ -227,6 +229,29 @@ describe("what a character's own agent starts with", () => {
     // The same layout, for anyone else: the record's own fields, as the omniscient side reads them.
     const others = await castViews(["unprocessed-perceptions"], input(b, { layouts: { "unprocessed-perceptions": greedy } }));
     expect(view(others, "unprocessed-perceptions")).toContain(MISSED);
+  });
+
+  test("a scene is named to the character by its id, under its day, never by its title: the title is the story record's words, which no reading of the character's holds", async () => {
+    const { b, ids, scenes } = await backlog();
+    // A start that holds nothing whole: every perception waits, and the outline lays them out by day and by scene.
+    const views = await castViews(SHIPPED, input(b, { own: own({ newlyPerceivedTokens: 0 }) }));
+    const outline = view(views, "outline");
+    expect(outline).toMatch(new RegExp(`^  - Scene ${scenes[0]}: 3 perceptions, \\d+ tokens\\. self_read reads them: part perceptions, day Sat 1 Mar 2031, scene ${scenes[0]}\\.$`, "m"));
+    expect(outline).toMatch(new RegExp(`^  - Scene ${scenes[1]}: 3 perceptions, \\d+ tokens\\. self_read reads them: part perceptions, day Mon 3 Mar 2031, scene ${scenes[1]}\\.$`, "m"));
+    // A layout that prints every field it is given is given a scene's id, and no title to print.
+    const greedy: Layout = { render: (fields) => ({ text: JSON.stringify(fields) }) };
+    const dumped = await castViews(["outline"], input(b, { own: own(), layouts: { outline: greedy } }));
+    expect(view(dumped, "outline")).toContain(`"id":"${scenes[0]}"`);
+
+    // self_read opens a scene by its id. Asked by its title, or by words no scene has, it says how a scene is asked for, and names the scenes by id alone.
+    const byId = await b.call("self_read", { part: "perceptions", scene: scenes[0] ?? "" }, null, BRAM);
+    expect((dataOf(byId).perceptions as JsonObject[]).map((p) => p.id)).toEqual(ids.slice(0, 6));
+    for (const asked of [TITLES[0] ?? "", "the stables"]) {
+      expect(texts(await b.call("self_read", { part: "perceptions", scene: asked }, null, BRAM))).toEqual([`Nothing in perceptions is of the scene ${asked}: a scene is asked for by its id, as your outline names it. The latest scenes it holds: ${scenes[0]}, ${scenes[1]}.`]);
+    }
+    const answers = [byId, await b.call("self_read", {}, null, BRAM), await b.call("self_read", { part: "perceptions", how: "gist" }, null, BRAM), await b.call("self_read", { part: "perceptions", day: DAYS[2] ?? "" }, null, BRAM)];
+    const read = [...views.map((v) => v.text), ...dumped.map((v) => v.text), ...answers.map((r) => said(r))].join("\n");
+    expect(TITLES.filter((title) => read.includes(title))).toEqual([]);
   });
 
   test("with no size set and the list its definition named before, a character is handed what anyone is handed of it: every perception and every old file, whole", async () => {
@@ -347,7 +372,7 @@ describe("self_read", () => {
     expect(read[1]).toEqual({ id: ids[4] ?? "", moment: "Moment 1-1", reach: "part", content: `PERCEIVED-1-1 ${FILLER}`, knows: ["KNOWN-1-1 the cellar door was bolted from outside."], told_by: "Odile", message: 3, date: "Sun 2 Mar 2031, 8:00 AM" });
     for (const p of read) expect(Object.keys(p).filter((key) => !OWN_FIELDS.includes(key))).toEqual([]);
 
-    const scene = dataOf(await b.call("self_read", { part: "perceptions", scene: "the cellar" }, null, BRAM)).perceptions as JsonObject[];
+    const scene = dataOf(await b.call("self_read", { part: "perceptions", scene: scenes[1] ?? "" }, null, BRAM)).perceptions as JsonObject[];
     expect(scene.map((p) => p.id)).toEqual(ids.slice(6));
     expect(dataOf(await b.call("self_read", { part: "perceptions", scene: scenes[0] ?? "", day: DAYS[1] ?? "" }, null, BRAM)).perceptions).toEqual(read);
     const range = dataOf(await b.call("self_read", { part: "perceptions", id: ids[2] ?? "", to: ids[4] ?? "" }, null, BRAM)).perceptions as JsonObject[];
@@ -420,7 +445,7 @@ describe("self_read", () => {
   });
 
   test("reads the other parts of its own record: how it feels about people, what it knows, its history; says what a part is not read by; and gives every part with its size when none is named", async () => {
-    const { b, ids } = await backlog();
+    const { b, ids, scenes } = await backlog();
     const turn = await b.t.begin();
     expect((await b.call("relate", { relationships: [{ with: "Wren", text: "She pays on time.", trust: 40 }, { with: "Hale", text: "A cheat with a badge.\nHe has never once paid for his ale.", fear: 10 }] }, turn.id, BRAM)).error).toBeUndefined();
     expect((await b.call("cast_update", { operations: [{ op: "history", who: "Bram", text: "Took the inn over from his aunt." }, { op: "knowledge", who: "Bram", text: "The reeve's seal has a chipped corner.", how: "He saw it on the letter.", why: WHY }] }, turn.id)).error).toBeUndefined();
@@ -435,12 +460,12 @@ describe("self_read", () => {
     expect((dataOf(await b.call("self_read", { part: "knowledge", subject: "KNOWN-2-1" }, null, BRAM)).knowledge as JsonObject[])[0]).toMatchObject({ text: "KNOWN-2-1 the cellar door was bolted from outside.", told_by: "Odile" });
     expect(dataOf(await b.call("self_read", { part: "history" }, null, BRAM)).history).toEqual([expect.objectContaining({ text: "Took the inn over from his aunt." })]);
 
-    const stray = await b.call("self_read", { part: "history", scene: "Night watch" }, null, BRAM);
+    const stray = await b.call("self_read", { part: "history", scene: scenes[0] ?? "" }, null, BRAM);
     expect(stray.error).toBe(true);
     expect(texts(stray)).toEqual(["history is not read by scene. It is read by id, to, day, subject, skip."]);
     expect(texts(await b.call("self_read", { part: "game-side", name: "coin" }, null, BRAM))).toEqual(["game-side is not read by name. It is read whole, or with how gist."]);
     expect(texts(await b.call("self_read", { part: "perceptions", day: "Fri 7 Mar 2031" }, null, BRAM))[0]).toStartWith("Nothing in perceptions is of Fri 7 Mar 2031. The nearest days it holds: ");
-    expect(texts(await b.call("self_read", { part: "perceptions", scene: "The harbour" }, null, BRAM))[0]).toStartWith("Nothing in perceptions is of a scene called The harbour. The latest scenes it holds: Night watch [");
+    expect(texts(await b.call("self_read", { part: "perceptions", scene: "The harbour" }, null, BRAM))).toEqual([`Nothing in perceptions is of the scene The harbour: a scene is asked for by its id, as your outline names it. The latest scenes it holds: ${scenes[0]}, ${scenes[1]}.`]);
 
     const index = await b.call("self_read", {}, null, BRAM);
     expect(wordsFromFiles(index)).toBe(true);

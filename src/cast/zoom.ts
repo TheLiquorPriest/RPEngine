@@ -16,7 +16,6 @@ import type { ReadContext } from "../engine/registry";
 import { isRecord } from "../shared/json";
 import type { Store } from "../store";
 import { beatsAt } from "./beats";
-import type { SceneNamed } from "./facts";
 import { gameSide } from "./game";
 import { fileName, importedFiles, importedText, isFiled } from "./imported";
 import { type CastClock, datedAt } from "./kit";
@@ -341,8 +340,8 @@ export interface OutlineOf {
   held: readonly OwnPerception[];
   /** Story time as the reading shows it, for the day each perception is laid out under; null: none is. */
   clock: CastClock | null;
-  /** The scene each turn lies in (null: none), as the host read it from the story record; a turn it does not hold is in none. */
-  sceneOf: ReadonlyMap<string, SceneNamed | null>;
+  /** The scene each turn lies in, by its id (null: none), as the host read it from the story record; a turn it does not hold is in none. A scene is named by its id and laid out under its day, never by its title, which is the record's words and not the character's. */
+  sceneOf: ReadonlyMap<string, string | null>;
   /** Each memory's tier and its size. */
   memories: readonly { tier: "top" | "short" | "long"; tokens: number }[];
   /** Each person not here the character holds a relationship toward, by the name they go by now, with its size. */
@@ -360,7 +359,8 @@ export interface OutlineOf {
 }
 
 interface SceneNode {
-  scene: SceneNamed;
+  /** The scene's id. */
+  scene: string;
   leaves: OwnPerception[];
 }
 
@@ -412,7 +412,7 @@ export function outlineFields(of: OutlineOf): Fields | null {
       node.loose.push(p);
       continue;
     }
-    let held = node.scenes.find((s) => s.scene.id === scene.id);
+    let held = node.scenes.find((s) => s.scene === scene);
     if (held === undefined) node.scenes.push((held = { scene, leaves: [] }));
     held.leaves.push(p);
   }
@@ -443,7 +443,7 @@ export function outlineFields(of: OutlineOf): Fields | null {
         .filter((s) => listed.has(s))
         .map((s): JsonObject => {
           const items = lines(s.leaves);
-          return { id: s.scene.id, ...(s.scene.title !== null ? { title: s.scene.title } : {}), ...counted(sizes(s.leaves)), ...(items.length > 0 ? { items } : {}) };
+          return { id: s.scene, ...counted(sizes(s.leaves)), ...(items.length > 0 ? { items } : {}) };
         });
       const loose = lines(d.loose);
       return { ...(d.day !== null ? { day: d.day } : {}), ...counted(sizes(d.all)), ...(last !== undefined && heldOn.has(d.day) ? { to: last } : {}), ...(within.length > 0 ? { scenes: { items: within } } : {}), ...(loose.length > 0 ? { loose: { items: loose } } : {}) };

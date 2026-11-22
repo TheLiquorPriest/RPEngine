@@ -18,7 +18,6 @@ import type { ReadContext } from "../engine/registry";
 import { isRecord } from "../shared/json";
 import type { Store } from "../store";
 import { beatsAt } from "./beats";
-import type { SceneNamed } from "./facts";
 import { CAST_DEFAULTS, type CastClock, castClock, type CastSettings, type CastStart, datedAt } from "./kit";
 import { memoryView } from "./memories";
 import { castAt } from "./path";
@@ -85,8 +84,12 @@ export interface CastViewInput {
    * may know. Absent, or for any other character: every view whole, as the turn's folder, the briefing and the omniscient side read them.
    */
   own?: CastStart & { plays: string; foldTokens: number };
-  /** The scene each of these turns lies in (null: none), as the host reads it from the story record, which the cast may not read: what the outline lays perceptions out by under their day. Absent: by day alone. */
-  scenes?: (turns: readonly string[]) => ReadonlyMap<string, SceneNamed | null>;
+  /**
+   * The scene each of these turns lies in (null: none), by its id, as the host reads it from the story record, which the cast may not
+   * read: what the outline lays perceptions out by under their day. A scene's title is the record's words, never the character's, so
+   * none is given. Absent: by day alone.
+   */
+  scenes?: (turns: readonly string[]) => ReadonlyMap<string, string | null>;
 }
 
 export interface CastView {

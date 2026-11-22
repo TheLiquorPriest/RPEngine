@@ -66,7 +66,7 @@ own_no_file: You carry no old mind file {{name}} that waits to be filed.{{#files
 own_no_days: Nothing in {{part}} has a date, so none of it is read by day. Ask by id{{#scenes}} or by scene{{/scenes}}.
 own_unknown_day: Nothing in {{part}} is of {{day}}.{{#days}} The nearest days it holds: {{days}}.{{/days}}
 own_no_scenes: No scene is recorded for anything in {{part}}. Ask by id or by day.
-own_unknown_scene: Nothing in {{part}} is of a scene called {{scene}}.{{#scenes}} The latest scenes it holds: {{scenes}}.{{/scenes}}
+own_unknown_scene: Nothing in {{part}} is of the scene {{scene}}: a scene is asked for by its id, as your outline names it.{{#scenes}} The latest scenes it holds: {{scenes}}.{{/scenes}}
 own_no_side: The world holds no person you are: none is tied to you, and your name finds no one, or more than one.
 own_side_names: This is your game side by name and count{{#whole}}: {{shown}} tokens of {{whole}}{{/whole}}. {{tool}} with part game-side and no how reads all of it.
 own_gists: {{#one}}This is its gist{{/one}}{{^one}}These are {{items}} gists{{/one}}: what your record holds that stands for each entry{{#first}}; where one has none, first is the first line of its text, which is no gist{{/first}}.{{#whole}} This shows {{shown}} tokens of {{whole}}; tokens is the size of each whole.{{/whole}} {{tool}} with the same part and an id reads one whole.

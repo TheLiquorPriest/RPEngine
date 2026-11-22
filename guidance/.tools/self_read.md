@@ -6,7 +6,7 @@ arguments:
   id: "One entry, by its id. With to, the first of a range."
   to: "The last id of a range that starts at id, both read. Alone, everything up to it."
   day: "perceptions, memories, history: only those of this day, written as your outline writes it."
-  scene: "perceptions: only those of this scene, by its id or its title, as your outline names it."
+  scene: "perceptions: only those of this scene, by its id, as your outline names it."
   name: "imported: the file's name (core.md; minds for the notes the older minds pack kept). relationships: the person. memories, knowledge: only what is about this person or thing, or what they told you."
   subject: "Only entries that hold all of these words."
   tier: "memories: only those at the top of your mind (top), from lately (short) or from longer ago (long)."

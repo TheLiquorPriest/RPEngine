@@ -18,7 +18,6 @@ import { clockRecorded, JoinedTurnError, type Store, StoreInputError, type UserS
 import { castAt } from "./path";
 import { IMPORTED_KIND } from "./carried";
 import { importedText } from "./imported";
-import type { SceneNamed } from "./facts";
 import { type BaseVersion, type CastItem, CastRecord, type Character, chatLine } from "./record";
 import type { MemorySearch } from "./search";
 import type { BookReader, SecretFactOf } from "./secrets";
@@ -192,10 +191,11 @@ export interface CastDeps {
   /** A text's tokens at the chat's characters to a token (RPH's `tokens.charsPerToken`): what an answer counts the size of what it names by (plan 3.2 §7.1). Absent: no size is said. */
   tokens?: (text: string) => number;
   /**
-   * The scene each of `turns` lies in as the story record stands at a reading of the chat (`at`: a turn, or its head for null); null
-   * for a turn in none. The story record is the host's to read (the cast may not), so the host says it. Absent: nothing is read by scene.
+   * The scene each of `turns` lies in as the story record stands at a reading of the chat (`at`: a turn, or its head for null), by its
+   * id; null for a turn in none. The story record is the host's to read (the cast may not), so the host says it, and names a scene by its
+   * id alone: its title is the record's words, which `self_read` never gives the character. Absent: nothing is read by scene.
    */
-  scenes?: (scope: { user: string; chat: string }, at: string | null, turns: readonly string[]) => ReadonlyMap<string, SceneNamed | null>;
+  scenes?: (scope: { user: string; chat: string }, at: string | null, turns: readonly string[]) => ReadonlyMap<string, string | null>;
   /** Milliseconds since 1970, for a row's time; `Date.now` when absent. */
   now?: () => number;
 }
