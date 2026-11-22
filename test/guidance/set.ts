@@ -62,7 +62,7 @@ export function placeOf(rpePath: string): string {
 export interface LoaderGuidance extends Guidance {
   problems(): Promise<{ path: string; message: string }[]>;
   rules(): Promise<{ name: string; path: string; inForce: boolean; why?: string }[]>;
-  definition(name: string): Promise<{ model?: string; effort?: string; tools: string[]; reads: string[]; outOfReach: string[]; writer?: string } | undefined>;
+  definition(name: string): Promise<{ model?: string; effort?: string; tools: string[]; reads: string[]; outOfReach: string[]; writer?: string; starts?: string[] } | undefined>;
   stack(agent: string): Promise<{ entries: { kind: string; where: string; left?: unknown; text?: string }[] }>;
 }
 
@@ -118,7 +118,7 @@ export async function openSet(texts: ReadonlyMap<string, string>, options: SetOp
       if (listed === undefined) return undefined;
       // What a definition keeps out of its agents' reach is its header's `out_of_reach:`; the listing does not carry it.
       const outOfReach = split(texts.get(`.agents/${name}.md`) ?? "").header?.out_of_reach;
-      return { ...(listed.model === undefined ? {} : { model: listed.model }), ...(listed.effort === undefined ? {} : { effort: listed.effort }), tools: listed.tools, reads: listed.reads, outOfReach: Array.isArray(outOfReach) ? outOfReach.map(String) : [], ...(listed.writer === undefined ? {} : { writer: listed.writer }) };
+      return { ...(listed.model === undefined ? {} : { model: listed.model }), ...(listed.effort === undefined ? {} : { effort: listed.effort }), tools: listed.tools, reads: listed.reads, outOfReach: Array.isArray(outOfReach) ? outOfReach.map(String) : [], ...(listed.writer === undefined ? {} : { writer: listed.writer }), ...(listed.starts === undefined ? {} : { starts: listed.starts }) };
     },
     stack: async (agent) => ({ entries: await harness.definitions.stack(SCOPE, agent) }),
   });

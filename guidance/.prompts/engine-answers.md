@@ -8,6 +8,7 @@ scope_gone: This call belongs to {{what}} {{id}}, which takes no more changes: i
 turn_joined: Turn {{id}} was joined to turn {{into}}, which holds its changes now; turn {{id}} itself is not read, so how things stand is not shown. Address turn {{into}}.
 engine_fault: {{tool}} failed in the engine, not in your call: the fault is in RPE's log. Nothing was recorded.
 no_chat_run: {{tool}} works on a chat's world, and this run belongs to no chat: nothing was done.
+question_none: {{tool}} handed your question to nobody: a question is answered by a reader, and you are given none (a reader has none of its own). Call it again without the question and read the answer yourself.
 receipt_kept: This is {{tool}}'s receipt. Its whole answer, {{chars}} characters, is in {{path}}.
 receipt_left: {{left}} of the {{of}} ids {{tool}} wrote under are left out of this receipt, to hold it to its size; the file lists them all.
 nothing_of_kind: Nothing that is {{sought}} is recorded in this world, so there is nothing near it. world_search finds what is recorded, by words.
