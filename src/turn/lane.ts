@@ -598,6 +598,7 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
       },
       playerMind: async (scope) => playerMindOf(readConfig(await portTexts(files, scope), app.log, [CAST_PLAYER_MIND])),
       settings: async (scope) => (await turnSettings(files, scope, app.log)).cast,
+      tokens: async (scope) => tokenCount((await turnSettings(files, scope, app.log)).charsPerToken),
     }),
   );
   // What time brings due over the store's states: listed by the world state's due section and by an answer that lets time pass.

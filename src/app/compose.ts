@@ -43,7 +43,7 @@ import { storyArea } from "../story/area";
 import { treeArea } from "../tree/area";
 import { levelFiles, MOUNTS, NO_CHAT, OwnFiles, RPE_GUIDANCE, treeReader } from "../tree";
 import { GLOBAL_FOLDERS } from "../tree/layout";
-import { MACHINE_CLOCK, NO_SESSION, turnSettings, type Turns } from "../turn";
+import { MACHINE_CLOCK, NO_SESSION, tokenCount, turnSettings, type Turns } from "../turn";
 import { turnArea } from "../turn/area";
 import { globalConfig } from "../turn/settings";
 import { bootstrapArea } from "../turn/bootstrap/area";
@@ -354,7 +354,14 @@ export function compose(options: ComposeOptions = {}): Composition {
       turns: made,
       carried: async (app, user) => (lastReport(app.db, user)?.imports ?? []).filter((c) => c.outcome === "imported" || c.outcome === "replaced").map((c) => c.chatId),
     }),
-    castArea(() => ({ store: made().store, files, settings: async (user, chat) => (await settings(user, chat)).cast, sources: made().sources })),
+    castArea(() => ({
+      store: made().store,
+      files,
+      settings: async (user, chat) => (await settings(user, chat)).cast,
+      sources: made().sources,
+      // How large what waits for a character's agent is, counted as the chat counts tokens.
+      tokens: async (user, chat) => tokenCount((await settings(user, chat)).charsPerToken),
+    })),
     storyArea(() => ({
       store: made().store,
       files,

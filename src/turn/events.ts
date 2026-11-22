@@ -31,7 +31,7 @@
 import type { Database } from "bun:sqlite";
 import { type Fields, type Guidance, loadGuidance, type TemplatePart } from "../app/guidance";
 import type { AgentRef, AttachMoment, ConsentGrant, ContextBlock, FilesPort, GapCheck, JobView, JsonObject, Log, RuleFiring, RunScope, Scope, TurnEvents } from "rp-harness/contract";
-import { castViews, type MemorySearch, type SourceReader } from "../cast";
+import { castViews, type MemorySearch, type SourceReader, TAKE_IN_PART, TAKE_IN_VIEW, takeInViews, viewNames } from "../cast";
 import { mapView, mapWording, noMapWords, rulesetData, rulesetParts, rulesetPlayed } from "../iface";
 import { LORE_BATCH, LORE_KNOWN, LORE_PLAN, type LoreIndex, type LoreProposals, loreBatchBlock, loreBatchNumber, loreKnownBlock, loreLines, loreNumberedBlock, lorePlanBlock } from "../lore";
 import { type DueSource, type Lane, type Part, readPart, type Store, type ViewLine, wordLine, worldState, type WorldStateBlock, worldStateFolds } from "../store";
@@ -298,6 +298,18 @@ const CAST_NAMED = /^cast:([^()]+)\((.*)\)$/;
 const SELF = "self";
 
 /**
+ * Whether a name is a character's own to hold (plan §7, §9.4): its own views of the cast (`cast:self(…)`, or `cast:` by its own name) and the
+ * lore bound as known to it. What an agent that plays the character names in a call of its own is handed on only where this holds (RPH's
+ * `AttachMoment.handedBy`): the scene as the world state has it, the story record, the ruleset, the chat's lore to index and another
+ * character's record are the omniscient side's, which a character's agent is given by the Author or not at all.
+ */
+function ownTo(character: string, ref: string): boolean {
+  if (ref === LORE_KNOWN) return true;
+  const named = CAST_NAMED.exec(ref)?.[1]?.trim();
+  return named !== undefined && (named === SELF || named.toLowerCase() === character.trim().toLowerCase());
+}
+
+/**
  * The cast's views that `ref` names of a character (by its name, or `self` for the one `agent` plays), each laid out by its part in
  * force for the chat, one after another; with nothing in any of them (the cast holds no record of the character yet), each one's part
  * for nothing, as for an agent of nobody given `cast:self(…)`. Null when the ref is not the cast's, or no part lays out a view it names.
@@ -308,11 +320,9 @@ async function castNamed(deps: EventsDeps, scope: Scope, agent: AgentRef, ref: s
   const named = said?.[1]?.trim();
   if (said?.[2] === undefined || named === undefined || named === "") return null;
   const character = named === SELF ? agent.plays : named;
-  const names = said[2]
-    .split(",")
-    .map((name) => name.trim())
-    .filter((name) => name !== "");
-  const [layouts, settings] = await Promise.all([castLayouts(loadGuidance(deps.files, scope), names), turnSettings(deps.files, scope, deps.log)]);
+  const names = viewNames(said[2]);
+  const guidance = loadGuidance(deps.files, scope);
+  const [layouts, settings, plan] = await Promise.all([castLayouts(guidance, names), turnSettings(deps.files, scope, deps.log), names.includes(TAKE_IN_VIEW) ? guidance.part(TAKE_IN_PART) : undefined]);
   const none = (fields: Fields): string | null => {
     const words = names.flatMap((name) => {
       const layout = layouts[name as keyof typeof layouts];
@@ -323,24 +333,21 @@ async function castNamed(deps: EventsDeps, scope: Scope, agent: AgentRef, ref: s
   if (character === undefined) return none({});
   const turn = scope.turn ?? null;
   const stage = stageAt(deps.store, scope.user, scope.chat, turn);
+  const read = { store: deps.store, user: scope.user, chat: scope.chat, turn, job: agent.job ?? null, character, tokens: tokenCount(settings.charsPerToken), settings: settings.cast };
   const views = await castViews(names, {
-    store: deps.store,
-    user: scope.user,
-    chat: scope.chat,
-    turn,
-    job: agent.job ?? null,
-    character,
+    ...read,
     present: stage?.who ?? [],
     // What comes to mind is cued by who and what is really there (R-144): the stage's place and things, and what the moment the lead handed the agent names.
     cues: [...new Set([...(stage === null ? [] : stageCues(stage)), ...namedIn(deps.store, scope.user, scope.chat, turn, [moment.task, moment.message ?? ""])])],
     sources: deps.sources,
     ...(deps.search !== undefined ? { search: deps.search } : {}),
     layouts,
-    tokens: tokenCount(settings.charsPerToken),
-    settings: settings.cast,
   });
-  const text = views
-    .map((view) => view.text)
+  // What waits to be taken in, as work, and the views that take an argument (`src/cast/take-in.ts`): each in its place among the names.
+  const waiting = takeInViews(names, read, { ...(plan?.format === "template" ? { plan } : {}), ...(layouts["unprocessed-perceptions"] !== undefined ? { perceptions: layouts["unprocessed-perceptions"] } : {}), ...(layouts.imported !== undefined ? { imported: layouts.imported } : {}) });
+  const texts = new Map<string, string>([...views, ...waiting].map((view) => [view.name, view.text]));
+  const text = names
+    .map((name) => texts.get(name) ?? "")
     .filter((text) => text.trim() !== "")
     .join("\n\n");
   return text !== "" ? text : none({ name: character });
@@ -489,8 +496,11 @@ export function turnEvents(deps: EventsDeps): TurnEvents {
         return given;
       }
       // A view RPE gives is given even with nothing in it, in its file's words for that. Every name none of RPE's spaces gives is left
-      // out, and RPH says so. What cannot be read leaves out its name alone.
-      const given = await givenViews(deps, at, agent, refs.flatMap(({ ref, own }) => (own ? [] : [ref])), moment);
+      // out, and RPH says so. What cannot be read leaves out its name alone. A name the call of an agent that plays a character added
+      // is given only where it is that character's own to hold (`ownTo`): the rest is left out as a name nothing gives.
+      const { handedBy } = moment;
+      const asked = refs.flatMap(({ ref, own, from }) => (own || (handedBy !== undefined && from === "delegate" && !ownTo(handedBy, ref)) ? [] : [ref]));
+      const given = await givenViews(deps, at, agent, asked, moment);
       return given.flatMap(({ ref, text }) => (text === null ? [] : [{ name: ref, text }]));
     },
     consent: (scope, grant) => keep(scope, "consent", grant.by, grant.topic, grant),

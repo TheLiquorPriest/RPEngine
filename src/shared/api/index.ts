@@ -544,9 +544,11 @@ export interface CastStrikeReply {
   notes: string[];
 }
 
-/** What waits for a character's own agent at the reading: how many of its perceptions of turns RPE played it has not taken in, the reply of the oldest one's turn (null: none waits, or that turn's reply is not on the path), the turns RPE played since that turn (the one read included), and its last dream (null: it never dreamt), with that turn's reply and its date in story time where the chat's clock shows one. */
+/** What waits for a character's own agent at the reading: how many of its perceptions of turns RPE played it has not taken in, how large they are as the chat counts tokens and how many batches its agent would take them in as by the setting cast.takeInTokens (both absent where no count is at hand), the reply of the oldest one's turn (null: none waits, or that turn's reply is not on the path), the turns RPE played since that turn (the one read included), and its last dream (null: it never dreamt), with that turn's reply and its date in story time where the chat's clock shows one. */
 export interface CastWaits {
   perceptions: number;
+  tokens?: number;
+  batches?: number;
   since: number | null;
   turns: number;
   dreamt: { message: number | null; date: string | null } | null;
@@ -3792,9 +3794,15 @@ export interface TagCheck {
 /** A tag check asked for: the job it runs as, at once; or why none was started (jobs off, the day's count or tokens reached, no such connection, the check's part missing or not as it needs, his job-start hook). */
 export type TagCheckStarted = { job: JobView } | { refusal: JobRefusal };
 
-/** The character whose own agent is to take in what it has perceived and not yet taken in, by its name as the cast holds it. */
+/** The characters whose own agents are to take in what each has perceived and not yet taken in, by their names as the cast holds them: one character, several, or every one that holds any. A job is started for each. */
 export interface TakeInAsk {
-  character: string;
+  characters: string[];
+}
+
+/** The jobs started, one for each character, each as it stands after the call; and the characters no job was started for, each with why. */
+export interface TakeInReply {
+  jobs: { character: string; job: JobView }[];
+  refused: { character: string; why: string }[];
 }
 
 /** The hash of the provider key today's connections hold, which RPE takes over at the swap, with the model names those connections name, which the key opens. */
@@ -5031,12 +5039,12 @@ export interface ApiRoutes {
     long: false;
     joined: false;
   };
-  /** He starts a job of the chat, as his own and tied to no turn, in which a character's own agent (the character definition, playing the character he names) takes in what it has perceived and not yet taken in, briefed by the line take_in of `.prompts/cast-jobs.md`. */
+  /** He starts jobs of the chat, as his own and tied to no turn, one for each character he names: in each, the character's own agent (the character definition, playing that character, started for the purpose take-in) takes in what it has perceived and not yet taken in, briefed by the line take_in of `.prompts/cast-jobs.md`. Where a great deal waits, its agent hands it out in batches to instances of itself (the setting cast.takeInTokens). A character whose job could not be started is answered with why, and the others' jobs are started all the same. */
   "POST /api/v1/chats/:chat/jobs/take-in": {
     params: { chat: string };
     query: Record<string, never>;
     body: TakeInAsk;
-    reply: JobReply;
+    reply: TakeInReply;
     paged: false;
     long: false;
     joined: false;

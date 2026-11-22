@@ -78,6 +78,11 @@ function told(b: TurnBed, line: string): number {
   return b.model.requests.filter((r) => JSON.stringify(r.messages).includes(line)).length;
 }
 
+/** The Author's requests that hold a line of a shape: one that says a size, which is the chat's own count. */
+function toldLike(b: TurnBed, line: RegExp): number {
+  return b.model.requests.filter((r) => line.test(JSON.stringify(r.messages))).length;
+}
+
 /** Each call answered from its own agent's list: a character's agent holds `remember`, the Author does not. */
 function routed(author: Answer[], hers: Answer[]): Answer[] {
   const route: Answer = (request) => {
@@ -158,7 +163,7 @@ test("memory-owed: a run that ends with a principal it voiced holding what it pe
   beds.push(b);
   const turn = await play(b, "I ask whether the boat came.");
   expect(told(b, "were on stage this turn and hold perceptions their own agent has not taken in: Wren Hale.")).toBeGreaterThan(0);
-  expect(told(b, "- Wren Hale (principal): 1 waiting, the oldest of this turn.")).toBeGreaterThan(0);
+  expect(toldLike(b, /- Wren Hale \(principal\): 1 waiting, about \d+ tokens, the oldest of this turn\./)).toBeGreaterThan(0);
   // Every shipped rule in force passed the harness's check of what its text shows when the run began, the names an item of a list gives among them.
   expect(b.logged.filter((l) => l.message === "A rule cannot be used.")).toEqual([]);
   expect(fired(b, turn)).toEqual(["memory-owed"]);
@@ -191,7 +196,7 @@ test("memory-late: what a principal still holds from an earlier turn is in the n
   const second = await play(b, "I watch her work.");
   expect(fired(b, second)).toEqual(["memory-late"]);
   expect(told(b, LATE)).toBeGreaterThan(0);
-  expect(told(b, "- Wren Hale (principal): 1 waiting, the oldest of message ")).toBeGreaterThan(0);
+  expect(toldLike(b, /- Wren Hale \(principal\): 1 waiting, about \d+ tokens, the oldest of message /)).toBeGreaterThan(0);
   expect(wrenAt(b, second).untaken).toEqual([]);
 
   const third = await play(b, "I wait.");
@@ -218,7 +223,7 @@ test("memory-scene-end: a scene closed with a principal's perceptions waiting is
   const second = await play(b, "I go down the stairs.");
   expect(fired(b, second)).toEqual(["memory-scene-end"]);
   expect(told(b, ENDED)).toBeGreaterThan(0);
-  expect(told(b, "- Wren Hale (principal): 1 waiting, of Night watch.")).toBeGreaterThan(0);
+  expect(toldLike(b, /- Wren Hale \(principal\): 1 waiting, about \d+ tokens, of Night watch\./)).toBeGreaterThan(0);
   await b.until("the job to end", async () => (await b.turns.harness.jobs.list({ user: USER, chat: CHAT })).jobs.find((j) => j.ended !== undefined));
 
   const third = await play(b, "I wait.");
@@ -269,12 +274,17 @@ test("the Cast page's press: the cast list and the Turn page's record say what w
   expect(before?.perceptions).toHaveLength(1);
   expect(before?.untaken).toEqual(before?.perceptions);
 
-  const list = await b.page<{ characters: { name: string; waits: { perceptions: number; dreamt: unknown } }[] }>("GET", `/api/v1/chats/${CHAT}/cast`);
-  expect(list.body.characters.find((c) => c.name === WREN)?.waits).toMatchObject({ perceptions: 1, dreamt: null });
-  const started = await b.page<{ job: { agent: string; plays?: string; for?: string; startedBy: unknown } }>("POST", `/api/v1/chats/${CHAT}/jobs/take-in`, { character: WREN });
+  // What waits is said with its size, as the chat counts tokens, and how many batches her agent would take it in as.
+  const list = await b.page<{ characters: { name: string; waits: { perceptions: number; tokens?: number; batches?: number; dreamt: unknown } }[] }>("GET", `/api/v1/chats/${CHAT}/cast`);
+  const waits = list.body.characters.find((c) => c.name === WREN)?.waits;
+  expect(waits).toMatchObject({ perceptions: 1, batches: 1, dreamt: null });
+  expect(waits?.tokens).toBeGreaterThan(0);
+  const started = await b.page<{ jobs: { character: string; job: { agent: string; plays?: string; for?: string; startedBy: unknown } }[]; refused: unknown[] }>("POST", `/api/v1/chats/${CHAT}/jobs/take-in`, { characters: [WREN] });
   expect(started.status).toBe(200);
-  // It names what it is started for (plan 3.2 §6.3): its use is counted under it, and the character's definition may hand it a list of its own for it.
-  expect(started.body.job).toMatchObject({ agent: "character", plays: WREN, for: "take-in", startedBy: "user" });
+  // It names what it is started for (plan 3.2 §6.3): its use is counted under it, and the character's definition hands it what waits as work.
+  expect(started.body.refused).toEqual([]);
+  expect(started.body.jobs).toHaveLength(1);
+  expect(started.body.jobs[0]).toMatchObject({ character: WREN, job: { agent: "character", plays: WREN, for: "take-in", startedBy: "user" } });
   await b.until("the job to end", async () => (await b.turns.harness.jobs.list({ user: USER, chat: CHAT })).jobs.find((j) => j.ended !== undefined && j.state === "done"));
   expect(told(b, "Take in what you have perceived and not yet taken in.")).toBeGreaterThan(0);
 
