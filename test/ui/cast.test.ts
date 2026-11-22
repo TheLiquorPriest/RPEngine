@@ -7,7 +7,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { h } from "preact";
-import type { CastStrikeReply, CharacterReply, EntryRow, PerceptionRecordReply } from "../../src/shared/api";
+import type { CastStrikeReply, CharacterReply, EntryRow, JobView, PerceptionRecordReply } from "../../src/shared/api";
 import { PAGES } from "../../src/ui/page-list";
 import { type CastShown, CastView, NO_CAST, readCast } from "../../src/ui/pages/cast";
 import { hashOf, routeOfHash } from "../../src/ui/web";
@@ -30,7 +30,7 @@ function view(shown: Partial<CastShown>, gateOpen = false) {
       onMore: (list, skip) => pressed.push(["more", list, skip]),
       onNewest: () => pressed.push("newest"),
       onDraft: (name, value) => pressed.push(["draft", name, value]),
-      onTakeIn: (step) => pressed.push(["take in", step]),
+      onTakeIn: (step, who) => pressed.push(who === undefined ? ["take in", step] : ["take in", step, who]),
     }),
   );
   return { tree, text: textOf(tree), pressed };
@@ -83,19 +83,52 @@ describe("the Cast page", () => {
     press(first.tree, "Have its agent take them in now");
     expect(first.pressed).toEqual([["take in", "ask"]]);
 
-    const asked = view({ ...opened, takeIn: { stage: "asked", runsOn: { connection: { id: "conn-1", name: "Ferry deep" }, model: "model-a", effort: null, sent: null }, job: null, problem: null } }, true);
+    const asked = view({ ...opened, takeIn: { who: ["Odile Holt"], stage: "asked", runsOn: { connection: { id: "conn-1", name: "Ferry deep" }, model: "model-a", effort: null, sent: null }, jobs: [], refused: [], problem: null } }, true);
     expect(section(asked.tree, "waits")).toContain("This starts a job of yours: the character definition, playing Odile Holt, on connection Ferry deep, model model-a. Its agent is given the 1 perception it has not taken in and writes from them; what it writes counts from the next turn.");
     press(asked.tree, "Start it");
     press(asked.tree, "Not now");
     expect(asked.pressed).toEqual([["take in", "go"], ["take in", "cancel"]]);
 
     // No connection resolves for the definition: it is said, and Start it is not live.
-    const none = view({ ...opened, takeIn: { stage: "asked", runsOn: { connection: null, model: null, effort: null, sent: null }, job: null, problem: null } }, true);
+    const none = view({ ...opened, takeIn: { who: ["Odile Holt"], stage: "asked", runsOn: { connection: null, model: null, effort: null, sent: null }, jobs: [], refused: [], problem: null } }, true);
     expect(section(none.tree, "waits")).toContain("on no connection: none resolves for it in this chat, so it will not start.");
     expect(elements(none.tree).find((e) => e.type === "button" && textOf(e.props.children) === "Start it")?.props.disabled).toBe(true);
 
     // Read at an earlier turn, there is no press.
     expect(elements(view({ ...opened, at: "turn-3" }, true).tree).some((e) => e.type === "button" && textOf(e.props.children) === "Have its agent take them in now")).toBe(false);
+  });
+
+  test("the list says which principals hold perceptions not taken in and how large they are, and one press starts a job for each: it asks first, naming each with its size, then says what was started and what was not", () => {
+    // Two principals hold something: one a backlog its agent takes in as two batches.
+    const principal = { as: "principal" as const, pinned: false, line: null };
+    const list = {
+      ...CAST,
+      characters: CAST.characters.map((m, at) => ({ ...m, casting: m.casting ?? principal, waits: at === 0 ? { ...m.waits, perceptions: 412, tokens: 41000, batches: 2 } : { ...m.waits, perceptions: 3, tokens: 900, batches: 1 } })),
+    };
+    const [first, second] = list.characters.map((m) => m.name) as [string, string];
+    const shown = view({ list }, true);
+    expect(section(shown.tree, "waits-all")).toContain("2 principals hold 415 perceptions their own agents have not taken in, about 41,900 tokens.");
+    press(shown.tree, "Have their agents take them in now");
+    expect(shown.pressed).toEqual([["take in", "ask", [first, second]]]);
+
+    const runsOn = { connection: { id: "conn-1", name: "Ferry deep" }, model: "model-a", effort: null, sent: null };
+    const asked = view({ list, takeIn: { who: [first, second], stage: "asked", runsOn, jobs: [], refused: [], problem: null } }, true);
+    const words = section(asked.tree, "waits-all");
+    expect(words).toContain("This starts 2 jobs of yours, one for each character: the character definition, playing it, on connection Ferry deep, model model-a.");
+    expect(words).toContain(`${first}: 412 perceptions, about 41,000 tokens, which its agent hands to instances of itself in 2 batches`);
+    expect(words).toContain(`${second}: 3 perceptions, about 900 tokens`);
+    press(asked.tree, "Start them");
+    expect(asked.pressed).toEqual([["take in", "go"]]);
+
+    // One started and one not: both are said, the one not started with why.
+    const job = { id: "job-7" } as JobView;
+    const done = view({ list, takeIn: { who: [first, second], stage: "started", runsOn: null, jobs: [{ character: first, job }], refused: [{ character: second, why: "Jobs are switched off." }], problem: null } }, true);
+    expect(banners(done.tree).map((b) => b.title)).toEqual(["Job job-7 started", "Not started for everyone"]);
+    expect(section(done.tree, "waits-all")).toContain(`${second}: Jobs are switched off.`);
+
+    // No principal holds anything: the list shows no such section. One who is no principal is started from its own page.
+    const quiet = view({ list: { ...CAST, characters: CAST.characters.map((m, at) => ({ ...m, casting: at === 0 ? null : m.casting, waits: { ...m.waits, perceptions: at === 0 ? 5 : 0 } })) } }, true);
+    expect(elements(quiet.tree).some((e) => e.props["data-section"] === "waits-all")).toBe(false);
   });
 
   test("one character opened shows its whole record: the base in force and its earlier versions, memories with tier, strength and fading, struck entries as struck, and every carried mind file word for word with its filed mark", () => {

@@ -124,7 +124,16 @@ const CHARACTER_DEFINITION = "character";
 /** The purpose a character's own agent is started for when it takes in what it perceived (plan 3.2 §6.3): its definition's list for it, where it has one. */
 const TAKE_IN_PURPOSE = "take-in";
 
-const takeInAsk = shape.named("TakeInAsk", "The character whose own agent is to take in what it has perceived and not yet taken in, by its name as the cast holds it.", shape.object({ character: shape.text({ blank: false }) }));
+const takeInAsk = shape.named(
+  "TakeInAsk",
+  "The characters whose own agents are to take in what each has perceived and not yet taken in, by their names as the cast holds them: one character, several, or every one that holds any. A job is started for each.",
+  shape.object({ characters: shape.list(shape.text({ blank: false })) }),
+);
+const takeInReply = shape.named(
+  "TakeInReply",
+  "The jobs started, one for each character, each as it stands after the call; and the characters no job was started for, each with why.",
+  shape.object({ jobs: shape.list(shape.object({ character: T, job: jobView })), refused: shape.list(shape.object({ character: T, why: T })) }),
+);
 export const jobReply = shape.named("JobReply", "A job as it stands after the call.", shape.object({ job: jobView }));
 
 const runUsage = shape.named(
@@ -269,15 +278,24 @@ export function jobRoutes(deps: JobRoutesDeps) {
       path: "/api/v1/chats/:chat/jobs/take-in",
       access: "page",
       group: "jobs",
-      does: "He starts a job of the chat, as his own and tied to no turn, in which a character's own agent (the character definition, playing the character he names) takes in what it has perceived and not yet taken in, briefed by the line take_in of `.prompts/cast-jobs.md`.",
+      does: "He starts jobs of the chat, as his own and tied to no turn, one for each character he names: in each, the character's own agent (the character definition, playing that character, started for the purpose take-in) takes in what it has perceived and not yet taken in, briefed by the line take_in of `.prompts/cast-jobs.md`. Where a great deal waits, its agent hands it out in batches to instances of itself (the setting cast.takeInTokens). A character whose job could not be started is answered with why, and the others' jobs are started all the same.",
       body: takeInAsk,
-      reply: jobReply,
+      reply: takeInReply,
       handle: async ({ user, params, body }) => {
         const scope: Scope = { user, chat: params.chat, session: NO_SESSION };
+        const names = [...new Set(body.characters.map((name) => name.trim()).filter((name) => name !== ""))];
+        if (names.length === 0) throw new RouteError(400, "No job was started: no character was named.");
         const part = await loadGuidance(turns.files, scope).part(CAST_JOBS_PART);
-        const brief = part?.format === "lines" ? part.line("take_in", { name: body.character }) : undefined;
-        if (brief === undefined || brief.trim() === "") throw new RouteError(409, `No job was started: the part ${CAST_JOBS_PART} is switched off or has no line take_in, which briefs the job.`);
-        return { job: viewOrThrow(await jobs.start(scope, { agent: CHARACTER_DEFINITION, brief, plays: body.character, for: TAKE_IN_PURPOSE }), "No job was started") };
+        const started: { character: string; job: JobView }[] = [];
+        const refused: { character: string; why: string }[] = [];
+        for (const character of names) {
+          const brief = part?.format === "lines" ? part.line("take_in", { name: character }) : undefined;
+          if (brief === undefined || brief.trim() === "") throw new RouteError(409, `No job was started: the part ${CAST_JOBS_PART} is switched off or has no line take_in, which briefs the job.`);
+          const answer = await jobs.start(scope, { agent: CHARACTER_DEFINITION, brief, plays: character, for: TAKE_IN_PURPOSE });
+          if ("refused" in answer) refused.push({ character, why: refusalWords(answer) });
+          else started.push({ character, job: answer });
+        }
+        return { jobs: started, refused };
       },
     }),
     route({

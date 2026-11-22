@@ -55,6 +55,8 @@ export const CAST_DEFAULTS = Object.freeze({
   comesToMindTokens: 2000,
   /** What an outline of a character's record may fill, in tokens: past it, the rest is counted with its size and the call that reads it. */
   outlineTokens: 1500,
+  /** What one batch of a backlog may hold, in tokens, where a character's agent takes in what it perceived (plan 3.2 §6.5): what waits is cut into batches of at most this, each for one instance of the agent. */
+  takeInTokens: 30000,
   /** The most memories one recall brings back; the answer says how many more touch the cue. */
   recallItems: 10,
   /** The scale a relationship's dimensions are read and reported against: from minus this to this (`src/packs/relationships/core/index.ts:41-45` keeps today's regard on it). */
@@ -82,6 +84,7 @@ export const CAST_SETTING_DEFS = {
   dreamKeep: { key: "cast.dreamKeep", default: CAST_DEFAULTS.dreamKeep, takes: { type: "whole", least: 0 }, perConnection: false, name: "Weight a dream adds", about: "The weight a memory gains when a dream keeps it.", effect: "turn" },
   memoryWeight: { key: "cast.memoryWeight", default: CAST_DEFAULTS.memoryWeight, takes: { type: "whole", least: 1 }, perConnection: false, name: "Weight of a memory given none", about: "The weight a memory has when it is written with none.", effect: "turn" },
   weightMax: { key: "cast.maxMemoryWeight", default: CAST_DEFAULTS.weightMax, takes: { type: "whole", least: 1 }, perConnection: false, name: "Highest weight of a memory", about: "The highest weight a memory can have; weights run from 1.", effect: "turn" },
+  takeInTokens: { key: "cast.takeInTokens", default: CAST_DEFAULTS.takeInTokens, takes: { type: "whole", least: 1 }, perConnection: false, name: "A batch of what a character takes in", about: "Tokens of perceptions in one batch, where a character's agent takes in what it perceived and has not yet made memories of: what waits is cut into batches of at most this, oldest first, and its agent hands each to an instance of itself. A perception larger than this is a batch alone.", effect: "turn" },
   comesToMindTokens: { key: "cast.comesToMindTokens", default: CAST_DEFAULTS.comesToMindTokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "What comes to mind", about: "Tokens of a character's memories that come to mind for a scene.", effect: "turn", row: "What comes to mind" },
   outlineTokens: { key: "cast.outlineTokens", default: CAST_DEFAULTS.outlineTokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "An outline of a character's record", about: "Tokens an outline of a character's record may fill: in the briefing, a principal's history is given newest first up to it, and the earlier entries are counted with their size and the call that reads them.", effect: "turn" },
   recallItems: { key: "cast.recallItems", default: CAST_DEFAULTS.recallItems, takes: { type: "whole", least: 1 }, perConnection: false, name: "Memories one recall brings back", about: "The most memories one recall brings back; the answer says how many more touch the cue.", effect: "turn" },

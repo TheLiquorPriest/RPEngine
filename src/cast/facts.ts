@@ -18,6 +18,7 @@ import type { JsonObject } from "../shared/json";
 import { baseOf, bindingsOf, type Character, castingInForce, CASTINGS, CastRecord, charactersOf, chatLine, findCharacter, nameKey } from "./record";
 import { personOfCharacter, worldAt } from "./secrets";
 import { type SourceReader, sourcesNow } from "./sources";
+import { perceptionWords } from "./take-in";
 import { type InHand, turnsSince, type Untaken, type Waiting, waitingOf } from "./waiting";
 
 /** The groups a count breaks down into: each casting, and those on stage the cast has not cast on this path (or does not hold). */
@@ -27,7 +28,7 @@ type Group = (typeof UNPERCEIVED_GROUPS)[number];
 /** The fields of a count of who is missing a perception: `missing` and what each of its items carries, each turn among them. */
 const MISSING_FIELDS = ["missing", "missing.name", "missing.casting", "missing.turns", "missing.turns.message", "missing.turns.time", "missing.turns.place"];
 /** The fields of a count of who holds perceptions not taken in: `held` and what each of its items carries. */
-const HELD_FIELDS = ["held", "held.name", "held.casting", "held.perceptions", "held.since", "held.turns"];
+const HELD_FIELDS = ["held", "held.name", "held.casting", "held.perceptions", "held.tokens", "held.since", "held.turns"];
 
 /** How a stage was read: the open scene the Author recorded, where the owner's character stands (no scene recorded), or not recorded at all. */
 export type StageHow = "scene" | "owner" | "none";
@@ -93,13 +94,13 @@ export const CAST_FACT_DEFS: readonly FactDef[] = [
   },
   {
     name: "stage.untaken",
-    counts: "Characters on stage this turn (read as stage.unperceived reads it) who hold perceptions their own agent has not taken in, of this turn or any earlier one RPE played, each counted once, by casting. A perception is taken in once a memory, a mind entry or a relationship of the character's own names it as where it came from, or the character says it was taken in with nothing to remember. A perception waits from the turn it was written in, whatever turn it is of, and none waits that a job of the character's own agent has in hand: one going on or waiting to, or ended after this turn began, started after the perception was written. held: each with its casting, how many it holds (perceptions), the reply of the turn the oldest was written in (since; null while that turn's reply is not on the path) and how many turns RPE played since that turn, this one included (turns).",
+    counts: "Characters on stage this turn (read as stage.unperceived reads it) who hold perceptions their own agent has not taken in, of this turn or any earlier one RPE played, each counted once, by casting. A perception is taken in once a memory, a mind entry or a relationship of the character's own names it as where it came from, or the character says it was taken in with nothing to remember. A perception waits from the turn it was written in, whatever turn it is of, and none waits that a job of the character's own agent has in hand: one going on or waiting to, or ended after this turn began, started after the perception was written. held: each with its casting, how many it holds (perceptions), how large they are as the chat counts tokens (tokens: what its own agent would be handed of them), the reply of the turn the oldest was written in (since; null while that turn's reply is not on the path) and how many turns RPE played since that turn, this one included (turns).",
     by: [...UNPERCEIVED_GROUPS],
     fields: HELD_FIELDS,
   },
   {
     name: "path.untaken",
-    counts: "Characters who hold perceptions written in earlier turns RPE played on the chat's path that their own agent has not taken in (as stage.untaken says it, a job's in hand left out), each counted once, by casting, whether or not they are on stage now. held: each with its casting, how many of those it holds (perceptions), the reply of the turn the oldest was written in (since) and how many turns RPE played since that turn, the one read included (turns).",
+    counts: "Characters who hold perceptions written in earlier turns RPE played on the chat's path that their own agent has not taken in (as stage.untaken says it, a job's in hand left out), each counted once, by casting, whether or not they are on stage now. held: each with its casting, how many of those it holds (perceptions), how large they are (tokens), the reply of the turn the oldest was written in (since) and how many turns RPE played since that turn, the one read included (turns).",
     by: [...UNPERCEIVED_GROUPS],
     fields: HELD_FIELDS,
   },
@@ -110,7 +111,7 @@ export const CAST_FACT_DEFS: readonly FactDef[] = [
   },
   {
     name: "scene.untaken",
-    counts: "Characters who hold perceptions their own agent has not taken in from turns RPE played in a scene the story record now holds closed, each counted once, by casting. held: each with its casting, how many of those it holds (perceptions), the reply of the turn of the oldest (since) and the scenes they are of (scenes, by title or id).",
+    counts: "Characters who hold perceptions their own agent has not taken in from turns RPE played in a scene the story record now holds closed, each counted once, by casting. held: each with its casting, how many of those it holds (perceptions), how large they are (tokens), the reply of the turn of the oldest (since) and the scenes they are of (scenes, by title or id).",
     by: [...UNPERCEIVED_GROUPS],
     fields: [...HELD_FIELDS, "held.scenes"],
   },
@@ -209,10 +210,14 @@ function readsOf(hows: readonly StageHow[]): Record<StageHow, number> {
   return { scene: hows.filter((h) => h === "scene").length, owner: hows.filter((h) => h === "owner").length, none: hows.filter((h) => h === "none").length };
 }
 
-/** One character's perceptions a count holds, as its `held` field says them: its casting, how many, the reply of the oldest's turn, and the turns RPE played since it. */
-function heldOf(at: CastAt, played: ReadonlySet<string>, name: string, group: Group, untaken: readonly Untaken[]): JsonObject {
+/**
+ * One character's perceptions a count holds, as its `held` field says them: its casting, how many, how large they are by `tokens` (the
+ * words its own agent is handed of them; left out where no count is given), the reply of the oldest's turn, and the turns RPE played since it.
+ */
+function heldOf(at: CastAt, played: ReadonlySet<string>, name: string, group: Group, untaken: readonly Untaken[], tokens: ((text: string) => number) | null): JsonObject {
   const oldest = untaken[0] as Untaken;
-  return { name, casting: group, perceptions: untaken.length, since: at.order.has(oldest.turn) ? at.replyOf(oldest.turn) : null, turns: turnsSince(at, played, oldest.index) };
+  const size: JsonObject = tokens === null ? {} : { tokens: untaken.reduce((n, u) => n + tokens(perceptionWords(u.item)), 0) };
+  return { name, casting: group, perceptions: untaken.length, ...size, since: at.order.has(oldest.turn) ? at.replyOf(oldest.turn) : null, turns: turnsSince(at, played, oldest.index) };
 }
 
 /** A count of characters who hold what it counts: each with its group and what its field says of it. */
@@ -221,7 +226,17 @@ function heldValue(rows: readonly { name: string; group: Group; held: JsonObject
 }
 
 /** `stage.unperceived`, `path.unperceived` and what waits for the characters' own agents, counted from the cast, from who `onStage` says was there, and from the chat's jobs `jobs` gives. */
-export function castFacts(deps: { store: Store; onStage: OnStage; scenes: ScenesOf; jobs: JobsOf; sources: SourceReader; playerMind(scope: Scope): Promise<boolean>; settings(scope: Scope): Promise<Pick<CastSettings, "dreamAfterHours">> }): CastFacts {
+export function castFacts(deps: {
+  store: Store;
+  onStage: OnStage;
+  scenes: ScenesOf;
+  jobs: JobsOf;
+  sources: SourceReader;
+  playerMind(scope: Scope): Promise<boolean>;
+  settings(scope: Scope): Promise<Pick<CastSettings, "dreamAfterHours">>;
+  /** A text's tokens as the chat counts them, for how large what waits is (`held.tokens`); without it the counts say no size. */
+  tokens?(scope: Scope): Promise<(text: string) => number>;
+}): CastFacts {
   return {
     area: "cast",
     defs: CAST_FACT_DEFS,
@@ -343,7 +358,7 @@ export function castFacts(deps: { store: Store; onStage: OnStage; scenes: Scenes
 
 /** What `waitingValues` counts from. */
 interface WaitingInput {
-  deps: { store: Store; scenes: ScenesOf; settings(scope: Scope): Promise<Pick<CastSettings, "dreamAfterHours">> };
+  deps: { store: Store; scenes: ScenesOf; settings(scope: Scope): Promise<Pick<CastSettings, "dreamAfterHours">>; tokens?(scope: Scope): Promise<(text: string) => number> };
   scope: Scope;
   at: CastAt;
   played: ReadonlySet<string>;
@@ -361,7 +376,8 @@ interface WaitingInput {
 async function waitingValues(input: WaitingInput): Promise<Record<string, FactValue>> {
   const { at, played, waiting, groupOf, waits, scope } = input;
   const out: Record<string, FactValue> = {};
-  const rowOf = (w: Waiting, untaken: readonly Untaken[], more: JsonObject = {}) => ({ name: w.character.name, group: groupOf(w.character), held: { ...heldOf(at, played, w.character.name, groupOf(w.character), untaken), ...more } });
+  const tokens = (await input.deps.tokens?.(scope)) ?? null;
+  const rowOf = (w: Waiting, untaken: readonly Untaken[], more: JsonObject = {}) => ({ name: w.character.name, group: groupOf(w.character), held: { ...heldOf(at, played, w.character.name, groupOf(w.character), untaken, tokens), ...more } });
 
   if (waits.has("stage.untaken")) {
     const here = new Set(input.onStage.map((c) => c.id));

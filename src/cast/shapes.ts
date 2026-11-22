@@ -54,8 +54,8 @@ export type CastingShown = Infer<typeof castingRow>;
 
 const waitsRow = shape.named(
   "CastWaits",
-  "What waits for a character's own agent at the reading: how many of its perceptions of turns RPE played it has not taken in, the reply of the oldest one's turn (null: none waits, or that turn's reply is not on the path), the turns RPE played since that turn (the one read included), and its last dream (null: it never dreamt), with that turn's reply and its date in story time where the chat's clock shows one.",
-  shape.object({ perceptions: N, since: nullable(N), turns: N, dreamt: nullable(shape.object({ message: nullable(N), date: nullable(T) })) }),
+  "What waits for a character's own agent at the reading: how many of its perceptions of turns RPE played it has not taken in, how large they are as the chat counts tokens and how many batches its agent would take them in as by the setting cast.takeInTokens (both absent where no count is at hand), the reply of the oldest one's turn (null: none waits, or that turn's reply is not on the path), the turns RPE played since that turn (the one read included), and its last dream (null: it never dreamt), with that turn's reply and its date in story time where the chat's clock shows one.",
+  shape.object({ perceptions: N, tokens: shape.optional(N), batches: shape.optional(N), since: nullable(N), turns: N, dreamt: nullable(shape.object({ message: nullable(N), date: nullable(T) })) }),
 );
 export type CastWaitsShown = Infer<typeof waitsRow>;
 

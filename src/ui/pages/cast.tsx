@@ -27,7 +27,7 @@ import { Badge, Banner, Button, Disclosure, Empty, Gated, PageHeader, Pre, Row, 
 import { isJoined, replyOf, type RpeClient } from "../client";
 import { onChatChange } from "../live-watch";
 import { EntryCard, type EntryCardProps, type StrikeAsk, writeWords } from "../records";
-import { counted, errorWords } from "../words";
+import { counted, errorWords, num } from "../words";
 import type { PageEntry } from "../page-entry";
 import { BASE_WORDS, BaseEditor, CastingEditor, type CastEdit, type Drafts, PerceptionWriter, PersonEditor, SourceBinder, SourceLine } from "./cast-edit";
 
@@ -63,18 +63,23 @@ export interface CastShown {
   editProblem: string | null;
   /** What is typed in the forms and not sent, by the name of the field. */
   drafts: Drafts;
-  /** The press that starts the job in which the open character's own agent takes in what waits; null while it is not pressed. */
+  /** The press that starts the jobs in which characters' own agents take in what waits: the open character's, or from the list everyone's who holds any; null while it is not pressed. */
   takeIn: TakeInShown | null;
 }
 
 /** A step of that press: asked (the confirm shown), go (started), cancel (not now). */
 export type TakeInStep = "ask" | "go" | "cancel";
 
-/** Where that press stands: asked, with what the character definition runs on in this chat (null while it is read); the start out; the job it started; or why none was. */
+/**
+ * Where that press stands: asked, for the characters it names, with what the character definition runs on in this chat (null while it is
+ * read); the start out; the jobs it started, one for each, and the characters none was started for with why; or why nothing was started.
+ */
 export interface TakeInShown {
+  who: string[];
   stage: "asked" | "out" | "started" | "refused";
   runsOn: DefinitionRun | null;
-  job: JobView | null;
+  jobs: { character: string; job: JobView }[];
+  refused: { character: string; why: string }[];
   problem: string | null;
 }
 
@@ -93,8 +98,8 @@ export interface CastReader {
   newest(): void;
   /** Keeps what is typed in a form. */
   draft(name: string, value: string | boolean): void;
-  /** A step of the press that starts the job in which the open character's own agent takes in what waits. */
-  takeIn(step: TakeInStep): void;
+  /** A step of the press that starts the jobs in which characters' own agents take in what waits: asked for `who` by name, or for the open character where none is given. */
+  takeIn(step: TakeInStep, who?: readonly string[]): void;
   /** Reads the cast again, and the character open. */
   refresh(): void;
   stop(): void;
@@ -222,29 +227,32 @@ export function readCast(client: Pick<RpeClient, "call">, chat: string, onChange
     draft(name, value) {
       show({ drafts: { ...shown.drafts, [name]: value } });
     },
-    takeIn(step) {
-      const name = shown.character?.character.name;
-      if (step === "cancel" || name === undefined) {
+    takeIn(step, who) {
+      if (step === "cancel") {
         show({ takeIn: null });
         return;
       }
       if (step === "ask") {
-        show({ takeIn: { stage: "asked", runsOn: null, job: null, problem: null } });
+        const names = who ?? (shown.character === null ? [] : [shown.character.character.name]);
+        if (names.length === 0) return;
+        const asked: TakeInShown = { who: [...names], stage: "asked", runsOn: null, jobs: [], refused: [], problem: null };
+        show({ takeIn: asked });
         // What the character definition runs on in this chat, for the confirm: the Agents page's own reading.
         client.call("GET /api/v1/agents", {}, { query: { chat } }).then(replyOf).then(
           (agents) => {
             const run = agents.agents.find((a) => a.name === "character")?.runsOn ?? { connection: null, model: null, effort: null, sent: null };
             if (shown.takeIn?.stage === "asked") show({ takeIn: { ...shown.takeIn, runsOn: run } });
           },
-          (error: unknown) => show({ takeIn: { stage: "refused", runsOn: null, job: null, problem: errorWords(error) } }),
+          (error: unknown) => show({ takeIn: { ...asked, stage: "refused", problem: errorWords(error) } }),
         );
         return;
       }
-      if (shown.takeIn?.stage !== "asked") return;
-      show({ takeIn: { ...shown.takeIn, stage: "out" } });
-      client.call("POST /api/v1/chats/:chat/jobs/take-in", { chat }, { body: { character: name } }).then(replyOf).then(
-        (answer) => show({ takeIn: { stage: "started", runsOn: null, job: answer.job, problem: null } }),
-        (error: unknown) => show({ takeIn: { stage: "refused", runsOn: null, job: null, problem: errorWords(error) } }),
+      const asked = shown.takeIn;
+      if (asked?.stage !== "asked") return;
+      show({ takeIn: { ...asked, stage: "out" } });
+      client.call("POST /api/v1/chats/:chat/jobs/take-in", { chat }, { body: { characters: asked.who } }).then(replyOf).then(
+        (answer) => show({ takeIn: { ...asked, stage: answer.jobs.length > 0 ? "started" : "refused", runsOn: null, jobs: answer.jobs, refused: answer.refused } }),
+        (error: unknown) => show({ takeIn: { ...asked, stage: "refused", runsOn: null, problem: errorWords(error) } }),
       );
     },
     newest() {
@@ -324,52 +332,114 @@ function runsOnWords(run: DefinitionRun | null): string {
   return `connection ${run.connection.name}${run.model === null ? "" : `, model ${run.model}`}`;
 }
 
+/** How large what waits for a character is, in words after its count: about how many tokens, and in how many batches its agent hands it to instances of itself where it is more than one. Nothing where no size is at hand. */
+export function sizeWords(waits: CastMemberRow["waits"]): string {
+  if (waits.tokens === undefined) return "";
+  return `, about ${counted(waits.tokens, "token")}${waits.batches !== undefined && waits.batches > 1 ? `, which its agent hands to instances of itself in ${num(waits.batches)} batches` : ""}`;
+}
+
 /**
- * What waits for the open character's own agent, and the press that starts the job in which its agent takes it in: the press asks him
- * first, saying what it will run and on which connection. Read at the chat's newest turn only: at an earlier turn there is no press.
+ * The press that starts the jobs in which characters' own agents take in what waits, for the characters `members` holds: it asks him
+ * first, saying what it will run, for whom and on which connection, then says what was started and what was not.
+ */
+function TakeInPress(props: { members: readonly CastMemberRow[]; label: string; takeIn: TakeInShown | null; onTakeIn(step: TakeInStep): void }) {
+  const { members, takeIn } = props;
+  const one = members.length === 1 ? members[0] : undefined;
+  if (takeIn?.stage === "asked" || takeIn?.stage === "out") {
+    return (
+      <div class="lre-stack" data-confirm="true">
+        <span class="rpe-meta">
+          {one !== undefined
+            ? `This starts a job of yours: the character definition, playing ${one.name}, on ${runsOnWords(takeIn.runsOn)}. Its agent is given the ${counted(one.waits.perceptions, "perception")} it has not taken in${sizeWords(one.waits) === "" ? "" : `${sizeWords(one.waits)},`} and writes from them; what it writes counts from the next turn.`
+            : `This starts ${counted(members.length, "job")} of yours, one for each character: the character definition, playing it, on ${runsOnWords(takeIn.runsOn)}. Each agent is given the perceptions it has not taken in and writes from them; what they write counts from the next turn.`}
+        </span>
+        {one !== undefined ? null : (
+          <ul class="rpe-meta" data-take-in-who>
+            {members.map((m) => (
+              <li key={m.id}>
+                {m.name}: {counted(m.waits.perceptions, "perception")}
+                {sizeWords(m.waits)}
+              </li>
+            ))}
+          </ul>
+        )}
+        <div class="lre-inline rpe-wrap">
+          <Button size="sm" busy={takeIn.stage === "out"} disabled={takeIn.stage === "out" || takeIn.runsOn?.connection === null} onClick={() => props.onTakeIn("go")}>
+            {one !== undefined ? "Start it" : "Start them"}
+          </Button>
+          <Button size="sm" variant="ghost" disabled={takeIn.stage === "out"} onClick={() => props.onTakeIn("cancel")}>
+            Not now
+          </Button>
+        </div>
+      </div>
+    );
+  }
+  const started = takeIn?.jobs ?? [];
+  const refused = takeIn?.refused ?? [];
+  return (
+    <div class="lre-stack">
+      {started.length === 0 ? null : (
+        <Banner tone="info" icon="check" title={started.length === 1 ? `Job ${started[0]?.job.id} started` : `${counted(started.length, "job")} started`}>
+          <span>
+            {started.length === 1 ? "Its agent takes in what waits" : `Their agents take in what waits: ${started.map((s) => `${s.character} (job ${s.job.id})`).join(", ")}`}; the Jobs page follows {started.length === 1 ? "it" : "them"}. What {started.length === 1 ? "it writes" : "they write"} counts from the next turn.
+          </span>
+        </Banner>
+      )}
+      {takeIn?.stage === "refused" || refused.length > 0 ? (
+        <Banner tone="neg" icon="alert" title={started.length === 0 ? "No job was started" : "Not started for everyone"}>
+          <span data-problem>{takeIn?.problem ?? refused.map((r) => (one !== undefined ? r.why : `${r.character}: ${r.why}`)).join(" ")}</span>
+        </Banner>
+      ) : null}
+      <div class="lre-inline rpe-wrap">
+        <Button size="sm" disabled={members.every((m) => m.waits.perceptions === 0)} onClick={() => props.onTakeIn("ask")}>
+          {props.label}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What waits for the open character's own agent, and the press that starts the job in which its agent takes it in. Read at the chat's
+ * newest turn only: at an earlier turn there is no press.
  */
 function WaitsSection(props: { member: CastMemberRow; at: string | null; takeIn: TakeInShown | null; onTakeIn(step: TakeInStep): void }) {
-  const { member, takeIn } = props;
+  const { member } = props;
   const words = waitsWords(member);
-  const n = member.waits.perceptions;
   return (
     <Section id="waits" title="What waits for its own agent">
       <p class="rpe-line" data-waits>
         {words === "" ? "Nothing waits: it is no principal, and holds no perception it has not taken in." : words}
       </p>
-      {props.at !== null || words === "" ? null : takeIn?.stage === "asked" || takeIn?.stage === "out" ? (
-        <div class="lre-stack" data-confirm="true">
-          <span class="rpe-meta">
-            This starts a job of yours: the character definition, playing {member.name}, on {runsOnWords(takeIn.runsOn)}. Its agent is given the {counted(n, "perception")} it has not taken in and writes from them; what it writes counts from the next turn.
-          </span>
-          <div class="lre-inline rpe-wrap">
-            <Button size="sm" busy={takeIn.stage === "out"} disabled={takeIn.stage === "out" || takeIn.runsOn?.connection === null} onClick={() => props.onTakeIn("go")}>
-              Start it
-            </Button>
-            <Button size="sm" variant="ghost" disabled={takeIn.stage === "out"} onClick={() => props.onTakeIn("cancel")}>
-              Not now
-            </Button>
-          </div>
-        </div>
-      ) : (
-        <div class="lre-stack">
-          {takeIn?.stage === "started" && takeIn.job !== null ? (
-            <Banner tone="info" icon="check" title={`Job ${takeIn.job.id} started`}>
-              <span>Its agent takes in what waits; the Jobs page follows it. What it writes counts from the next turn.</span>
-            </Banner>
-          ) : null}
-          {takeIn?.stage === "refused" ? (
-            <Banner tone="neg" icon="alert" title="No job was started">
-              <span data-problem>{takeIn.problem}</span>
-            </Banner>
-          ) : null}
-          <div class="lre-inline rpe-wrap">
-            <Button size="sm" disabled={n === 0} onClick={() => props.onTakeIn("ask")}>
-              Have its agent take them in now
-            </Button>
-          </div>
-        </div>
-      )}
+      {props.at !== null || words === "" ? null : <TakeInPress members={[member]} label="Have its agent take them in now" takeIn={props.takeIn} onTakeIn={props.onTakeIn} />}
+    </Section>
+  );
+}
+
+/**
+ * Above the cast's list: the principals who hold perceptions their own agents have not taken in, counted, with one press that starts a
+ * job for each. A principal is the casting that is run as an agent of its own; another character's is started from its own page.
+ * Nothing where no principal holds any.
+ */
+function WaitsForAll(props: { members: readonly CastMemberRow[]; takeIn: TakeInShown | null; onTakeIn(step: TakeInStep, who?: readonly string[]): void }) {
+  const holding = props.members.filter((m) => m.casting?.as === "principal" && m.waits.perceptions > 0);
+  if (holding.length === 0) return null;
+  const perceptions = holding.reduce((n, m) => n + m.waits.perceptions, 0);
+  const sized = holding.every((m) => m.waits.tokens !== undefined);
+  const tokens = holding.reduce((n, m) => n + (m.waits.tokens ?? 0), 0);
+  // The press is for those it was asked for: who holds something may change under a confirm that is open.
+  const asked = props.takeIn === null ? holding : holding.filter((m) => props.takeIn?.who.includes(m.name));
+  return (
+    <Section id="waits-all" title="What waits for the principals' own agents">
+      <p class="rpe-line" data-waits>
+        {counted(holding.length, "principal holds", "principals hold")} {counted(perceptions, "perception")} their own agents have not taken in{sized ? `, about ${counted(tokens, "token")}` : ""}.
+      </p>
+      <TakeInPress
+        members={asked.length === 0 ? holding : asked}
+        label={holding.length === 1 ? "Have its agent take them in now" : "Have their agents take them in now"}
+        takeIn={props.takeIn}
+        onTakeIn={(step) => props.onTakeIn(step, step === "ask" ? holding.map((m) => m.name) : undefined)}
+      />
     </Section>
   );
 }
@@ -470,8 +540,8 @@ export interface CastViewProps {
   onNewest(): void;
   /** Keeps what is typed in a form, by the name of its field. */
   onDraft(name: string, value: string | boolean): void;
-  /** A step of the press that starts the job in which the open character's own agent takes in what waits. */
-  onTakeIn(step: TakeInStep): void;
+  /** A step of the press that starts the jobs in which characters' own agents take in what waits: for the open character, or from the list for the characters named. */
+  onTakeIn(step: TakeInStep, who?: readonly string[]): void;
 }
 
 /** Why the record sits behind the gate. */
@@ -840,6 +910,7 @@ export function CastView(props: CastViewProps) {
       <PageHeader title="Cast" subtitle="Every character this chat knows, with its casting and what its record holds." />
       {problem}
       {shown.list === null || characters.length === 0 ? null : gate(null)}
+      {shown.list === null ? null : <WaitsForAll members={characters} takeIn={shown.takeIn} onTakeIn={props.onTakeIn} />}
       {shown.list === null ? (
         shown.loading ? (
           <p class="lre-muted rpe-line">Reading the cast…</p>
@@ -892,7 +963,7 @@ export function CastPage(props: { chat: string }) {
       onMore={(list, skip) => reader.current?.more(list, skip)}
       onNewest={() => reader.current?.newest()}
       onDraft={(name, value) => reader.current?.draft(name, value)}
-      onTakeIn={(step) => reader.current?.takeIn(step)}
+      onTakeIn={(step, who) => reader.current?.takeIn(step, who)}
     />
   );
 }

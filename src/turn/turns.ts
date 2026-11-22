@@ -32,7 +32,7 @@ import type { LvMessage } from "../adapter/lumiverse/rows";
 import type { ReplyStream } from "../adapter/lumiverse/stream";
 import { type TagLore, textHash } from "../adapter/lumiverse/wire";
 import { type LiveHub, liveKind, shape } from "../app";
-import { CAST_VIEWS, castPresentViews, castViews, type CastViewName, chatLine, findCharacter, type MemorySearch, type SourceReader } from "../cast";
+import { CAST_VIEWS, castPresentViews, castViews, type CastViewName, chatLine, findCharacter, type MemorySearch, type SourceReader, TAKE_IN_VIEW } from "../cast";
 import { calendarOf, formatClock } from "../engine/calendar";
 import { placeOfEntity } from "../engine/scope";
 import { mapView, mapWording, timelapseOperation } from "../iface";
@@ -150,7 +150,9 @@ function firstWords(text: string, count: number): string {
 export async function castLayouts(guidance: Pick<Guidance, "part">, names: readonly string[]): Promise<Partial<Record<CastViewName, TemplatePart>>> {
   const layouts: Partial<Record<CastViewName, TemplatePart>> = {};
   for (const view of Object.keys(CAST_VIEWS) as CastViewName[]) {
-    if (!names.some((name) => name === view || name.startsWith(`${view}:`))) continue;
+    // A view asked with an argument (`imported[core.md]`, a range of perceptions) and the plan of what waits (`take-in`, which gives the perceptions where they fit one batch) are laid out by the same parts.
+    const asks = (name: string): boolean => name === view || name.startsWith(`${view}:`) || name.startsWith(`${view}[`) || (name === TAKE_IN_VIEW && view === "unprocessed-perceptions");
+    if (!names.some(asks)) continue;
     const part = await guidance.part(CAST_VIEWS[view]);
     if (part?.format === "template") layouts[view] = part;
   }
