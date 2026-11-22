@@ -17,7 +17,8 @@ afterEach(async () => {
 });
 
 async function bed(answers: Answer[]): Promise<TurnBed> {
-  const b = await openTurnBed({ answers, off: ["rules/press-owed"] });
+  // The model's window is wide enough that five turns on a starter world never reach a compaction, whose calls the script does not answer.
+  const b = await openTurnBed({ answers, off: ["rules/press-owed"], contextWindow: 200_000 });
   beds.push(b);
   await playsWorld(b, STARTER_WORLDS.fantasy_town("w-harbour", "Harbour"));
   return b;
