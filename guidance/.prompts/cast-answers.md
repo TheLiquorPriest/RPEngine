@@ -83,4 +83,5 @@ page_no_entry: {{who}} has no entry {{id}} on this chat's record.
 page_pin_needs_casting: A pin holds a casting: say how large a part {{who}} plays to pin it.
 page_nothing_to_edit: Nothing was sent to change in {{who}}'s record.
 page_not_taken: The request has {{field}}, which it does not take.{{#choices}} It takes {{choices}}.{{/choices}}
+page_take_in_going: {{who}}'s own agent is at work already in job {{job}}, which has what waits for it in hand, so no second job was started.
 still_struck: {{id}}{{#text}} ({{text}}){{/text}} stays struck: it was struck apart from {{from}}, so taking that strike back leaves it as it is.{{#secret}} The secret it gave, {{secret}}, is not held again.{{/secret}}

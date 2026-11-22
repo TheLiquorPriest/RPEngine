@@ -13,6 +13,7 @@ export { CAST_LANE, UPDATE_OPERATIONS } from "./update";
 export { QUERY_PARTS } from "./query";
 export { REACHES } from "./perceive";
 export { CAST_FACT_DEFS, castFacts, type CastFacts, type OnStage, UNPERCEIVED_GROUPS } from "./facts";
+export { isGoing, type JobRead, type JobsOf, playedByIn } from "./waiting";
 export { CAST_VIEWS, castPresentViews, castViews, type CastPresentView, type CastView, type CastViewInput, type CastViewName } from "./views";
 export { arguedView, perceptionTokens, TAKE_IN_PART, TAKE_IN_VIEW, takeInBatches, takeInViews, viewNames } from "./take-in";
 export { type OwnPerception, type OwnReading, untakenSized } from "./zoom";

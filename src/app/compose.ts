@@ -361,6 +361,8 @@ export function compose(options: ComposeOptions = {}): Composition {
       sources: made().sources,
       // How large what waits for a character's agent is, counted as the chat counts tokens.
       tokens: async (user, chat) => tokenCount((await settings(user, chat)).charsPerToken),
+      // The chat's jobs, as the cast's facts read them: what a job of a character's own agent has in hand is not shown as waiting.
+      jobs: made().castJobs,
     })),
     storyArea(() => ({
       store: made().store,

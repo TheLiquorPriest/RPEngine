@@ -257,6 +257,33 @@ describe("the Cast page", () => {
     expect(shown.at(-1)).toMatchObject({ open: "char-tobin", character: null });
   });
 
+  test("a take-in that started a job reads the cast and the open character again, so what the job has in hand no longer shows as waiting; one that started none reads nothing again", async () => {
+    const { client, asked } = askingClient();
+    const shown: CastShown[] = [];
+    const reader = readCast(client, CHAT, (s) => shown.push(s));
+    asked[0]?.answer(CAST);
+    await settle();
+    reader.open(ODILE.id);
+    asked[1]?.answer(ODILE_RECORD);
+    await settle();
+    const start = async (answer: { jobs: { character: string; job: JobView }[]; refused: { character: string; why: string }[] }): Promise<string[]> => {
+      const before = asked.length;
+      reader.takeIn("ask");
+      asked.at(-1)?.answer({ chat: CHAT, agents: [{ name: "character", runsOn: { connection: { id: "conn-1", name: "Ferry deep" }, model: "model-a", effort: null, sent: null } }] });
+      await settle();
+      reader.takeIn("go");
+      const post = asked.at(-1);
+      expect(post).toMatchObject({ key: "POST /api/v1/chats/:chat/jobs/take-in", body: { characters: [ODILE.name] } });
+      post?.answer(answer);
+      await settle();
+      return asked.slice(before + 2).map((a) => a.key);
+    };
+    expect(await start({ jobs: [{ character: ODILE.name, job: { id: "job-7" } as JobView }], refused: [] })).toEqual(["GET /api/v1/chats/:chat/cast", "GET /api/v1/chats/:chat/cast/:character"]);
+    expect(shown.at(-1)?.takeIn).toMatchObject({ stage: "started", jobs: [{ character: ODILE.name }] });
+    expect(await start({ jobs: [], refused: [{ character: ODILE.name, why: "Her own agent is at work already in job job-7." }] })).toEqual([]);
+    expect(shown.at(-1)?.takeIn).toMatchObject({ stage: "refused", refused: [{ why: "Her own agent is at work already in job job-7." }] });
+  });
+
   test("the base shows the growth laid over it, each source its title and how it stands against the base, an away principal where it is and what it means to do, its game side, its castings in words, its memories by tier and its mind by kind", () => {
     const { tree, text } = view({ list: CAST, open: ODILE.id, character: RICH }, true);
     expect(section(tree, "base")).toContain("Growth laid over it");

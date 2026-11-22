@@ -31,7 +31,7 @@ import type { LumiverseReads } from "../adapter/lumiverse/reads";
 import type { Stores } from "../adapter/lumiverse/stores";
 import { type App, LIVE_JOBS, RouteError, WritesClosed } from "../app";
 import { portTexts, readConfig } from "../app/config-read";
-import { type BookReader, CAST_PLAYER_MIND, castFacts, CastRecord, castTools, chatLine, findCharacter, MemorySearch, playerMindOf, type SourceReader } from "../cast";
+import { type BookReader, CAST_PLAYER_MIND, castFacts, CastRecord, castTools, chatLine, findCharacter, type JobsOf, MemorySearch, playerMindOf, type SourceReader } from "../cast";
 import { castAt } from "../cast/path";
 import { charactersOf } from "../cast/record";
 import { holdersOf } from "../quests/holders";
@@ -373,6 +373,8 @@ export interface Turns {
   placeSources: PlaceSourcesReader;
   /** The cast as a place's or a quest's record reads it at a turn of the chat (the head where none is named): every character's items and names. */
   castKnowledge(user: string, chat: string, turn: string | null): CastKnowledge;
+  /** The chat's jobs as the cast reads them (`JobsOf`): what the Cast page and the press that starts a take-in count a job of a character's own agent by, as the cast's facts do. */
+  castJobs: JobsOf;
 }
 
 export function buildTurns(app: App, options: TurnsOptions): Turns {
@@ -574,6 +576,21 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
     const known = castKnowledge(user, chat, turn);
     return holdersOf(known.items, (id) => known.nameOf(id), quest);
   };
+  // The chat's jobs as the cast reads them (`JobsOf`): those not ended, every one; and those done, ended since `since`. What a job of a
+  // character's own agent has in hand is counted by them alike in the cast's facts, on the Cast page and by the press that starts a take-in.
+  const castJobs: JobsOf = async ({ user, chat }, since) => {
+    const out: JobView[] = [];
+    for (const states of [["queued", "held", "running", "asking"], ["done"]] satisfies JobState[][]) {
+      if (states[0] === "done" && since === Number.POSITIVE_INFINITY) continue;
+      let cursor: string | undefined;
+      do {
+        const page = await harness.jobs.list({ user, chat, states, ...(cursor !== undefined ? { cursor } : {}) });
+        out.push(...page.jobs.filter((j) => states[0] !== "done" || (j.ended ?? 0) >= since));
+        cursor = page.next;
+      } while (cursor !== undefined);
+    }
+    return out.map((j) => ({ id: j.id, plays: j.plays ?? null, state: j.state, started: j.started, ended: j.ended ?? null, turn: j.scope.turn ?? null }));
+  };
   // Who was on stage at each turn the cast counts, and how that was read (R-56, `countedOn`): the open scene's own list of who is in it; with none recorded, who the state places where the owner's character stands; with neither, nobody. With the place and the story's time there.
   // The scene each turn was played in, and those closed at the reading, from the story record. Whether his own character has a mind is his setting for the chat (`cast.playerMind`), read at each use; the cast's settings are the chat's.
   facts.add(
@@ -582,20 +599,7 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
       sources,
       onStage: async ({ user, chat }, turns) => new Map([...stagesAt(store, user, chat, turns)].map(([turn, stage]) => [turn, countedOn(stage)])),
       scenes: async ({ user, chat }, turns, at) => ({ of: scenesOf(store, user, chat, turns), closed: closedScenesAt(store, user, chat, at) }),
-      // The chat's jobs that may have a character's perceptions in hand: those not ended, every one; and those done, ended since `since`.
-      jobs: async ({ user, chat }, since) => {
-        const out: JobView[] = [];
-        for (const states of [["queued", "held", "running", "asking"], ["done"]] satisfies JobState[][]) {
-          if (states[0] === "done" && since === Number.POSITIVE_INFINITY) continue;
-          let cursor: string | undefined;
-          do {
-            const page = await harness.jobs.list({ user, chat, states, ...(cursor !== undefined ? { cursor } : {}) });
-            out.push(...page.jobs.filter((j) => states[0] !== "done" || (j.ended ?? 0) >= since));
-            cursor = page.next;
-          } while (cursor !== undefined);
-        }
-        return out.map((j) => ({ plays: j.plays ?? null, state: j.state, started: j.started, ended: j.ended ?? null, turn: j.scope.turn ?? null }));
-      },
+      jobs: castJobs,
       playerMind: async (scope) => playerMindOf(readConfig(await portTexts(files, scope), app.log, [CAST_PLAYER_MIND])),
       settings: async (scope) => (await turnSettings(files, scope, app.log)).cast,
       tokens: async (scope) => tokenCount((await turnSettings(files, scope, app.log)).charsPerToken),
@@ -811,5 +815,5 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
       return new Map(here.map((e) => [e.id, { tokens: e.hash === null ? null : Math.ceil(e.chars / settings.charsPerToken), status: e.status === "gone" ? null : e.status, lead: did?.get(e.id) ?? null }] as const));
     },
   };
-  return { lane, store, harness, env, facts, files, chats, take, place, prompts, loreTurns, runs, requests, approvals, writes: app.writes, marks, trace, calls, lore, secretSettings, secretMarks, loreIndex, notes, suggestions, projection, meaning, stateIndex, given, sources, placeSources, castKnowledge };
+  return { lane, store, harness, env, facts, files, chats, take, place, prompts, loreTurns, runs, requests, approvals, writes: app.writes, marks, trace, calls, lore, secretSettings, secretMarks, loreIndex, notes, suggestions, projection, meaning, stateIndex, given, sources, placeSources, castKnowledge, castJobs };
 }
