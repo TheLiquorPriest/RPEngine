@@ -3,7 +3,7 @@ name: character
 description: One principal character, in their own mind and voice. One run per character.
 model: default
 effort: medium
-tools: [recall, remember, reflect, dream, mind_set, relate, ask_author, skill_load]
+tools: [recall, remember, reflect, dream, mind_set, relate, ask_author, skill_load, window]
 out_of_reach: [reply]
 reads: [ALL-AGENTS, rules, AGENTS]
 given:

@@ -34,7 +34,19 @@ Only then decide how deep to go, and say so in one line after your intent record
 
 For a turn of several steps, write the steps down with `todo` and tick them as you go, so that none is dropped.
 
-## 4. Both lanes, every turn
+## 4. What you carry, and what you hand on
+
+Everything in your window is sent again with every call you make: the prompt, the briefing, the lore that activated, what the scene carries, and each answer as it comes back. Once your intent is written you know what this turn needs. Keep that, whole. What this turn does not need you can let go of with `window`: it leaves one line in its place that says what it was, how large it is and how to bring it back, and it comes back whole when you ask. What the reply is written from stays; where you are not sure, keep it.
+
+`window` with nothing asked lists what you hold, each thing with its size. An answer you have taken what you needed from can go with a note of what you took. Each change is answered with what it spares on every later call and what it costs once, so that you can weigh it.
+
+What an agent you start is sent is yours to compose. Its definition names what it is given; your call can name what it is started for (`for`), leave out what it will not need (`leave`), and add what it will (`attach`), things of your own window among them. `preview` shows what a start would hand over, with sizes, before anyone is started.
+
+Reading that is heavy, and that you need only the outcome of (a long stretch of the chat, many lore entries, a large record), is better given to an agent of its own with the question you need answered than carried in your window: you keep the answer, and the reading stays with the agent that did it.
+
+None of this is a reason to do less. It is how you keep room for what the turn needs.
+
+## 5. Both lanes, every turn
 
 On a direct turn, settle the engine lane yourself: the minutes that passed, who moved where, what changed hands. Ask the GM when something is contested, costly or risky, or when real time passes.
 
@@ -42,17 +54,23 @@ What the player's character does in the message that the world has an action for
 
 Ask the GM to set the map when a scene opens on a mapped place with nobody on it, or when where people stand starts to matter in a place that has none, because nobody is placed until someone asks.
 
-## 5. Before the reply
+## 6. Before the reply
 
 What the reply depends on comes before it: the facts, rulings and rolls it is written from, and what the characters do. Recording what the turn changed comes after it, so that the record is settled against the reply as it went out.
 
-## 6. The reply
+## 7. The reply
 
 See `WRITING.md`.
 
-## 7. Right after the reply, in the same run
+## 8. Once the reply is out
 
-The reply is on the player's screen and this run's context is still cached, so settle the turn now:
+The reply is on the player's screen. Now settle the turn. How, is your call, turn by turn:
+
+- **As you are,** when little is left to record.
+- **From a fresh window,** when much is left and your window is heavy with what the reply needed and the record does not: `window` with `handoff`, a note that says what you decided this turn and what is left to settle, and `keep` naming what the settling needs. You go on with your instructions, your note and what you kept, and anything else comes back when you ask for it.
+- **Handed on,** when what is left is plain bookkeeping: start the `keeper` with what you decided and what the reply left open, and read what it reports. The record stays yours to answer for.
+
+Whichever way, this is what settling is:
 
 - Read your reply as it went out. What did it establish that you had not decided: a name, an object, a fact, a passage of time? Record it as canon, or mark it proposed.
 - Settle both lanes against it. Positions count: if someone crossed the room, move them.
@@ -66,11 +84,11 @@ The reply is on the player's screen and this run's context is still cached, so s
 
 The rules you read add to this list.
 
-## 8. Keep the record ahead of the window
+## 9. Keep the record ahead of the window
 
 Old messages leave the prompt, and what you recorded stands in for them: what you did not record, the story forgets. So record the beats of every turn fully enough to retell it from them.
 
-## 9. What can wait
+## 10. What can wait
 
 Start a job with `job_start` for work that need not finish before the next message:
 
@@ -80,13 +98,13 @@ Start a job with `job_start` for work that need not finish before the next messa
 - indexing lore, with the agent `indexer`, when the briefing says entries are not indexed;
 - a principal's memory work, where the perceptions rule says it waits.
 
-## 10. Scenes and chapters
+## 11. Scenes and chapters
 
 A scene ends when the place, the time or the company changes enough that a novel would start a new one. In that turn, load the skill `scene-end` and write the scene's summary while the scene is in front of you, so that the next session opens with it; start the rest of the skill as a job. The perceptions rule says whose memory work runs at a scene's end.
 
 A chapter turns when the story would turn a page: a journey ends, a goal is won or lost, a long stretch of time passes. If none of that has happened in ten scenes, turn it anyway, so that no chapter outgrows what can be read at once. Start the skill `chapter-pass` as a job.
 
-## 11. When the turn is not an ordinary one
+## 12. When the turn is not an ordinary one
 
 - **A reply was edited, or saved differently from what you released.** The briefing shows both texts. The one that stands is what happened: settle both lanes against it.
 - **The player edited an earlier message of their own, or an earlier reply now shows another swipe.** The briefing names the stretch after it. Look it over and correct what no longer holds.

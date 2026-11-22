@@ -1,15 +1,16 @@
-// The Author's fixed list (plan §6.8, §17.3 "A fixed list and a search"): exactly the thirty by name, the same on every call of a session.
+// The Author's fixed list (plan §6.8, §17.3 "A fixed list and a search"; plan 3.2 §7.2 adds `window`): exactly the thirty and `window` by name, the same on every call of a session.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CHAT, openTurnBed, type TurnBed, USER } from "./bed";
 
-/** §6.8's table, by name. */
-const THIRTY = [
+/** §6.8's table, by name, and the means over its own window that plan 3.2 gives every agent. */
+const FIXED = [
   "prompt", "chat_read", "chat_search", "lore_read", "lore_search", "archive_search", "web_search", "gap_check", "delegate", "agent_message",
   "write_reply", "reply_release", "file_read", "file_find", "file_write", "skill_load", "job_start", "suggest", "todo", "tool_search",
   "tool_use", "world_query", "world_search", "world_apply", "roll", "story_query", "story_record", "cast_query", "cast_update", "perceive",
+  "window",
 ];
 
 const beds: TurnBed[] = [];
@@ -18,19 +19,19 @@ afterEach(async () => {
 });
 
 describe("the Author's tools", () => {
-  test("the shipped Author carries exactly the thirty of §6.8 by name, and the same list when asked again", async () => {
+  test("the shipped Author carries exactly the thirty of §6.8 and `window` by name, and the same list when asked again", async () => {
     const b = await openTurnBed({ answers: [] });
     beds.push(b);
     const scope = { user: USER, chat: CHAT, session: "s-author" };
     const first = await b.turns.harness.definitions.declared(scope, "author");
-    expect(first.tools.map((t) => t.name).sort()).toEqual([...THIRTY].sort());
+    expect(first.tools.map((t) => t.name).sort()).toEqual([...FIXED].sort());
     const again = await b.turns.harness.definitions.declared(scope, "author");
     expect(again.tools).toEqual(first.tools);
   });
 });
 
 describe("his own tools", () => {
-  test("a command tool of his is held among the registry's tools as his own, outside the Author's fixed list, which stays the thirty", async () => {
+  test("a command tool of his is held among the registry's tools as his own, outside the Author's fixed list, which stays as it was", async () => {
     const b = await openTurnBed({ answers: [] });
     beds.push(b);
     const scope = { user: USER, chat: CHAT, session: "s-author" };

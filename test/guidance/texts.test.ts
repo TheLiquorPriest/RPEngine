@@ -53,6 +53,8 @@ const WORDED: { row: string; markers: string[] }[] = [
   { row: "When a scene ends, and when a chapter turns", markers: ["a scene ends when", "a chapter turns when"] },
   { row: "Starting the mapping, indexing and summarizing jobs", markers: ["mapping the prompt, with the agent `mapper`", "indexing lore, with the agent `indexer`", "summarizing a stretch of the past that has beats"] },
   { row: "Writing a turn's steps down with `todo`", markers: ["write the steps down with `todo`"] },
+  { row: "Keeping what the turn needs in its window", markers: ["you can let go of with `window`", "is yours to compose", "is better given to an agent of its own"] },
+  { row: "Settling the turn once the reply is out", markers: ["how, is your call, turn by turn", "`window` with `handoff`, a note that says what you decided this turn", "start the `keeper` with what you decided"] },
   { row: "Before the reply, only what the reply depends on", markers: ["what the reply depends on comes before it"] },
   { row: "The Author's record of the turn", markers: ["write your record of the turn"] },
   { row: "What the reply established that nobody decided", markers: ["record it as canon, or mark it proposed"] },
@@ -131,20 +133,21 @@ describe("TURN.md reads intent, then a look, then a decision on how deep to go",
     return turn.slice(at, next < 0 ? undefined : next);
   };
 
-  test("holds E.2's eleven parts, in order", () => {
+  test("holds E.2's eleven parts and the one plan 3.2 added (what the Author carries), in order", () => {
     const heads = [...turn.matchAll(/^## (\d+)\. (.+)$/gm)].map((m) => [Number(m[1]), m[2]]);
     expect(heads).toEqual([
       [1, "Intent first"],
       [2, "Look where the message points"],
       [3, "Decide how to run it"],
-      [4, "Both lanes, every turn"],
-      [5, "Before the reply"],
-      [6, "The reply"],
-      [7, "Right after the reply, in the same run"],
-      [8, "Keep the record ahead of the window"],
-      [9, "What can wait"],
-      [10, "Scenes and chapters"],
-      [11, "When the turn is not an ordinary one"],
+      [4, "What you carry, and what you hand on"],
+      [5, "Both lanes, every turn"],
+      [6, "Before the reply"],
+      [7, "The reply"],
+      [8, "Once the reply is out"],
+      [9, "Keep the record ahead of the window"],
+      [10, "What can wait"],
+      [11, "Scenes and chapters"],
+      [12, "When the turn is not an ordinary one"],
     ]);
   });
 
@@ -171,8 +174,8 @@ describe("TURN.md reads intent, then a look, then a decision on how deep to go",
     expect(linesOf(turn).filter((line) => line.includes("a stretch of the past that has beats and no summary"))).toHaveLength(1);
   });
 
-  test("the map line stands in the fourth part, once, with its reason", () => {
-    expect(flat(part(4))).toContain("nobody is placed until someone asks");
+  test("the map line stands in the part on both lanes, once, with its reason", () => {
+    expect(flat(part(5))).toContain("nobody is placed until someone asks");
     expect(flat(turn).split("set the map").length - 1).toBe(1);
   });
 

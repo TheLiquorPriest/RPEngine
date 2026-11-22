@@ -64,6 +64,7 @@ Shipped rules in force:
 | `guidance/.rules/dream-due.md` | Reminds the Author, as its run ends, when a principal has begun a sleep, or lived the story hours of `cast.dreamAfterHours`, since it last dreamt. |
 | `guidance/.rules/engine-silent.md` | Notices when nothing has been recorded in the engine lane for a while. |
 | `guidance/.rules/history-leaving.md` | Warns the Author when messages are about to leave the prompt and the story record does not cover them. |
+| `guidance/.rules/window-heavy.md` | Tells the Author, once in a turn, when the answers to its calls have grown past the size its header names (30,000 tokens, as shipped), with how large its window now is and how the `window` tool lists, lets go of and brings back what it holds. |
 | `guidance/.rules/intent-owed.md` | Reminds the Author, as the calls of a message come back, when it has written no intent record for the turn and its reply has not gone out; it says too how many turns before went without one. |
 | `guidance/.rules/intent-owed-end.md` | The same, as the Author's run is about to end, with the other reminders of that moment, so that the one more call it is given can write the record; where the reply has gone out, it asks for the record alone. Whichever of the two says it first in a run, the other keeps quiet. |
 | `guidance/.rules/press-owed.md` | Reminds the Author, as its run is about to end, of each press of one of the world's actions you made from a panel for this turn that no `act` has carried out or had refused, by what you pressed. |

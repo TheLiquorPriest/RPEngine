@@ -29,6 +29,8 @@ export const HOMES: readonly Row[] = [
   { behaviour: "When a scene ends, and when a chapter turns", home: "TURN.md", off: "The Author's own judgment, unprompted", test: "edit" },
   { behaviour: "Starting the mapping, indexing and summarizing jobs", home: "TURN.md", off: "Started only by you", test: "off" },
   { behaviour: "Writing a turn's steps down with `todo` when there are several", home: "TURN.md", off: "No list is kept", test: "off" },
+  { behaviour: "Keeping what the turn needs in its window and letting go of the rest; composing what an agent it starts is sent; giving heavy reading to an agent of its own", home: "TURN.md", off: "The Author carries everything it was given and every answer through every call", test: "off" },
+  { behaviour: "Settling the turn once the reply is out as it is, from a fresh window by a handoff, or handed on to the keeper, by its own call", home: "TURN.md", off: "The Author settles in the window the reply was written in", test: "edit" },
   { behaviour: "Handing the prose to the narrator when the threshold is met", home: "WRITING.md", off: "The Author writes every reply itself", test: "edit" },
   { behaviour: "Reading a narrator's draft before release; sending it back with what to change, or cutting it", home: "WRITING.md", off: "Drafts go out unread", test: "edit: the hand-off is kept and the paragraph on the draft is changed" },
   { behaviour: "What leads when story, lore and rules disagree; going on when a sum does not balance", home: "SIMULATION.md", off: "No order is given. Code applies and reports either way", test: "edit" },
@@ -107,5 +109,6 @@ export const REMINDERS: readonly { file: string; needs: string | null }[] = [
   { file: ".rules/press-owed.md", needs: "TURN" },
   { file: ".rules/growth-waiting.md", needs: "TURN" },
   { file: ".rules/history-leaving.md", needs: "TURN" },
+  { file: ".rules/window-heavy.md", needs: "TURN" },
   { file: ".rules/reply-missing.md", needs: null },
 ];
