@@ -281,6 +281,7 @@ export function turnOf(seen: readonly LiveEvent[], options: { run: string; chat:
     timings,
     usage: outcome?.usage ?? sum,
     jobs: [],
+    weighted: null,
     intent: intent?.kind === "intent" ? intent.text : null,
     reply: { text, progress },
     emptyReply: null,
@@ -305,14 +306,14 @@ export function turnAt(count: number = RECORDED.length, from = 1, chat = CHAT): 
 }
 
 export function summaryOf(detail: TurnReply): TurnRow {
-  return { id: detail.id, kind: detail.kind, onPath: detail.onPath, message: detail.message, status: detail.status, timings: detail.timings, usage: detail.usage, jobs: detail.jobs, marks: [], runs: detail.runs.map(({ nth, kind, status, error, timings, usage }) => ({ nth, kind, status, error, timings, usage })) };
+  return { id: detail.id, kind: detail.kind, onPath: detail.onPath, message: detail.message, status: detail.status, timings: detail.timings, usage: detail.usage, jobs: detail.jobs, weighted: detail.weighted, marks: [], runs: detail.runs.map(({ nth, kind, status, error, timings, usage }) => ({ nth, kind, status, error, timings, usage })) };
 }
 
 /** The chat's earlier turns: a swipe that stands, the attempt it replaced (off the path now), and one stopped by the player. */
 const EARLIER_ROWS: readonly Omit<TurnRow, "runs">[] = [
-  { id: "turn-30", marks: [], kind: "swipe", onPath: true, message: "msg-0410", status: "released", timings: { received: T0 - 600_000, started: T0 - 599_780, firstWord: T0 - 591_200, released: T0 - 586_900, ended: T0 - 586_700, finished: null, intent: null, thinking: [], intake: null, wait: null }, usage: usage(3, 24_100, 19_456, 512, 88), jobs: [] },
-  { id: "turn-29", marks: [], kind: "new", onPath: false, message: "msg-0410", status: "released", timings: { received: T0 - 720_000, started: T0 - 719_700, firstWord: T0 - 709_900, released: T0 - 705_100, ended: T0 - 704_800, finished: null, intent: null, thinking: [], intake: null, wait: null }, usage: usage(4, 30_870, 22_528, 640, 120), jobs: [] },
-  { id: "turn-28", marks: [], kind: "new", onPath: true, message: "msg-0408", status: "stopped", timings: { received: T0 - 1_500_000, started: T0 - 1_499_760, firstWord: null, released: null, ended: T0 - 1_492_000, finished: null, intent: null, thinking: [], intake: null, wait: null }, usage: usage(2, 11_920, 8_192, 301, 64), jobs: [] },
+  { id: "turn-30", marks: [], kind: "swipe", onPath: true, message: "msg-0410", status: "released", timings: { received: T0 - 600_000, started: T0 - 599_780, firstWord: T0 - 591_200, released: T0 - 586_900, ended: T0 - 586_700, finished: null, intent: null, thinking: [], intake: null, wait: null }, usage: usage(3, 24_100, 19_456, 512, 88), jobs: [], weighted: null },
+  { id: "turn-29", marks: [], kind: "new", onPath: false, message: "msg-0410", status: "released", timings: { received: T0 - 720_000, started: T0 - 719_700, firstWord: T0 - 709_900, released: T0 - 705_100, ended: T0 - 704_800, finished: null, intent: null, thinking: [], intake: null, wait: null }, usage: usage(4, 30_870, 22_528, 640, 120), jobs: [], weighted: null },
+  { id: "turn-28", marks: [], kind: "new", onPath: true, message: "msg-0408", status: "stopped", timings: { received: T0 - 1_500_000, started: T0 - 1_499_760, firstWord: null, released: null, ended: T0 - 1_492_000, finished: null, intent: null, thinking: [], intake: null, wait: null }, usage: usage(2, 11_920, 8_192, 301, 64), jobs: [], weighted: null },
 ];
 export const EARLIER: readonly TurnRow[] = EARLIER_ROWS.map((row) => ({ ...row, runs: [{ nth: 1, kind: row.kind, status: row.status, error: null, timings: row.timings, usage: row.usage }] }));
 

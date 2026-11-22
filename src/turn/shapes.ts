@@ -72,6 +72,10 @@ const rowFields = {
   timings: moments,
   usage: field(usage, "Every agent of its runs together: model calls and tokens. The jobs it started are not among them: each has its own."),
   jobs: field(shape.list(jobRow), "The jobs its runs started, the first started first, each by its row as a list of jobs shows it, with what it spent as RPH counts it; none for a turn that started none, or whose jobs' records are no longer kept."),
+  weighted: field(
+    nullable(shape.object({ runs: field(N, "Its own runs' calls together."), jobs: field(shape.record(N), "Each of its jobs whose calls are kept, by the job's id.") })),
+    "What the kept rows of its calls weigh, whole numbers: each token sent fresh counted 1 and the rest by the weights the settings hold as this is read (`usage.weights.*`, a connection's own over them). Tokens weighed, never money. Null where no row of its calls is kept: a turn played before the rows were, and not read in.",
+  ),
 } as const;
 
 export const chatsReply = shape.named(

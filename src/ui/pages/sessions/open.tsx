@@ -15,7 +15,7 @@ import { AgentTree, RunHead } from "../../trace-view";
 import { useSelect } from "../../store";
 import { useUiSetting } from "../../ui-settings";
 import { counted, errorWords, num, when } from "../../words";
-import { RunUsage, windowOfModel } from "../usage";
+import { RunUsage, windowOfModel } from "../run-usage";
 import { CARRY_MODES, CARRY_WORDS } from "./carry";
 
 const REASON_WORDS: Readonly<Record<NonNullable<CompactionShown["reason"]>, string>> = {

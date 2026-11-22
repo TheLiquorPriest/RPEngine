@@ -28,7 +28,7 @@ import { JOB_KIND } from "./jobs";
 import { REQUESTS_KIND } from "./requests";
 import { turnRoutes } from "./routes";
 import { sessionRoutes } from "./session-routes";
-import { globalConfig, passConnection, TURN_SETTINGS, turnSettings } from "./settings";
+import { globalConfig, passConnection, TURN_SETTINGS, turnSettings, usageWeights, weighedConnections } from "./settings";
 import { namedStretches } from "./stage";
 import { HARNESS_MIGRATIONS, PROMPT_MIGRATIONS } from "./tables";
 import { EMPTY_REPLY_KIND, leadConnection, NO_SESSION, type MigratedSource } from "./turns";
@@ -278,12 +278,22 @@ export function turnArea(takes: TurnTakes): TurnArea {
       // A restart onto a new app file waits for the turns and the jobs that run, and for a request whose turn is still being taken in.
       at.builds.counts(async () => runs.chatsGoing().length + lane.intakesGoing() + (await harness.jobs.list({ user: owner(), states: ["running", "queued"] })).jobs.length);
       const shared = () => globalConfig(at.paths.files, at.log);
-      at.routes.add("turn", turnRoutes({ turns, chatName: async (chat) => (await takes.lumiverse()?.reads.chat(chat))?.name ?? null, shared }));
+      // The weights of the weighted figure, read as a page asks. The connections are listed only where one is given weights of its own, to find by its id the name its calls carry; where they cannot be listed, the weights set under a name still hold.
+      const weights = async (user: string) => {
+        const read = shared();
+        if (weighedConnections(read).length === 0) return usageWeights(read, []);
+        const listed = await harness.models.list(user).catch((error: unknown) => {
+          at.log.warn("The connections could not be listed to weigh each one's calls by its own weights; those set under a connection's id are passed over for this read.", { error: error instanceof Error ? error.message : String(error) });
+          return { connections: [] };
+        });
+        return usageWeights(read, listed.connections);
+      };
+      at.routes.add("turn", turnRoutes({ turns, chatName: async (chat) => (await takes.lumiverse()?.reads.chat(chat))?.name ?? null, shared, weights }));
       at.routes.add("jobs", jobRoutes({ turns, shared }));
       // What the models were used for, from the rows kept of each call: one turn's use, a span of his calls, and the reading in of what was played before the rows were kept.
       at.routes.add(
         "usage",
-        usageRoutes({ calls: turns.calls, runs, db: at.db, turn: (user, turn) => made().store.user(user).turn(turn), kept: (scope) => made().trace.kept(scope), shared, log: at.log }),
+        usageRoutes({ calls: turns.calls, runs, db: at.db, turn: (user, turn) => made().store.user(user).turn(turn), kept: (scope) => made().trace.kept(scope), shared, weights, log: at.log }),
       );
       at.routes.add("sessions", sessionRoutes({ turns, writes: at.writes, files: at.paths.files, log: at.log }));
       at.routes.add("web", webRoutes(at.secrets));

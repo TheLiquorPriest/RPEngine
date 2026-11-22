@@ -8,7 +8,7 @@
 // the Author settles an edit then, and nothing is written to the chat.
 
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { CarriedTurnsReply, SettleReply, StageTurn, TurnLoreRow, TurnReply, TurnRow } from "../../../shared/api";
+import type { CarriedTurnsReply, SettleReply, StageTurn, TurnLoreRow, TurnReply, TurnRow, TurnUseReply, Usage } from "../../../shared/api";
 import { useSelect } from "../../store";
 import { useApp, useNow } from "../../app";
 import { replyOf, type RpeClient, RpeError } from "../../client";
@@ -19,9 +19,10 @@ import { type NoticeLines, useNoticeLines } from "../../notice-words";
 import { answeringRun, statusWords, TURN_KIND_WORDS, whyEnded } from "../../trace-view";
 import { latestOf, liveTurn } from "../../turn-model";
 import { useUiSetting } from "../../ui-settings";
-import { counted, duration, errorWords, tokenWords, when } from "../../words";
+import { counted, duration, errorWords, num, tokenWords, when } from "../../words";
 import type { PageEntry } from "../../page-entry";
 import { type JobsReader, type JobsShown, JobsView, NO_JOBS, readJobs } from "../jobs";
+import { callsOf } from "../run-usage";
 import { useRead } from "../../reading";
 import { readFolder } from "./folder";
 import { laterWords, LaterRuns } from "./later";
@@ -52,6 +53,36 @@ export function turnKindWords(turn: { kind: TurnRow["kind"]; runs: readonly { ki
   return `${TURN_KIND_WORDS[turn.kind]}${continued ? ", continued" : ""}`;
 }
 
+/**
+ * What the kept rows of a turn's own runs' calls weigh, said after tokens; nothing where no row is kept. The figure is of every
+ * run of the turn: after one run's own tokens (`ofAll` false) it says so.
+ */
+export function weighsWords(turn: Pick<TurnRow, "weighted">, ofAll = true): string {
+  return turn.weighted === null ? "" : ofAll ? ` · weighs ${num(turn.weighted.runs)}` : ` · all its runs weigh ${num(turn.weighted.runs)}`;
+}
+
+/**
+ * The jobs a turn's runs started, in one line beside the turn's own: how many, how many have not ended, what RPH counted for them
+ * together, and what the kept rows of their calls weigh. A job has its own use: none of this is in the turn's figures. No agent is
+ * named, since the line shows with the spoiler gate shut. Null for a turn that started none.
+ */
+export function jobsWords(turn: Pick<TurnRow, "jobs" | "weighted">): string | null {
+  const { jobs, weighted } = turn;
+  if (jobs.length === 0) return null;
+  const all: Usage = { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+  for (const job of jobs) {
+    all.calls += job.usage.calls;
+    all.input += job.usage.input;
+    all.cacheRead += job.usage.cacheRead;
+    all.cacheWrite += job.usage.cacheWrite;
+    all.output += job.usage.output;
+  }
+  const going = jobs.filter((job) => job.ended === undefined).length;
+  const weighed = weighted === null ? [] : jobs.flatMap((job) => weighted.jobs[job.id] ?? []);
+  const weighs = weighed.length === 0 ? "" : ` · ${jobs.length === 1 ? "weighs" : "weigh"} ${num(weighed.reduce((sum, each) => sum + each, 0))}`;
+  return `${jobs.length === 1 ? "The job" : `The ${num(jobs.length)} jobs`} it started${going === 0 ? "" : `, ${going === jobs.length ? "not ended yet" : `${num(going)} not ended yet`}`}: ${counted(all.calls, "call")} · ${tokenWords(all)}${weighs}`;
+}
+
 function TurnLine(props: { turn: TurnRow; carried?: CarriedRow | undefined; onOpen: () => void }) {
   const { turn } = props;
   // What became of its reply is the run that answered's; a later run (Settle now) is said beside it in its own words, with its own time and spend, and the turn's total is said as one. What the turn is, is its own.
@@ -62,6 +93,7 @@ function TurnLine(props: { turn: TurnRow; carried?: CarriedRow | undefined; onOp
   const own = head?.usage ?? turn.usage;
   const end = (head?.timings ?? turn.timings).ended ?? (head?.timings ?? turn.timings).released;
   const later = answering === undefined ? [] : turn.runs.filter((r) => r.nth > answering.nth);
+  const jobs = jobsWords(turn);
   return (
     <li class="lre-listrow">
       <button type="button" class="lre-listrow-hit" onClick={props.onOpen} data-turn={turn.id}>
@@ -73,6 +105,7 @@ function TurnLine(props: { turn: TurnRow; carried?: CarriedRow | undefined; onOp
             <span class="lre-listrow-sub lre-num">
               {end === null ? "" : `${duration(end - turn.timings.received)} · `}
               {counted(own.calls, "call")} · {tokenWords(own)}
+              {later.length === 0 ? weighsWords(turn, turn.runs.length <= 1) : ""}
             </span>
             {later.map((run) => (
               <span key={run.nth} class="lre-listrow-sub lre-num" data-later-run={run.nth}>
@@ -81,7 +114,12 @@ function TurnLine(props: { turn: TurnRow; carried?: CarriedRow | undefined; onOp
             ))}
             {later.length === 0 ? null : (
               <span class="lre-listrow-sub lre-num" data-turn-total>
-                {`In all, every run: ${counted(turn.usage.calls, "call")} · ${tokenWords(turn.usage)}`}
+                {`In all, every run: ${counted(turn.usage.calls, "call")} · ${tokenWords(turn.usage)}${weighsWords(turn)}`}
+              </span>
+            )}
+            {jobs === null ? null : (
+              <span class="lre-listrow-sub lre-num" data-turn-jobs={turn.jobs.length}>
+                {jobs}
               </span>
             )}
             {props.carried === undefined ? null : <span class="lre-listrow-sub" data-carried-line>{carriedWords(props.carried)}</span>}
@@ -438,6 +476,8 @@ export interface TurnViewProps {
   stage?: StageTurn | null;
   /** The turn's review card and, for a turn carried in, the record an old engine kept; read once the gate is open. */
   review?: ReviewShown;
+  /** Where the turn's tokens went, from the rows kept of its model calls, read once the gate is open; null until read. */
+  use?: TurnUseReply | null;
   onOpenQuest?(id: string): void;
   /** Opens a setting on the Settings page, by its key. */
   onOpenSetting?(key: string): void;
@@ -463,7 +503,7 @@ export function TurnView(props: TurnViewProps) {
   const reached = head?.stoppedBy != null && "limit" in head.stoppedBy ? head.stoppedBy.limit : undefined;
   const failure = kind === "settle" && (head?.status ?? turn.status) === "no-reply" ? null : whyEnded(error, head?.status ?? turn.status, reached);
   const later = answering === undefined ? [] : turn.runs.filter((r) => r.nth > answering.nth);
-  const parts: TurnParts = { turn, runs: props.runs, now: props.now, folder: props.folder, notices: props.notices, lead: props.lead, loreRows: props.loreRows, stage: props.stage, review: props.review, onOpenQuest: props.onOpenQuest, onOpenFile: props.onOpenFile, onOpenRequest: props.onOpenRequest, onCloseFile: props.onCloseFile };
+  const parts: TurnParts = { turn, runs: props.runs, now: props.now, folder: props.folder, notices: props.notices, lead: props.lead, loreRows: props.loreRows, stage: props.stage, review: props.review, use: props.use, onOpenQuest: props.onOpenQuest, onOpenSetting: props.onOpenSetting, onOpenFile: props.onOpenFile, onOpenRequest: props.onOpenRequest, onCloseFile: props.onCloseFile };
   return (
     <div class="lre-stack rpe-page" data-page="turn" data-turn={turn.id}>
       <PageHeader
@@ -592,6 +632,9 @@ export function TurnPage(props: { chat: string; turn: string }) {
   const runs = runsOf(watched.model, turn);
   const latest = watched.detail === null ? runs.at(-1) : latestOf(watched.detail, runs);
   const detail = watched.detail === null ? null : liveTurn(watched.detail, latest);
+  // Where its tokens went, from the rows kept of its calls: read once the gate is open, and again as its runs make another call and as it ends (a call's row is kept as the call ends).
+  const calls = runs.reduce((sum, run) => sum + callsOf(run), 0);
+  const used = useRead(gateOpen ? async () => replyOf(await app.client.call("GET /api/v1/chats/:chat/turns/:turn/use", { chat, turn })) : null, [chat, turn, gateOpen, reads, calls, detail?.status]);
   const now = useNow(detail?.status === "running");
   const back = (): void => app.go({ page: "turns", chat });
   if (detail === null) {
@@ -621,6 +664,7 @@ export function TurnPage(props: { chat: string; turn: string }) {
       loreRows={loreRead.value}
       stage={stageRead.value}
       review={review}
+      use={used.value}
       onOpenQuest={(id) => app.go({ page: "quests", chat, at: [id] })}
       onOpenSetting={(key) => app.go({ page: "settings", chat: null, at: [key] })}
       onOpenGate={() => app.gate.open(chat)}

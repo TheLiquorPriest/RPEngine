@@ -30,6 +30,7 @@ import type { Turns } from "./lane";
 import { turnRecordFields } from "./record";
 import { CARRIED_SESSION, playedUnder, type RunRecord } from "./runs";
 import { turnSettings } from "./settings";
+import type { UsageWeights } from "./usage";
 import { givenRoutes } from "./given-routes";
 import { liveRoutes } from "./live-routes";
 import { rulesRoutes } from "./rules-routes";
@@ -53,7 +54,12 @@ export interface TurnRoutesDeps {
   chatName(chat: string): Promise<string | null>;
   /** The levels every chat shares, read now: how much of a job's brief a list shows. */
   shared(): ConfigRead;
+  /** The weights of the weighted figure as the settings hold them now, for the user's connections. */
+  weights(user: string): Promise<UsageWeights>;
 }
+
+/** What the kept rows of the calls recorded under each turn weigh, not rounded: its own runs' together, and each of its jobs' by id (`CallRows.weighedOfTurns`). */
+type Weighed = ReadonlyMap<string, { runs: number; jobs: ReadonlyMap<string, number> }>;
 
 /** Strings among a value's items; none when it is no list. */
 function idsOf(value: unknown): string[] {
@@ -226,14 +232,19 @@ export function turnRoutes(deps: TurnRoutesDeps) {
    * A turn as the list gives it: what it is (the kind of the run that made it: a continue that joined its reply makes it no continue,
    * plan §10.10, and a Settle now run none), its state, and the times of its reply (its latest run that wrote into the chat; a Settle
    * now run's own times are among its runs). Its state is running while a run of it goes on, else its reply's: a Settle now run writes
-   * nothing to the chat, so how it ended is its own, said among the turn's runs, and never what became of the turn's reply.
+   * nothing to the chat, so how it ended is its own, said among the turn's runs, and never what became of the turn's reply. With it, the
+   * jobs its runs started (`jobs`, by the turn each was started under) and what the kept rows of its calls weigh (`weighed`, the same).
    */
-  const summary = (user: string, chat: string, r: RunRecord, jobs: ReadonlyMap<string, Infer<typeof jobRow>[]>) => {
+  const summary = (user: string, chat: string, r: RunRecord, jobs: ReadonlyMap<string, Infer<typeof jobRow>[]>, weighed: Weighed) => {
     const store = turns.store.user(user);
     const row = store.turn(r.turn);
     const onPath = r.status === "running" || store.path(chat).some((e) => e.turn === r.turn);
     const all = turns.runs.ofTurn(user, r.turn);
     const said = turns.runs.reply(user, r.turn) ?? r;
+    const under = playedUnder(r.turn, all);
+    const kept = under.flatMap((each) => weighed.get(each) ?? []);
+    const byJob = new Map<string, number>();
+    for (const each of kept) for (const [job, weighs] of each.jobs) byJob.set(job, (byJob.get(job) ?? 0) + weighs);
     return {
       id: r.turn,
       kind: all.find((run) => run.kind !== "settle")?.kind ?? r.kind,
@@ -243,10 +254,18 @@ export function turnRoutes(deps: TurnRoutesDeps) {
       marks: turns.marks.ofTurn(user, r.turn),
       timings: momentsOf(said),
       usage: spent(all),
-      jobs: playedUnder(r.turn, all)
-        .flatMap((under) => jobs.get(under) ?? [])
-        .sort((a, b) => a.started - b.started || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+      jobs: under.flatMap((each) => jobs.get(each) ?? []).sort((a, b) => a.started - b.started || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+      weighted: kept.length === 0 ? null : { runs: Math.round(kept.reduce((sum, each) => sum + each.runs, 0)), jobs: Object.fromEntries([...byJob].map(([job, weighs]) => [job, Math.round(weighs)])) },
     };
+  };
+
+  /**
+   * What the kept rows of the calls recorded under these turns weigh, by turn, by the weights the settings hold now. A call that
+   * ended a moment ago has its row queued: the read waits for it, so a turn that has just ended is weighed whole.
+   */
+  const weighedUnder = async (user: string, under: readonly string[]): Promise<Weighed> => {
+    await turns.calls.settled();
+    return turns.calls.weighedOfTurns(user, under, await deps.weights(user));
   };
 
   /**
@@ -339,7 +358,7 @@ export function turnRoutes(deps: TurnRoutesDeps) {
     // What went to the chat is the reply's: a Settle now run writes nothing there.
     const said = turns.runs.reply(user, r.turn) ?? r;
     return {
-      ...summary(user, chat, r, jobsUnder(user, folders)),
+      ...summary(user, chat, r, jobsUnder(user, folders), await weighedUnder(user, folders)),
       chat: r.chat,
       intent: turns.store.user(user).turn(r.turn)?.intent ?? null,
       reply: { text: said.reply, progress: [...said.progress] },
@@ -422,7 +441,7 @@ export function turnRoutes(deps: TurnRoutesDeps) {
       path: "/api/v1/chats/:chat/turns",
       access: "page",
       group: "turns",
-      does: "A chat's turns, newest first, each with what its runs spent together, the jobs its runs started with what each spent, and each of its runs by itself (its kind, where it stands, its error, its moments and its own spend); `before` is a turn's id, and older ones follow it. The settings `turns.page` and `turns.maxPage` give a page's length.",
+      does: "A chat's turns, newest first, each with what its runs spent together, the jobs its runs started with what each spent, what the kept rows of its calls weigh, and each of its runs by itself (its kind, where it stands, its error, its moments and its own spend); `before` is a turn's id, and older ones follow it. The settings `turns.page` and `turns.maxPage` give a page's length.",
       query: {
         limit: shape.optional(shape.whole({ least: 1 }), "How many turns to give: the setting `turns.page` when left out, and at most `turns.maxPage`."),
         before: shape.optional(shape.turnId(), "A turn's id: the turns older than it are given."),
@@ -435,10 +454,12 @@ export function turnRoutes(deps: TurnRoutesDeps) {
         if (query.before !== undefined) notJoined(user, params.chat, query.before);
         const kept = turns.runs.ofChatKept(user, params.chat, limit + 1, query.before);
         const listed = kept.slice(0, limit);
-        const jobs = jobsUnder(user, listed.flatMap((r) => playedUnder(r.turn, turns.runs.ofTurn(user, r.turn))));
+        const under = listed.flatMap((r) => playedUnder(r.turn, turns.runs.ofTurn(user, r.turn)));
+        const jobs = jobsUnder(user, under);
+        const weighed = await weighedUnder(user, under);
         // Each turn with its runs one by one: the list says what a turn is and what became of its reply from the run that answered, and what a later run did beside it.
         const rowOf = (r: RunRecord) => ({
-          ...summary(user, params.chat, r, jobs),
+          ...summary(user, params.chat, r, jobs, weighed),
           runs: turns.runs.ofTurn(user, r.turn).map((run, i) => ({ nth: i + 1, kind: run.kind, status: run.status, error: run.error, timings: momentsOf(run), usage: run.usage ?? NO_USAGE })),
         });
         return { turns: listed.map(rowOf), more: kept.length > limit };

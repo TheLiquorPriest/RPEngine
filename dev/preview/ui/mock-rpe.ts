@@ -2,7 +2,8 @@
 // recorded turn (test/ui/recorded.ts), and the live socket, which plays that turn as it was recorded,
 // in real time, the first time a page follows a chat (and again on `/preview/play`). Any chat id is served the same
 // turn, but for a chat the list says RPE has not played yet (one a migration imported), which has none.
-// Any bearer is taken: the preview proves the pages, not RPE's auth. Nothing is kept.
+// Any bearer is taken: the preview proves the pages, not RPE's auth. Nothing is kept. Where the tokens went (a turn's use, a span
+// of calls, the reading in of older ones) is answered from the same turn and from invented sums (test/ui/usage-recorded.ts).
 //
 // Preview controls, outside RPE's API (`previewControl`):
 // - `/preview/extension?state=well|unregistered|missing`: how RPE says its extension in Lumiverse stands.
@@ -24,6 +25,7 @@ import type { ConnectionView, ModelLimit, ProviderOffer, TraceDelta, TraceRecord
 import type { ConnectionShown, ExtensionStatusReply, LiveEvent, ReplyPiece, RunShown, SaveConnection, TurnReply } from "../../../src/shared/api";
 import { buildAnswer, buildControl } from "./mock-build";
 import { CHATS, CONTINUED, earlierTurn, EARLIER, RECORDED, RUN, summaryOf, T0, turnOf, worldAt } from "../../../test/ui/recorded";
+import { READ_IN, turnUse, usageSpan, withUse } from "../../../test/ui/usage-recorded";
 import { migrationAnswer, migrationControl } from "./mock-migration";
 import { playAnswer } from "./mock-play";
 import { recordsAnswer, recordsControl } from "./mock-records";
@@ -321,7 +323,8 @@ export function rpeAnswer(request: Request, server: Server<PreviewSocket>): Resp
     if (UNPLAYED.has(chat)) return answer(200, { turns: [], more: false });
     const p = playing.get(chat);
     const latest = p === undefined ? turnOf(RECORDED, { run: RUN, chat, received: T0 - INTAKE_MS }) : playedTurn(p);
-    const all = [...(p === undefined || p.events.length > 0 ? [summaryOf(latest)] : []), ...EARLIER];
+    // The turn played last tells of its use as its row does: the job it started, and what its kept calls weigh.
+    const all = [...(p === undefined || p.events.length > 0 ? [withUse(summaryOf(latest), latest)] : []), ...EARLIER];
     const limit = Number(url.searchParams.get("limit") ?? all.length);
     return answer(200, { turns: all.slice(0, limit), more: limit < all.length });
   }
@@ -346,13 +349,27 @@ export function rpeAnswer(request: Request, server: Server<PreviewSocket>): Resp
     const text = folder.get(name);
     return text === undefined ? answer(404, { error: `Turn ${turn}'s folder has no file ${name}.` }) : answer(200, { name, text });
   }
+  // Where a turn's tokens went (the Turn page's section), from the turn as its read answers it; a span of calls and the reading in of older ones (the Usage page).
+  const use = /^\/api\/v1\/chats\/([^/]+)\/turns\/([^/]+)\/use$/.exec(path);
+  if (use !== null && request.method === "GET") {
+    const chat = decodeURIComponent(use[1] as string);
+    const turn = decodeURIComponent(use[2] as string);
+    const whole = detailOf(chat, turn, 1);
+    return whole === null ? answer(404, { error: `Chat ${chat} has no turn ${turn}.` }) : answer(200, turnUse(whole));
+  }
+  if (path === "/api/v1/usage" && request.method === "GET") {
+    const asked = (name: string): number | null => (url.searchParams.has(name) ? Number(url.searchParams.get(name)) : null);
+    return answer(200, usageSpan({ turns: asked("turns"), from: asked("from"), to: asked("to") }));
+  }
+  if (path === "/api/v1/usage/read-in" && request.method === "POST") return answer(200, READ_IN);
   const one = /^\/api\/v1\/chats\/([^/]+)\/turns\/([^/]+)(\/stop)?$/.exec(path);
   if (one !== null) {
     const chat = decodeURIComponent(one[1] as string);
     const turn = decodeURIComponent(one[2] as string);
     if (one[3] !== undefined) return request.method === "POST" ? answer(200, { stopped: stop(chat, turn) }) : answer(405, { error: "Stop takes POST." });
     const detail = detailOf(chat, turn, Number(url.searchParams.get("from") ?? 1));
-    return detail === null ? answer(404, { error: `RPE has no turn ${turn} in this chat.` }) : answer(200, detail);
+    // Its use is told of the whole turn, however far on the read begins.
+    return detail === null ? answer(404, { error: `RPE has no turn ${turn} in this chat.` }) : answer(200, withUse(detail, detailOf(chat, turn, 1) ?? detail));
   }
   return answer(404, { error: `RPE has no ${request.method} ${path}.` });
 }

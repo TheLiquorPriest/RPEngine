@@ -9,7 +9,7 @@ import { afterEach, expect, test } from "bun:test";
 import type { AgentRef, Usage } from "rp-harness/contract";
 import { meterOf } from "../../src/play/panel-reads";
 import { CallRows } from "../../src/turn/usage";
-import { answered, AUTHOR, before, calling, CHAT, ended, JOB, LEAD_1, LEAD_2, recorder, RUN, spent, started, sum, T0, TURN, turnRecords, USER, type UsageBed, usageBed } from "./usage-rig";
+import { answered, AUTHOR, before, calling, CHAT, ended, JOB, LEAD_1, LEAD_2, recorder, RUN, SHIPPED, spent, started, sum, T0, TURN, turnRecords, USER, type UsageBed, usageBed, weightsOf } from "./usage-rig";
 
 const beds: UsageBed[] = [];
 afterEach(async () => {
@@ -168,30 +168,47 @@ test("a kept trace is read in once, with no parts where it kept none, and never 
   expect(whole.calls.ofTurns(USER, [TURN])).toEqual(kept);
 });
 
-test("a span's calls are summed in all and by definition, operation, part, chat and day, with no cached token counted twice", async () => {
+test("a span's calls are summed in all and by definition, operation, part, chat and day, with no cached token counted twice, and weighed by the weights given", async () => {
   const b = await bed();
   for (const record of turnRecords()) b.calls.record(record);
-  // A job of no chat, half an hour past the next midnight by UTC, under its own run.
+  // A job of no chat, half an hour past the next midnight by UTC, under its own run, on a connection of its own.
   const own = recorder("job-almanac", { user: USER, session: "session-almanac" });
   const clerk: AgentRef = { id: "agent-almanac", definition: "historian", job: "job-almanac" };
   const later = 4.5 * 3_600_000;
-  for (const record of [own(clerk, later, started("historian", { operation: "job" })), own(clerk, later + 10, calling(1)), own(clerk, later + 1_010, answered(1, spent(1_000, 0, 0, 100), 1_000)), own(clerk, later + 1_011, ended(spent(1_000, 0, 0, 100)))]) b.calls.record(record);
+  for (const record of [own(clerk, later, started("historian", { operation: "job", connection: "conn-mill" })), own(clerk, later + 10, calling(1, { connection: "conn-mill" })), own(clerk, later + 1_010, answered(1, spent(1_000, 0, 0, 100), 1_000)), own(clerk, later + 1_011, ended(spent(1_000, 0, 0, 100)))])
+    b.calls.record(record);
   await b.calls.settled();
 
-  const all = b.calls.sums(USER, {}, 0);
-  // Sent is what RPH counted, the cached tokens among it: 9,000 + 9,800 + 4,000 + 2,500 + 1,000.
-  expect(all.total).toEqual({ calls: 5, input: 26_300, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 9_100, output: 2_250, reasoning: 120 });
+  const all = b.calls.sums(USER, {}, 0, SHIPPED);
+  // Sent is what RPH counted, the cached tokens among it: 9,000 + 9,800 + 4,000 + 2,500 + 1,000. Weighed as shipped, a token sent fresh
+  // counts 1, one read from the cache 0.1, one written to it for its long lifetime 2 and one written out 5: the Author's first call
+  // 800 + 16,400 + 1,500, its second 700 + 820 + 1,800 + 2,250, the GM's 4,000 + 3,000, and the jobs' 2,500 + 4,000 and 1,000 + 500.
+  expect(all.total).toEqual({ calls: 5, input: 26_300, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 9_100, output: 2_250, reasoning: 120, weighted: 39_270 });
   expect(all.withParts).toBe(4);
-  expect(all.byDefinition.map((d) => [d.definition, d.spent.calls, d.spent.input])).toEqual([
-    ["author", 2, 18_800],
-    ["gm", 1, 4_000],
-    ["historian", 2, 3_500],
+  // Each cut the one that weighs most first.
+  expect(all.byDefinition.map((d) => [d.definition, d.spent.calls, d.spent.input, d.spent.weighted])).toEqual([
+    ["author", 2, 18_800, 24_270],
+    ["historian", 2, 3_500, 8_000],
+    ["gm", 1, 4_000, 7_000],
   ]);
-  expect(all.byOperation.map((o) => [o.operation, o.spent.calls, o.spent.input + o.spent.output])).toEqual([
-    ["lead", 2, 19_550],
-    ["sub", 1, 4_600],
-    ["job", 2, 4_400],
+  expect(all.byOperation.map((o) => [o.operation, o.spent.calls, o.spent.input + o.spent.output, o.spent.weighted])).toEqual([
+    ["lead", 2, 19_550, 24_270],
+    ["job", 2, 4_400, 8_000],
+    ["sub", 1, 4_600, 7_000],
   ]);
+  // The figure is worked out as the sum is read: a weight changed changes it for every row kept, and a connection's own weights,
+  // set under its id, weigh the calls its name carries and no other's.
+  expect(b.calls.sums(USER, {}, 0, weightsOf("usage:\n  weights:\n    output: 1\n")).total.weighted).toBe(39_270 - 4 * 2_250);
+  const mill = weightsOf("connections:\n  mill-id:\n    usage:\n      weights:\n        output: 0\n", [{ id: "mill-id", name: "conn-mill" }]);
+  expect(mill.connections.get("conn-mill")).toEqual({ cacheRead: 0.1, cacheWrite: 1.25, cacheWriteLong: 2, output: 0 });
+  expect(b.calls.sums(USER, {}, 0, mill).total.weighted).toBe(39_270 - 500);
+  expect(b.calls.sums(USER, {}, 0, mill).byDefinition.map((d) => [d.definition, d.spent.weighted])).toEqual([
+    ["author", 24_270],
+    ["historian", 7_500],
+    ["gm", 7_000],
+  ]);
+  // A turn's kept calls weighed for its line: its own runs' together, and each of its jobs' by id.
+  expect([...b.calls.weighedOfTurns(USER, [TURN, "turn-elsewhere"], SHIPPED)].map(([turn, of]) => [turn, of.runs, [...of.jobs]])).toEqual([[TURN, 31_270, [[JOB, 6_500]]]]);
   expect(all.byPart).toEqual([
     { part: "opening", name: null, calls: 4, chars: 19_200, tokens: 4_800 },
     { part: "prompt", name: "lore", calls: 2, chars: 16_000, tokens: 4_000 },
@@ -209,15 +226,15 @@ test("a span's calls are summed in all and by definition, operation, part, chat 
     ["2031-03-10", 1],
   ]);
   // Counted five hours west of UTC, the job of the next day's first half hour falls on the evening before.
-  expect(b.calls.sums(USER, {}, -300).byDay.map((d) => [d.day, d.spent.calls])).toEqual([["2031-03-09", 5]]);
+  expect(b.calls.sums(USER, {}, -300, SHIPPED).byDay.map((d) => [d.day, d.spent.calls])).toEqual([["2031-03-09", 5]]);
 
   // One chat's, a stretch of time, and the calls recorded under a turn.
-  expect(b.calls.sums(USER, { chat: CHAT }, 0).total.calls).toBe(4);
-  expect(b.calls.sums(USER, { from: T0 + 6_000, to: T0 + later }, 0).total).toMatchObject({ calls: 2, input: 12_300 });
-  expect(b.calls.sums(USER, { turns: [TURN] }, 0).total.calls).toBe(4);
-  expect(b.calls.sums(USER, { turns: ["turn-elsewhere"] }, 0)).toEqual({ total: { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, cacheWriteLong: 0, output: 0, reasoning: 0 }, withParts: 0, byDefinition: [], byOperation: [], byPart: [], byChat: [], byDay: [] });
+  expect(b.calls.sums(USER, { chat: CHAT }, 0, SHIPPED).total.calls).toBe(4);
+  expect(b.calls.sums(USER, { from: T0 + 6_000, to: T0 + later }, 0, SHIPPED).total).toMatchObject({ calls: 2, input: 12_300 });
+  expect(b.calls.sums(USER, { turns: [TURN] }, 0, SHIPPED).total.calls).toBe(4);
+  expect(b.calls.sums(USER, { turns: ["turn-elsewhere"] }, 0, SHIPPED)).toEqual({ total: { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, cacheWriteLong: 0, output: 0, reasoning: 0, weighted: 0 }, withParts: 0, byDefinition: [], byOperation: [], byPart: [], byChat: [], byDay: [] });
   // Another user's rows are none of his.
-  expect(b.calls.sums("user-other", {}, 0).total.calls).toBe(0);
+  expect(b.calls.sums("user-other", {}, 0, SHIPPED).total.calls).toBe(0);
 });
 
 test("the rows of calls that began before the days kept are removed, with what the agents started then were handed", async () => {

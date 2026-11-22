@@ -124,7 +124,7 @@ What you pick does not play by itself. It waits for your next message, and the A
 RPE's pages are in a tab of Lumiverse's drawer called **RPE**, for the chat Lumiverse has open. Its bar holds **Live**, **Turns**, **World** and **Play**, and **More** holds the rest. The same pages are in RPE's web app, where the **Chats** page lists the chats RPE plays, the latest played first, and you pick one ([the web app](install.md#the-web-app-and-its-key)).
 
 - For one chat: **Live**, **Turns**, **Sessions**, **World**, **Cast**, **Prompt**, **Story**, **Places**, **Quests**, **Lore** and **Play**.
-- For everything: **Jobs**, **Agents**, **Rules**, **Build**, **Files**, **Connections**, **Settings**, **Runtime**, **Storage** and **Migration**.
+- For everything: **Jobs**, **Usage**, **Agents**, **Rules**, **Build**, **Files**, **Connections**, **Settings**, **Runtime**, **Storage** and **Migration**.
 
 At the top, a line says how the page reaches RPE: **Direct**, or **Through Lumiverse** (by way of the extension). Where the extension does not hold RPE's registration or lacks a permission, a banner says so, with **Check again**. Where RPE refuses something, the page shows it in RPE's own words.
 
@@ -375,15 +375,16 @@ Replies written while the chat was on another connection, after RPE's first turn
 
 ### The Turns page
 
-**Turns** lists every turn RPE has played in the chat, newest first: what it was (**New reply**, **Swipe**, **Regenerate**, **Continue**, **Impersonation**, **Settle run**), when, how long it took, its calls and tokens, its marks, and how it ended (**Reply released**, **No reply**, **Stopped**, **Stopped at a limit**, **Failed**). A turn the migration carried is marked **carried**, and opens to what the old engine recorded.
+**Turns** lists every turn RPE has played in the chat, newest first: what it was (**New reply**, **Swipe**, **Regenerate**, **Continue**, **Impersonation**, **Settle run**), when, how long it took, its calls and tokens and what they weigh (see [What is spent](#what-is-spent)), the jobs it started with what they spent, its marks, and how it ended (**Reply released**, **No reply**, **Stopped**, **Stopped at a limit**, **Failed**). A turn the migration carried is marked **carried**, and opens to what the old engine recorded.
 
 A turn's own page has its sections, those behind the spoiler gate shown once you open it:
 
-- **Marks on this turn**, **Timings**, **Tokens**, **Its runs** and **What went to the chat**;
+- **Marks on this turn**, **Timings**, **Tokens** (with what its calls weigh, and each job it started with its own use), **Its runs** and **What went to the chat**;
 - **What you asked for**: your depth, your swipe's way and feedback, what you pressed in the play views;
 - **What the Author was given** (gated): the prompt by part, its lore, the turn's files, and what each agent's first call was sent;
 - **The prompt's front, and what changed in it**, and **A reply asked for whole**, where one was;
 - **Intent record**, **The Author's record of the turn**, **Tokens by agent** and **The run, step by step** (gated);
+- **Where the tokens went** (gated): each agent with what it was handed as it started and its calls one by one, each call with its tokens, what they weigh and its request part by part; a call made after the reply went out is marked **after the reply**, and one that read nothing from the provider's cache and wrote it again is marked **cold write**, with why; below, the jobs the turn started, each with its own use;
 - **Changes by lane**, and **The changes, lane by lane** (gated), each with who made it, how sure it is and where it came from;
 - **The review card** (gated): every change the turn made, under **The story's changes** and **The engine's changes**, each told in words (what changed, who made it and how sure it is, what it reported), with **Undo it** and a line saying what an Undo takes back and what it would leave; **The record as written** is closed under each, for whoever is looking for a fault. **Questions asked on it** holds the writes that wait for your word (see [Who may write what](#who-may-write-what));
 - **Who perceived the turn**;
@@ -588,9 +589,14 @@ An agent's sampling (temperature, top P and the rest) is the provider's own unle
 
 - The HUD's **This turn**: the newest turn's calls, seconds, tokens and lore lookups.
 - **Live**: what each run has spent as it goes.
-- **Turns**: each turn's calls and tokens, and on its page **Tokens** and **Tokens by agent**.
+- **Turns**: each turn's calls and tokens, what they weigh, and the jobs it started; and on its page **Tokens**, **Tokens by agent** and **Where the tokens went**.
+- **Usage**: where the tokens went over the turns played last, or over the last days, for the chat open or for every chat: in all, by agent, by what the calls were for, by part of the request, by chat and by day, each set against the span before it, so that what grew and what shrank shows.
 - **Sessions** and **Jobs**: the calls a run made against the limit that applies to it, and each agent's window as a gauge, how near compaction it is.
 - **Runtime**: where the time goes across the latest turns.
+
+Every figure is tokens, as the provider counted them. Beside them stands one **weighted** figure: a token sent fresh counts 1, and one read from the provider's cache, one written to it and one the model wrote count by a weight. The weights are settings (`usage.weights.cacheRead`, `cacheWrite`, `cacheWriteLong` for a call that asked the cache's long lifetime, and `output`), shipped as the terms of one provider; other providers' terms differ, so each can be set for one connection too (**For each connection** on the Settings page). The figure is worked out as a page reads it: a weight you change shows at once, for everything kept. It is never money.
+
+RPE keeps a row for each model call as it ends, for good unless **Rows of model calls kept** (`usage.rowsKeptDays`) says a number of days. What was played before it kept them can be read in from the turns' own traces with **Read them in** on the Usage page; a call read in from an older trace carries its totals alone, without its parts.
 
 ## Jobs and sessions
 

@@ -23,6 +23,7 @@ import { entry as settingsPage } from "./pages/settings";
 import { entry as storagePage } from "./pages/storage";
 import { entry as storyPage } from "./pages/story";
 import { entry as turnsPage } from "./pages/turns";
+import { entry as usagePage } from "./pages/usage";
 import { entry as worldPage } from "./pages/world";
 
-export const PAGES: readonly PageEntry[] = [agentsPage, buildPage, castPage, chatsPage, connectionsPage, filesPage, jobsPage, livePage, lorePage, migrationPage, placesPage, playPage, promptPage, questsPage, rulesPage, runtimePage, sessionsPage, settingsPage, storagePage, storyPage, turnsPage, worldPage].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+export const PAGES: readonly PageEntry[] = [agentsPage, buildPage, castPage, chatsPage, connectionsPage, filesPage, jobsPage, livePage, lorePage, migrationPage, placesPage, playPage, promptPage, questsPage, rulesPage, runtimePage, sessionsPage, settingsPage, storagePage, storyPage, turnsPage, usagePage, worldPage].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));

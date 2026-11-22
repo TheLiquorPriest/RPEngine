@@ -1,27 +1,18 @@
 // The routes of the use of the models (`src/turn/usage-routes.ts`), called as the server calls them, each reply held to its
 // declaration: a turn's use, agent by agent with what each was handed and its calls by part, and the job its run started beside it
 // with its own use; a continue that joined a turn counted with it, and its held turn answered as joined; a span of turns or of time
-// summed by operation and by part; and what was played before the rows were kept read in from the kept traces on a press, each call
-// with its totals and no parts. Every name and every figure is invented.
+// summed by operation and by part; the weighted figure beside every sum and every call, by the weights the settings hold as the
+// route answers; and what was played before the rows were kept read in from the kept traces on a press, each call with its totals
+// and no parts. Every name and every figure is invented.
 
 import { afterEach, expect, test } from "bun:test";
-import type { RunScope, TraceRecord } from "rp-harness/contract";
 import { RouteError } from "../../src/app";
-import { readConfig } from "../../src/app/config-read";
-import type { ApiRoutes } from "../../src/shared/api";
 import { JoinedTurnError } from "../../src/store";
 import { kvStore } from "../../src/turn";
-import { type Run, type RunRecord, Runs } from "../../src/turn/runs";
-import { usageRoutes } from "../../src/turn/usage-routes";
-import { callRoute } from "../app/call";
-import { AUTHOR, before, CHAT, CLERK_1, GM, JOB, jobRecord, jobScope, RUN, SCOPE, SESSION, T0, TURN, turnRecords, USER, type UsageBed, usageBed } from "./usage-rig";
+import { AUTHOR, before, CHAT, CLERK_1, GM, JOB, jobRecord, jobScope, RUN, SCOPE, SESSION, T0, TURN, turnRecords, USER, type UsagePages, usagePages } from "./usage-rig";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-
-type TurnUse = ApiRoutes["GET /api/v1/chats/:chat/turns/:turn/use"]["reply"];
-type UsageSpan = ApiRoutes["GET /api/v1/usage"]["reply"];
-type ReadIn = ApiRoutes["POST /api/v1/usage/read-in"]["reply"];
 
 /** The status a route refused with; null where it answered, or failed in another way. */
 const refusal = (asked: Promise<unknown>): Promise<number | null> =>
@@ -30,114 +21,13 @@ const refusal = (asked: Promise<unknown>): Promise<number | null> =>
     (error: unknown) => (error instanceof RouteError ? error.status : null),
   );
 
-/** A folder RPE keeps a trace in, by its place below the chat: the session, then the turn. */
-const folderOf = (scope: RunScope): string => `${scope.session}/${scope.turn ?? ""}`;
-
-interface Page {
-  b: UsageBed;
-  /** What each folder keeps, by folder; a folder in `unreadable` cannot be read, and each read is noted in `read`. */
-  kept: Map<string, TraceRecord[]>;
-  unreadable: Set<string>;
-  read: string[];
-  /** The turns with a run going on now. */
-  going: Set<string>;
-  /** The turns the store holds as joined to another, each with the turn it joined. */
-  joined: Map<string, string>;
-  /** Keeps records as RPE's trace does: each in the folder of its scope's session and turn. */
-  keeps(records: readonly TraceRecord[]): void;
-  /** Keeps a run of RPE's as it stands. */
-  played(run: Partial<RunRecord> & Pick<RunRecord, "id" | "turn" | "received">): Promise<void>;
-  use(turn: string, chat?: string, user?: string): Promise<TurnUse>;
-  span(query?: Record<string, string | number>, user?: string): Promise<UsageSpan>;
-  readIn(): Promise<ReadIn>;
-}
-
-const pages: Page[] = [];
+const pages: UsagePages[] = [];
 afterEach(async () => {
   for (const p of pages.splice(0)) await p.b.close();
 });
 
-async function page(): Promise<Page> {
-  const b = await usageBed();
-  const runs = new Runs(b.db, b.writes);
-  const kept = new Map<string, TraceRecord[]>();
-  const unreadable = new Set<string>();
-  const read: string[] = [];
-  const going = new Set<string>();
-  const joined = new Map<string, string>();
-  const [use, span, readIn] = usageRoutes({
-    calls: b.calls,
-    runs: {
-      ofTurn: (user, turn) => runs.ofTurn(user, turn),
-      newestPlayed: (user, count, within) => runs.newestPlayed(user, count, within),
-      playedFolders: (user) => runs.playedFolders(user),
-      running: (_user, turn) => (going.has(turn) ? ({} as Run) : undefined),
-    },
-    db: b.db,
-    turn: (_user, turn) => (joined.has(turn) ? { chat: CHAT, joined: joined.get(turn) ?? "" } : null),
-    kept: async (scope: RunScope) => {
-      const folder = folderOf(scope);
-      read.push(folder);
-      if (unreadable.has(folder)) throw new Error("the folder cannot be read");
-      return kept.get(folder) ?? [];
-    },
-    shared: () => readConfig([], null),
-    log: b.log,
-  });
-  const p: Page = {
-    b,
-    kept,
-    unreadable,
-    read,
-    going,
-    joined,
-    keeps: (records) => {
-      for (const record of records) kept.set(folderOf(record.scope), [...(kept.get(folderOf(record.scope)) ?? []), record]);
-    },
-    played: async (run) => {
-      const record: RunRecord = {
-        traceRun: null,
-        user: USER,
-        chat: CHAT,
-        session: SESSION,
-        generation: null,
-        target: null,
-        swipe: null,
-        kind: "new",
-        status: "released",
-        started: run.received,
-        firstWord: null,
-        released: null,
-        finished: null,
-        ended: run.received + 10_000,
-        intent: null,
-        thinking: [],
-        withoutIntent: false,
-        intake: null,
-        wait: null,
-        folder: null,
-        usage: null,
-        lookups: { searches: 0, reads: 0 },
-        reply: "",
-        progress: [],
-        error: null,
-        stoppedBy: null,
-        lastText: false,
-        notGiven: [],
-        base: "",
-        saved: null,
-        settled: null,
-        held: null,
-        mark: null,
-        intentRecord: null,
-        ...run,
-      };
-      await b.writes.run((db) => runs.put(db, record));
-    },
-    use: (turn, chat = CHAT, user = USER) => callRoute(use, { params: { chat, turn }, user }),
-    span: (query = {}, user = USER) => callRoute(span, { query, user }),
-    readIn: () => callRoute(readIn, { user: USER }),
-  };
+async function page(): Promise<UsagePages> {
+  const p = await usagePages();
   pages.push(p);
   return p;
 }
@@ -151,8 +41,10 @@ test("a turn's use is its agents, each with what it was handed and its calls by 
 
   const use = await p.use(TURN);
   expect(use.turn).toBe(TURN);
-  // The turn's own runs: the Author's two calls and the GM's one. The job's call is its own.
-  expect(use.spent).toEqual({ calls: 3, input: 22_800, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 9_100, output: 1_350, reasoning: 120 });
+  // The turn's own runs: the Author's two calls and the GM's one. The job's call is its own. Weighed as shipped: the Author's
+  // 18,700 and 5,570 (its cache written for the long lifetime, at 2), and the GM's 7,000.
+  expect(use.spent).toEqual({ calls: 3, input: 22_800, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 9_100, output: 1_350, reasoning: 120, weighted: 31_270 });
+  expect(use.weights).toEqual({ cacheRead: 0.1, cacheWrite: 1.25, cacheWriteLong: 2, output: 5, connections: [] });
   expect(use.agents.map((a) => [a.definition, a.run, a.spent.calls, a.spent.input, a.calls.map((c) => c.n)])).toEqual([
     ["author", RUN, 2, 18_800, [1, 2]],
     ["gm", RUN, 1, 4_000, [1]],
@@ -183,6 +75,7 @@ test("a turn's use is its agents, each with what it was handed and its calls by 
     cacheWrite: 8_200,
     output: 300,
     reasoning: 120,
+    weighted: 18_700,
     parts: [
       { part: "opening", chars: 6_000, tokens: 1_500 },
       { part: "prompt", name: "lore", chars: 8_000, tokens: 2_000 },
@@ -202,7 +95,7 @@ test("a turn's use is its agents, each with what it was handed and its calls by 
     {
       id: JOB,
       job: { id: JOB, agent: "historian", brief: "Tally the tide tables.", state: "done", scope: jobScope(JOB), startedBy: AUTHOR, started: T0 + 6_100, ended: T0 + 9_612, usage: CLERK_1 },
-      spent: { calls: 1, input: 2_500, cacheRead: 0, cacheWrite: 0, cacheWriteLong: 0, output: 800, reasoning: 0 },
+      spent: { calls: 1, input: 2_500, cacheRead: 0, cacheWrite: 0, cacheWriteLong: 0, output: 800, reasoning: 0, weighted: 6_500 },
       agents: [expect.objectContaining({ run: JOB, definition: "historian", sent: [], calls: [expect.objectContaining({ n: 1, operation: "job", input: 2_500, output: 800 })] })],
     },
   ]);
@@ -245,12 +138,25 @@ test("a span is summed in all and by operation, by part, by definition, by chat 
   // The newest turn: its runs' calls and its job's.
   const newest = await p.span({ turns: 1 });
   expect(newest).toMatchObject({ turns: 1, from: T0 + 5 * HOUR - 500, to: null, withParts: 4 });
-  expect(newest.total).toEqual({ calls: 4, input: 25_300, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 9_100, output: 2_150, reasoning: 120 });
-  expect(newest.byOperation.map((o) => [o.operation, o.spent.calls, o.spent.input, o.spent.output])).toEqual([
-    ["lead", 2, 18_800, 750],
-    ["sub", 1, 4_000, 600],
-    ["job", 1, 2_500, 800],
+  expect(newest.total).toEqual({ calls: 4, input: 25_300, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 9_100, output: 2_150, reasoning: 120, weighted: 37_770 });
+  expect(newest.byOperation.map((o) => [o.operation, o.spent.calls, o.spent.input, o.spent.output, o.spent.weighted])).toEqual([
+    ["lead", 2, 18_800, 750, 24_270],
+    ["sub", 1, 4_000, 600, 7_000],
+    ["job", 1, 2_500, 800, 6_500],
   ]);
+  // The weights it was worked out by are told with it; the rows are kept for good, so nothing is said of how long.
+  expect(newest.weights).toEqual({ cacheRead: 0.1, cacheWrite: 1.25, cacheWriteLong: 2, output: 5, connections: [] });
+  expect(newest.kept).toBeNull();
+  // A weight changed in the settings changes the figure at the next read, for the rows already kept; and where the rows are kept
+  // for a number of days alone, the setting is named with its value.
+  p.config.text = "usage:\n  rowsKeptDays: 30\n  weights:\n    output: 1\n";
+  expect(await p.span({ turns: 1 })).toMatchObject({ total: { output: 2_150, weighted: 37_770 - 4 * 2_150 }, weights: { output: 1 }, kept: { setting: "usage.rowsKeptDays", name: "Rows of model calls kept", days: 30 } });
+  // A connection's own weights, set under its id, weigh the calls its name carries.
+  p.connections.push({ id: "harbor-id", name: "conn-harbor" });
+  p.config.text = "connections:\n  harbor-id:\n    usage:\n      weights:\n        cacheRead: 0\n";
+  expect(await p.span({ turns: 1 })).toMatchObject({ total: { weighted: 37_770 - 820 }, weights: { cacheRead: 0.1, connections: [{ connection: "conn-harbor", cacheRead: 0, cacheWrite: 1.25, cacheWriteLong: 2, output: 5 }] } });
+  expect((await p.use("turn-landing")).spent.weighted).toBe(31_270 - 820);
+  p.config.text = "";
   expect(newest.byPart.map((part) => [part.part, part.name, part.calls, part.tokens])).toEqual([
     ["opening", null, 4, 4_800],
     ["prompt", "lore", 2, 4_000],
@@ -313,7 +219,8 @@ test("what was played before the rows were kept is read in from the kept traces 
 
   // The old turn's use: its calls with their totals, no parts, and no word of what they were for; its job beside it.
   const old = await p.use("turn-old");
-  expect(old.spent).toEqual({ calls: 3, input: 22_800, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 0, output: 1_350, reasoning: 120 });
+  // Its trace told nothing of the cache, so what was written to it is weighed as written for the short lifetime.
+  expect(old.spent).toEqual({ calls: 3, input: 22_800, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 0, output: 1_350, reasoning: 120, weighted: 24_445 });
   expect(old.agents.flatMap((a) => a.calls.map((c) => [a.definition, c.n, c.input, c.output, c.operation, c.parts, c.cache]))).toEqual([
     ["author", 1, 9_000, 300, null, null, null],
     ["author", 2, 9_800, 450, null, null, null],

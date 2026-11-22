@@ -20,7 +20,7 @@ import { Handed } from "../files/stack";
 import type { SettingsShown } from "../settings";
 import type { RowActions } from "../settings/row";
 import { SettingName } from "../settings/names";
-import { windowOfModel } from "../usage";
+import { windowOfModel } from "../run-usage";
 import { listLine, rewrite, splitFile } from "./header";
 import { AgentSettings } from "./settings";
 
