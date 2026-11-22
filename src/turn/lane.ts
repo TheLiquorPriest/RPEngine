@@ -31,7 +31,7 @@ import type { LumiverseReads } from "../adapter/lumiverse/reads";
 import type { Stores } from "../adapter/lumiverse/stores";
 import { type App, LIVE_JOBS, RouteError, WritesClosed } from "../app";
 import { portTexts, readConfig } from "../app/config-read";
-import { type BookReader, CAST_PLAYER_MIND, castFacts, CastRecord, castTools, chatLine, findCharacter, MemorySearch, playerMindOf, type SourceReader } from "../cast";
+import { type BookReader, CAST_PLAYER_MIND, castFacts, CastRecord, castTools, chatLine, findCharacter, type JobsOf, MemorySearch, playerMindOf, type SourceReader } from "../cast";
 import { castAt } from "../cast/path";
 import { charactersOf } from "../cast/record";
 import { holdersOf } from "../quests/holders";
@@ -373,6 +373,8 @@ export interface Turns {
   placeSources: PlaceSourcesReader;
   /** The cast as a place's or a quest's record reads it at a turn of the chat (the head where none is named): every character's items and names. */
   castKnowledge(user: string, chat: string, turn: string | null): CastKnowledge;
+  /** The chat's jobs as the cast reads them (`JobsOf`): what the Cast page and the press that starts a take-in count a job of a character's own agent by, as the cast's facts do. */
+  castJobs: JobsOf;
 }
 
 export function buildTurns(app: App, options: TurnsOptions): Turns {
@@ -574,6 +576,21 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
     const known = castKnowledge(user, chat, turn);
     return holdersOf(known.items, (id) => known.nameOf(id), quest);
   };
+  // The chat's jobs as the cast reads them (`JobsOf`): those not ended, every one; and those done, ended since `since`. What a job of a
+  // character's own agent has in hand is counted by them alike in the cast's facts, on the Cast page and by the press that starts a take-in.
+  const castJobs: JobsOf = async ({ user, chat }, since) => {
+    const out: JobView[] = [];
+    for (const states of [["queued", "held", "running", "asking"], ["done"]] satisfies JobState[][]) {
+      if (states[0] === "done" && since === Number.POSITIVE_INFINITY) continue;
+      let cursor: string | undefined;
+      do {
+        const page = await harness.jobs.list({ user, chat, states, ...(cursor !== undefined ? { cursor } : {}) });
+        out.push(...page.jobs.filter((j) => states[0] !== "done" || (j.ended ?? 0) >= since));
+        cursor = page.next;
+      } while (cursor !== undefined);
+    }
+    return out.map((j) => ({ id: j.id, plays: j.plays ?? null, state: j.state, started: j.started, ended: j.ended ?? null, turn: j.scope.turn ?? null }));
+  };
   // Who was on stage at each turn the cast counts, and how that was read (R-56, `countedOn`): the open scene's own list of who is in it; with none recorded, who the state places where the owner's character stands; with neither, nobody. With the place and the story's time there.
   // The scene each turn was played in, and those closed at the reading, from the story record. Whether his own character has a mind is his setting for the chat (`cast.playerMind`), read at each use; the cast's settings are the chat's.
   facts.add(
@@ -582,20 +599,7 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
       sources,
       onStage: async ({ user, chat }, turns) => new Map([...stagesAt(store, user, chat, turns)].map(([turn, stage]) => [turn, countedOn(stage)])),
       scenes: async ({ user, chat }, turns, at) => ({ of: scenesOf(store, user, chat, turns), closed: closedScenesAt(store, user, chat, at) }),
-      // The chat's jobs that may have a character's perceptions in hand: those not ended, every one; and those done, ended since `since`.
-      jobs: async ({ user, chat }, since) => {
-        const out: JobView[] = [];
-        for (const states of [["queued", "held", "running", "asking"], ["done"]] satisfies JobState[][]) {
-          if (states[0] === "done" && since === Number.POSITIVE_INFINITY) continue;
-          let cursor: string | undefined;
-          do {
-            const page = await harness.jobs.list({ user, chat, states, ...(cursor !== undefined ? { cursor } : {}) });
-            out.push(...page.jobs.filter((j) => states[0] !== "done" || (j.ended ?? 0) >= since));
-            cursor = page.next;
-          } while (cursor !== undefined);
-        }
-        return out.map((j) => ({ plays: j.plays ?? null, state: j.state, started: j.started, ended: j.ended ?? null, turn: j.scope.turn ?? null }));
-      },
+      jobs: castJobs,
       playerMind: async (scope) => playerMindOf(readConfig(await portTexts(files, scope), app.log, [CAST_PLAYER_MIND])),
       settings: async (scope) => (await turnSettings(files, scope, app.log)).cast,
       tokens: async (scope) => tokenCount((await turnSettings(files, scope, app.log)).charsPerToken),
@@ -624,8 +628,8 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
     const tokens = tokenCount(settings.charsPerToken);
     const [engine, cast, story, indexing] = await Promise.all([
       engineTools({ store: store.user(scope.user), env: store.envOf(scope.user), writes: app.writes, files: texts, search: indexedSearch(stateIndex, { user: scope.user, chat: scope.chat }), grid: gridMoves(wording.lines, settings.map), map: mapView(wording, settings.map), mapSettings: settings.map, due, dueAhead: settings.worldState.dueAhead, settings: settings.engine, places: settings.places, quests: settings.quests, placeSources, questHolders, lastUse, tokens, ...receipts, ...(options.carried !== undefined ? { carried: options.carried } : {}), ...(options.worlds !== undefined ? { worlds: options.worlds } : {}), ...asked }),
-      // The cast counts sizes as the chat does, and reads by scene what the story record says of each turn (plan 3.2 §6.4): both are the turn's to hand it.
-      castTools({ store, writes: app.writes, files: texts, sources, books: bookTexts(options.books), secretFact: (user, shown) => secretFacts.secretFactOf(user, shown), search: memorySearch, now: () => clock.now(), settings: settings.cast, tokens, scenes: ({ user, chat }, at, turns) => scenesAcross(store, user, chat, at, turns), lastUse, ...receipts, ...asked }),
+      // The cast counts sizes as the chat does, and reads by scene what the story record says of each turn (plan 3.2 §6.4): both are the turn's to hand it. Its near matches are offered as the engine's are, by the chat's settings.
+      castTools({ store, writes: app.writes, files: texts, sources, books: bookTexts(options.books), secretFact: (user, shown) => secretFacts.secretFactOf(user, shown), search: memorySearch, now: () => clock.now(), settings: settings.cast, near: settings.engine, tokens, scenes: ({ user, chat }, at, turns) => scenesAcross(store, user, chat, at, turns), lastUse, ...receipts, ...asked }),
       storyTools({ store, writes: app.writes, files: texts, overlay, settings: settings.story, lastUse, tokens, ...receipts }),
       loreTools({ index: loreIndex, guidance: loadGuidance(files, scope), log: app.log }),
     ]);
@@ -647,8 +651,9 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
   const lorePorts = lorePort(lore, loreIndex);
   // A job's end is told through `events.job`, which records it; the lane, made below, brings the sessions of its turn up to date. Each
   // change of a job's state is told to every page that follows his jobs, by the job's row, its brief cut as the shared levels say now: a
-  // page that has the job open reads it whole by its id.
-  const eventsDeps: EventsDeps = { db: app.db, writes: app.writes, store, runs, files, sources, search: memorySearch, loreIndex, notes, suggestions, proposals: options.proposals, due, ...(options.views !== undefined ? { views: options.views } : {}), now: () => clock.now(), jobEnded: (user, chat, turn) => lane.sessionsAfter(user, chat, turn), jobTold: (job) => JOB_KIND.publish(app.live, LIVE_JOBS, { job: jobRowOf(job, globalConfig(app.paths.files, app.log)) }), kept: (user, chat, turn) => prompts.keptAt(user, chat, turn), log: app.log };
+  // page that has the job open reads it whole by its id. What tools an agent's definition holds is RPH's reading of the definition in
+  // force at the scope, the one the Agents page lists.
+  const eventsDeps: EventsDeps = { db: app.db, writes: app.writes, store, runs, files, sources, search: memorySearch, loreIndex, notes, suggestions, tools: async (scope, definition) => (await harness.definitions.list(scope)).find((d) => d.name === definition)?.tools ?? [], proposals: options.proposals, due, ...(options.views !== undefined ? { views: options.views } : {}), now: () => clock.now(), jobEnded: (user, chat, turn) => lane.sessionsAfter(user, chat, turn), jobTold: (job) => JOB_KIND.publish(app.live, LIVE_JOBS, { job: jobRowOf(job, globalConfig(app.paths.files, app.log)) }), kept: (user, chat, turn) => prompts.keptAt(user, chat, turn), log: app.log };
   const events = turnEvents(eventsDeps);
   const env: Environment = {
     id: "rpe",
@@ -811,5 +816,5 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
       return new Map(here.map((e) => [e.id, { tokens: e.hash === null ? null : Math.ceil(e.chars / settings.charsPerToken), status: e.status === "gone" ? null : e.status, lead: did?.get(e.id) ?? null }] as const));
     },
   };
-  return { lane, store, harness, env, facts, files, chats, take, place, prompts, loreTurns, runs, requests, approvals, writes: app.writes, marks, trace, calls, lore, secretSettings, secretMarks, loreIndex, notes, suggestions, projection, meaning, stateIndex, given, sources, placeSources, castKnowledge };
+  return { lane, store, harness, env, facts, files, chats, take, place, prompts, loreTurns, runs, requests, approvals, writes: app.writes, marks, trace, calls, lore, secretSettings, secretMarks, loreIndex, notes, suggestions, projection, meaning, stateIndex, given, sources, placeSources, castKnowledge, castJobs };
 }

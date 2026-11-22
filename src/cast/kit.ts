@@ -10,7 +10,7 @@ import type { ConfigRead } from "../app/config-read";
 import type { NumberSettings, Setting } from "../app/setting-list";
 import { calendarOf, formatClock, formatDay, placeOffset } from "../engine/calendar";
 import { placeOfEntity } from "../engine/scope";
-import { type AreaCall, type AreaSpec, type AreaWords, IFACE_DEFAULTS, type LastUseKeeper, type Reply, type Writes } from "../iface/kit";
+import { type AreaCall, type AreaSpec, type AreaWords, IFACE_DEFAULTS, type IfaceSettings, type LastUseKeeper, type Reply, type Writes } from "../iface/kit";
 import type { ReceiptKeeper } from "../iface/receipt";
 import { nearestOf } from "../iface/reading";
 import { type GuidanceFiles, Lines } from "../iface/texts";
@@ -18,7 +18,6 @@ import { clockRecorded, JoinedTurnError, type Store, StoreInputError, type UserS
 import { castAt } from "./path";
 import { IMPORTED_KIND } from "./carried";
 import { importedText } from "./imported";
-import type { SceneNamed } from "./facts";
 import { type BaseVersion, type CastItem, CastRecord, type Character, chatLine } from "./record";
 import type { MemorySearch } from "./search";
 import type { BookReader, SecretFactOf } from "./secrets";
@@ -138,7 +137,7 @@ export const CAST_START_DEFS = {
     none: "all of it, on every start",
     perConnection: false,
     name: "Newest perceptions a character starts with",
-    about: "Tokens of what a character has perceived and not yet taken in that its own agent is handed whole when it starts, the newest first. Nothing is cut to fit: what passes this waits whole, counted in a line with its size and listed in the character's outline, and the character opens it with self_read. None: all of it is handed over on every start, however much waits.",
+    about: "Tokens of what a character has perceived and not yet taken in that its own agent is handed whole when it starts, the newest first. Nothing is cut to fit: what passes this waits whole, counted in a line with its size and listed in the character's outline, and the character opens it with self_read. An agent whose definition holds no self_read is handed all of it, since it could not open what waits. None: all of it is handed over on every start, however much waits.",
     effect: "turn",
   },
   importedTokens: {
@@ -149,7 +148,7 @@ export const CAST_START_DEFS = {
     none: "every one whole, on every start",
     perConnection: false,
     name: "Old mind files a character starts with",
-    about: "Tokens of a migrated character's old mind files, not yet filed, that its own agent is handed whole when it starts, in the order they were carried. As shipped none is: each is listed by its name and size, and the character opens one with self_read. None: every one is handed over whole on every start.",
+    about: "Tokens of a migrated character's old mind files, not yet filed, that its own agent is handed whole when it starts, in the order they were carried. As shipped none is: each is listed by its name and size, and the character opens one with self_read. An agent whose definition holds no self_read is handed every one whole, since it could not open them. None: every one is handed over whole on every start.",
     effect: "turn",
   },
 } as const satisfies Record<keyof CastStart, Setting>;
@@ -192,12 +191,23 @@ export interface CastDeps {
   /** A text's tokens at the chat's characters to a token (RPH's `tokens.charsPerToken`): what an answer counts the size of what it names by (plan 3.2 §7.1). Absent: no size is said. */
   tokens?: (text: string) => number;
   /**
-   * The scene each of `turns` lies in as the story record stands at a reading of the chat (`at`: a turn, or its head for null); null
-   * for a turn in none. The story record is the host's to read (the cast may not), so the host says it. Absent: nothing is read by scene.
+   * The scene each of `turns` lies in as the story record stands at a reading of the chat (`at`: a turn, or its head for null), by its
+   * id; null for a turn in none. The story record is the host's to read (the cast may not), so the host says it, and names a scene by its
+   * id alone: its title is the record's words, which `self_read` never gives the character. Absent: nothing is read by scene.
    */
-  scenes?: (scope: { user: string; chat: string }, at: string | null, turns: readonly string[]) => ReadonlyMap<string, SceneNamed | null>;
+  scenes?: (scope: { user: string; chat: string }, at: string | null, turns: readonly string[]) => ReadonlyMap<string, string | null>;
+  /** How an answer about a name, an id or a day that is not there offers the nearest (`engine.nearMatches`, `engine.nearDistance`), as the chat sets it for the engine's tools; the shipped values where absent. */
+  near?: NearSettings;
   /** Milliseconds since 1970, for a row's time; `Date.now` when absent. */
   now?: () => number;
+}
+
+/** How many near matches an answer lists, and how near a match must be. */
+export type NearSettings = Pick<IfaceSettings, "nearMatches" | "nearDistance">;
+
+/** How a call's answers offer near matches: the chat's settings for them, or the shipped values where the host gives none. */
+export function nearOf(call: Pick<CastCall, "deps">): NearSettings {
+  return call.deps.near ?? IFACE_DEFAULTS;
 }
 
 /** One call of a cast tool. */
@@ -306,9 +316,9 @@ export function readingOr(call: CastCall, reply: Reply): CastReading | null {
   };
 }
 
-/** The nearest of `ids` to what was said, no more than an answer about a name that is not there lists (`engine.nearMatches`): offered where an id is none of the character's. */
-export function nearIds(said: string, ids: readonly string[]): string[] {
-  return nearestOf(said, ids, IFACE_DEFAULTS).slice(0, IFACE_DEFAULTS.nearMatches);
+/** The nearest of `ids` to what was said, no more than an answer about a name that is not there lists (`near`, the chat's `engine.nearMatches`): offered where an id is none of the character's. */
+export function nearIds(said: string, ids: readonly string[], near: NearSettings): string[] {
+  return nearestOf(said, ids, near).slice(0, near.nearMatches);
 }
 
 // ---------------------------------------------------------------- what answers show

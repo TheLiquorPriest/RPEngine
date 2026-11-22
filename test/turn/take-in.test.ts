@@ -3,10 +3,14 @@
 // instance of itself with `task`, each instance is given its own batch and no other and writes that batch's memories, and the
 // character settles its mind once, from what they report. No perception is taken in twice, and none is left. Where everything fits
 // one batch the character is given the perceptions whole and takes them in itself. An agent that plays a character hands an instance
-// only what is its character's own: the story record it names is not given. Played through the stand-in Lumiverse on the scripted
-// model. Every name is invented.
+// only what is its character's own: the story record it names is not given. The Cast page's press starts one job for each character
+// the cast holds, however its name is written, and none while its own agent is at work already, whose job has what waits in hand. A
+// character definition of the user's own that holds no `self_read` is handed what waits whole, as before there were sizes. Played
+// through the stand-in Lumiverse on the scripted model. Every name is invented.
 
 import { afterEach, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { JsonObject } from "rp-harness/contract";
 import type { Answer } from "rp-harness/testing/rig";
 import { CastRecord, chatLine, findCharacter } from "../../src/cast";
@@ -180,4 +184,94 @@ test("what fits one batch is given whole, and she takes it in herself", async ()
   for (const content of REACHED) expect(seen[0]).toContain(content);
   expect(listed(seen[0] as string)).toEqual([]);
   expect(wrenNow(b)).toMatchObject({ untaken: [], memories: ["A stranger came and went."] });
+});
+
+/** What the take-in press answers: the jobs it started, and the characters it started none for, with why. */
+type Pressed = { jobs: { character: string; job: { id: string } }[]; refused: { character: string; why: string }[] };
+
+test("the press starts one job for each character the cast holds, however its name is written; a name it does not hold, and a character whose own agent is at work already, are answered with why; the Cast page counts none of what that job has in hand", async () => {
+  const release = Promise.withResolvers<void>();
+  let starts = 0;
+  const hers: Answer = async (request) => {
+    const text = sent(request);
+    if (request.messages.some((m) => m.role === "toolResult")) return { pieces: [{ text: "Taken in." }] };
+    // Her agent holds its first call until the test lets it go: the job is at work all the while.
+    starts += 1;
+    await release.promise;
+    return { pieces: [{ call: "remember", args: { memories: [{ text: "A stranger came and went in the storm.", gist: "A stranger came and went.", weight: 2, from: held(text), source: "character" }] } }] };
+  };
+  const b = await openTurnBed({ off: ["rules/unsourced", "rules/perceptions-owed", "rules/memory-owed", "rules/memory-late", "rules/memory-scene-end"], answers: routed([...VOICED], hers, 20) });
+  beds.push(b);
+  await play(b, "I ask whether the boat came.");
+  const waits = async (): Promise<number | undefined> => (await b.page<{ characters: { name: string; waits: { perceptions: number } }[] }>("GET", `/api/v1/chats/${CHAT}/cast`)).body.characters.find((c) => c.name === WREN)?.waits.perceptions;
+  const press = async (characters: string[]): Promise<Pressed> => (await b.page<Pressed>("POST", `/api/v1/chats/${CHAT}/jobs/take-in`, { characters })).body;
+  expect(await waits()).toBe(REACHED.length);
+
+  // A name the cast does not hold starts nothing, and is answered so in the cast's words.
+  expect(await press(["Nobody Here"])).toEqual({ jobs: [], refused: [{ character: "Nobody Here", why: "There is no Nobody Here in the cast." }] });
+  // Two ways of writing her name are one character: one job, under the name the cast holds.
+  const first = await press([WREN, WREN.toLowerCase()]);
+  expect(first.refused).toEqual([]);
+  expect(first.jobs.map((j) => j.character)).toEqual([WREN]);
+  const job = first.jobs[0]?.job.id ?? "";
+
+  // While her agent is at work, what its job was given is in its hands: the Cast page counts none of it, and a second press starts no second job, naming the one at work.
+  expect(await waits()).toBe(0);
+  expect(await press([WREN])).toEqual({ jobs: [], refused: [{ character: WREN, why: `${WREN}'s own agent is at work already in job ${job}, which has what waits for it in hand, so no second job was started.` }] });
+  expect((await b.turns.harness.jobs.list({ user: USER, chat: CHAT })).jobs.map((j) => j.id)).toEqual([job]);
+
+  // Let go, it takes in every perception once, in one memory.
+  release.resolve();
+  await jobDone(b);
+  expect(starts).toBe(1);
+  expect(wrenNow(b)).toMatchObject({ untaken: [], memories: ["A stranger came and went."] });
+  expect(await waits()).toBe(0);
+});
+
+/** A character definition of the user's own, as he copied it before a character could read its own record: the tools named, the views of its start, and no purposes. */
+function ownCharacter(tools: readonly string[]): string {
+  return [
+    "---",
+    "name: character",
+    "description: One principal character, in their own mind and voice.",
+    "model: default",
+    "effort: medium",
+    `tools: [${tools.join(", ")}]`,
+    "out_of_reach: [reply]",
+    "given:",
+    "  - cast:self(base, growth, mind, what-comes-to-mind, relationships:present, unprocessed-perceptions, game-side, imported)",
+    "---",
+    "You are one person of the story: the one your brief names.",
+    "",
+  ].join("\n");
+}
+
+test("a character definition of the user's own that holds no self_read is handed what waits whole, as before: nothing is held back that its agent could not open", async () => {
+  /** Her agent's first request in a take-in job, run on the definition given, where its start holds at most 10 tokens of perceptions: what it carries, and the tools it offers. */
+  const firstAsked = async (tools: readonly string[]): Promise<{ text: string; tools: string[] }> => {
+    const seen: { text: string; tools: string[] }[] = [];
+    const hers: Answer = (request) => {
+      if (seen.length === 0) seen.push({ text: sent(request), tools: request.tools.map((t) => t.name) });
+      return { pieces: [{ text: "Nothing to take in now." }] };
+    };
+    const b = await openTurnBed({ off: ["rules/unsourced", "rules/perceptions-owed", "rules/memory-owed", "rules/memory-late", "rules/memory-scene-end"], global: "cast:\n  newlyPerceivedTokens: 10\n", answers: routed([...VOICED], hers, 20) });
+    beds.push(b);
+    mkdirSync(join(b.app.paths.files, ".agents"), { recursive: true });
+    writeFileSync(join(b.app.paths.files, ".agents", "character.md"), ownCharacter(tools));
+    await play(b, "I ask whether the boat came.");
+    expect((await b.page<Pressed>("POST", `/api/v1/chats/${CHAT}/jobs/take-in`, { characters: [WREN] })).body.jobs).toHaveLength(1);
+    await jobDone(b);
+    return seen[0] ?? { text: "", tools: [] };
+  };
+  const tools = ["recall", "remember", "reflect", "dream", "mind_set", "relate", "ask_author", "skill_load"];
+  // His own definition is the one in force: its agent offers no self_read, and its start holds every perception whole.
+  const whole = await firstAsked(tools);
+  expect(whole.tools).not.toContain("self_read");
+  for (const content of REACHED) expect(whole.text).toContain(content);
+  expect(whole.text).not.toContain("Not shown here");
+  // The same definition holding self_read: its start holds back what passes the size, and says how to open it.
+  const zoomed = await firstAsked([...tools, "self_read"]);
+  expect(zoomed.tools).toContain("self_read");
+  expect(zoomed.text).toContain(`Not shown here: ${REACHED.length} perceptions`);
+  for (const content of REACHED) expect(zoomed.text).not.toContain(content);
 });

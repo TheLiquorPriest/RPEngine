@@ -9,7 +9,7 @@
 // casting `namesBy`), so a rule's header picks the castings it cares about. Who was on stage, and in which scene each turn was played,
 // is the caller's to say. Code decides nothing about whose perceptions or memories matter, and holds nothing back for any of it: it counts.
 
-import type { FactDef, FactValue, JobState, JsonValue, Scope } from "rp-harness/contract";
+import type { FactDef, FactValue, JsonValue, Scope } from "rp-harness/contract";
 import type { Store } from "../store";
 import { type CastSettings, castClock } from "./kit";
 import { castAt, type CastAt } from "./path";
@@ -19,7 +19,7 @@ import { baseOf, bindingsOf, type Character, castingInForce, CASTINGS, CastRecor
 import { personOfCharacter, worldAt } from "./secrets";
 import { type SourceReader, sourcesNow } from "./sources";
 import { perceptionTokens } from "./take-in";
-import { type InHand, turnsSince, type Untaken, type Waiting, waitingOf } from "./waiting";
+import { inHandOf, type JobsOf, playedByIn, turnsSince, type Untaken, type Waiting, waitingOf } from "./waiting";
 
 /** The groups a count breaks down into: each casting, and those on stage the cast has not cast on this path (or does not hold). */
 export const UNPERCEIVED_GROUPS = [...CASTINGS, "uncast"] as const;
@@ -59,21 +59,6 @@ export interface SceneNamed {
  * what it has recorded; the chat's head for null): the host's to say, from the story record.
  */
 export type ScenesOf = (scope: { user: string; chat: string }, turns: readonly string[], at: string | null) => Promise<{ of: ReadonlyMap<string, SceneNamed | null>; closed: ReadonlyMap<string, SceneNamed> }>;
-
-/** A job of the chat, as the facts read it: whom its agent plays (by name; null: no one), its state, when it started and ended, and the turn that started it (null: none). */
-export interface JobRead {
-  plays: string | null;
-  state: JobState;
-  started: number;
-  ended: number | null;
-  turn: string | null;
-}
-
-/** The chat's jobs that may have a character's perceptions in hand: those going on or waiting to, and those ended since `since` (milliseconds). The host's to say. */
-export type JobsOf = (scope: { user: string; chat: string }, since: number) => Promise<readonly JobRead[]>;
-
-/** The states of a job not yet ended: its agent is at work, or will be. */
-const GOING: Readonly<Partial<Record<JobState, true>>> = { queued: true, held: true, running: true, asking: true };
 
 /** The engine's word for a person's activity while asleep (the Cast life pack's `sleep`). */
 const ASLEEP = "sleep";
@@ -267,21 +252,11 @@ export function castFacts(deps: {
       const earlier = at.turns.filter((t) => t !== scope.turn && played.has(t));
       const chats = chatLine(user, scope.chat);
       const characters = charactersOf(deps.store.db, scope.user, chats);
-      // The jobs of a character's own agent that have its perceptions in hand at the reading: going on or waiting to, or ended once the
-      // turn read began (what a job writes counts from the turn after it ended); one a turn after the reading started is none of them.
+      // The jobs of a character's own agent that have its perceptions in hand at the reading (`inHandOf`): going on or waiting to, or ended
+      // once the turn read began (what a job writes counts from the turn after it ended); one a turn after the reading started is none of them.
       const began = scope.turn === undefined ? Number.POSITIVE_INFINITY : (user.turn(scope.turn)?.created ?? Number.POSITIVE_INFINITY);
       const jobs = waits.size === 0 ? [] : await deps.jobs({ user: scope.user, chat: scope.chat }, began);
-      const playing = new Map<string, string | null>();
-      const playedBy = (plays: string): string | null => {
-        if (!playing.has(plays)) playing.set(plays, findCharacter(deps.store.db, scope.user, chats, plays)?.id ?? null);
-        return playing.get(plays) ?? null;
-      };
-      const inHand = (character: Character): InHand[] =>
-        jobs.flatMap((j) =>
-          j.plays !== null && playedBy(j.plays) === character.id && (GOING[j.state] === true || (j.state === "done" && j.ended !== null && j.ended >= began)) && (j.turn === null || at.order.has(j.turn))
-            ? [{ started: j.started, turn: j.turn }]
-            : [],
-        );
+      const inHand = inHandOf(jobs, at, began, playedByIn(deps.store.db, scope.user, chats));
       const waiting = waits.size === 0 ? [] : waitingOf(record, characters, played, inHand).filter((w) => w.untaken.length > 0 || waits.has("dream.due"));
       const groupOf = (character: Character): Group => castingInForce(record, character)?.as ?? "uncast";
       const asked = [...(turn !== null && (wanted.stage || waits.has("stage.untaken")) ? [turn] : []), ...(wanted.path ? earlier : [])];

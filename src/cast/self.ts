@@ -7,16 +7,17 @@
 import type { JsonObject, JsonValue } from "rp-harness/contract";
 import type { Reply } from "../iface/kit";
 import { textOf } from "../iface/texts";
-import { type CastCall, type CastReading, nearIds, readingOr } from "./kit";
+import { type CastCall, type CastReading, nearIds, nearOf, type NearSettings, readingOr } from "./kit";
 import { type CastWriter, type Character, findCharacter, MIND_KINDS } from "./record";
 import { isUnread, type ItemRead, type Kind, readArg, type Unread } from "./update";
 
-/** What one call of a character's own tool works with: the reading, the character, story time, and the writer of its rows. */
+/** What one call of a character's own tool works with: the reading, the character, story time, the writer of its rows, and how its answers offer near matches. */
 export interface Self {
   reading: CastReading;
   character: Character;
   now: number | null;
   writer: CastWriter;
+  near: NearSettings;
 }
 
 /** The character the calling agent plays, at the call's turn or, in a job of no turn, as that job's own changes; a line says why not when there is none. */
@@ -34,7 +35,7 @@ export function selfOr(call: CastCall, reply: Reply): Self | null {
     return null;
   }
   const now = reading.clock?.now ?? null;
-  return { reading, character, now, writer: { user: call.scope.user, turn: call.scope.turn ?? null, chat: call.scope.chat, by: call.agent.definition, agent: call.agent.id, job: call.agent.job ?? null, at: now, now: (call.deps.now ?? Date.now)() } };
+  return { reading, character, now, writer: { user: call.scope.user, turn: call.scope.turn ?? null, chat: call.scope.chat, by: call.agent.definition, agent: call.agent.id, job: call.agent.job ?? null, at: now, now: (call.deps.now ?? Date.now)() }, near: nearOf(call) };
 }
 
 /** Arguments that hold nothing back: the file says what each is, and this code reads each in whatever shape it comes. */
@@ -75,7 +76,7 @@ export function strangers(self: Self, part: OwnPart | readonly OwnPart[], ids: u
 export function nearOwn(self: Self, part: OwnPart | readonly OwnPart[] | "mind", said: string): string {
   const parts: readonly string[] = typeof part === "string" ? [part] : part;
   const ids = [...self.reading.record.items.values()].filter((i) => i.character === self.character.id && parts.includes(i.part) && (i.part !== "mind" || (MIND_KINDS as readonly unknown[]).includes(i.fields.kind))).map((i) => i.id);
-  return textOf(nearIds(said, ids));
+  return textOf(nearIds(said, ids, self.near));
 }
 
 /**

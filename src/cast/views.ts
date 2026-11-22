@@ -18,7 +18,6 @@ import type { ReadContext } from "../engine/registry";
 import { isRecord } from "../shared/json";
 import type { Store } from "../store";
 import { beatsAt } from "./beats";
-import type { SceneNamed } from "./facts";
 import { CAST_DEFAULTS, type CastClock, castClock, type CastSettings, type CastStart, datedAt } from "./kit";
 import { memoryView } from "./memories";
 import { castAt } from "./path";
@@ -81,12 +80,17 @@ export interface CastViewInput {
   tokens: (text: string) => number;
   /**
    * Whom the agent given the views plays, with the sizes of its start (`CastStart`, and `foldTokens`, the world state's size for what
-   * one thing holds). Where that is the character the views are of, they are its own start: sized, and laid out from what the character
-   * may know. Absent, or for any other character: every view whole, as the turn's folder, the briefing and the omniscient side read them.
+   * one thing holds; null: nothing is closed). Where that is the character the views are of, they are its own start: sized, and laid out
+   * from what the character may know; with every size null, nothing is held back. Absent, or for any other character: every view whole,
+   * as the turn's folder, the briefing and the omniscient side read them.
    */
-  own?: CastStart & { plays: string; foldTokens: number };
-  /** The scene each of these turns lies in (null: none), as the host reads it from the story record, which the cast may not read: what the outline lays perceptions out by under their day. Absent: by day alone. */
-  scenes?: (turns: readonly string[]) => ReadonlyMap<string, SceneNamed | null>;
+  own?: CastStart & { plays: string; foldTokens: number | null };
+  /**
+   * The scene each of these turns lies in (null: none), by its id, as the host reads it from the story record, which the cast may not
+   * read: what the outline lays perceptions out by under their day. A scene's title is the record's words, never the character's, so
+   * none is given. Absent: by day alone.
+   */
+  scenes?: (turns: readonly string[]) => ReadonlyMap<string, string | null>;
 }
 
 export interface CastView {
@@ -370,7 +374,7 @@ export async function castViews(names: readonly string[], input: CastViewInput):
       // to do, as the Author recorded them. For its own agent, what is large of it is closed (plan 3.2 §6.4).
       const side = sideFields(reading, character);
       const layout = input.layouts[name];
-      if (side !== null) fields = { ...head, ...(own !== null && layout !== undefined ? foldedSide(side, layout, own.foldTokens, input.tokens) : side) };
+      if (side !== null) fields = { ...head, ...(own !== null && own.foldTokens !== null && layout !== undefined ? foldedSide(side, layout, own.foldTokens, input.tokens) : side) };
     } else if (name === "outline") {
       // The rest of the record (plan 3.2 §6.4): what this reading does not hold whole, each part counted and sized, the perceptions that wait by day and scene.
       const layout = input.layouts[name];

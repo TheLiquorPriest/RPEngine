@@ -4,7 +4,8 @@ import { resolve } from "node:path";
 import type { AgentRef, FactValue, JsonObject, ToolResult } from "rp-harness/contract";
 import { renderTemplate } from "rp-harness/helpers";
 import { factProblems } from "rp-harness/testing/kit";
-import { CAST_FACT_DEFS, castFacts, type JobRead } from "../../src/cast/facts";
+import { CAST_FACT_DEFS, castFacts } from "../../src/cast/facts";
+import type { JobRead } from "../../src/cast/waiting";
 import { castAt } from "../../src/cast/path";
 import { CAST_DEFAULTS } from "../../src/cast/kit";
 import { turnFacts } from "../../src/turn/facts";
@@ -364,16 +365,16 @@ describe("what waits for a character's own agent", () => {
     expect(values["path.untaken.turns"]?.count).toBe(1);
 
     // A job of his own agent started after it was written has it in hand while it runs, and once done until the turn after it ended.
-    jobs.push({ plays: "Bram", state: "running", started: 7, ended: null, turn: fourth.id });
+    jobs.push({ id: "job-1", plays: "Bram", state: "running", started: 7, ended: null, turn: fourth.id });
     values = await read(fourth.id);
     expect([values["stage.untaken"]?.count, values["path.untaken"]?.count, values["path.untaken.turns"]?.count]).toEqual([0, 0, 0]);
-    jobs[0] = { plays: "Bram", state: "done", started: 7, ended: Number.MAX_SAFE_INTEGER, turn: fourth.id };
+    jobs[0] = { id: "job-1", plays: "Bram", state: "done", started: 7, ended: Number.MAX_SAFE_INTEGER, turn: fourth.id };
     expect((await read(fourth.id))["path.untaken"]?.count).toBe(0);
     // One started before it was written has it not; one that failed has nothing in hand; another character's job is not his.
     for (const job of [
-      { plays: "Bram", state: "running" as const, started: 6, ended: null, turn: fourth.id },
-      { plays: "Bram", state: "failed" as const, started: 7, ended: 8, turn: fourth.id },
-      { plays: "Odile", state: "running" as const, started: 7, ended: null, turn: fourth.id },
+      { id: "job-2", plays: "Bram", state: "running" as const, started: 6, ended: null, turn: fourth.id },
+      { id: "job-3", plays: "Bram", state: "failed" as const, started: 7, ended: 8, turn: fourth.id },
+      { id: "job-4", plays: "Odile", state: "running" as const, started: 7, ended: null, turn: fourth.id },
     ]) {
       jobs[0] = job;
       expect((await read(fourth.id))["path.untaken"]?.count).toBe(1);
@@ -393,12 +394,12 @@ describe("what waits for a character's own agent", () => {
     await b.t.writes.run(() => b.t.s.addChanges(night.id, [{ lane: "engine", op: "set", value: { type: "set", entity: "bram", field: "activity", value: "sleep" } }]));
     expect(await due(night.id)).toMatchObject({ count: 1, names: ["Bram"] });
     // His agent's job taking in what he holds, started in this turn: the dream waits for it, while it runs and once done until the turn after.
-    jobs.push({ plays: "Bram", state: "queued", started: 7, ended: null, turn: night.id });
+    jobs.push({ id: "job-1", plays: "Bram", state: "queued", started: 7, ended: null, turn: night.id });
     expect(await due(night.id)).toMatchObject({ count: 0 });
-    jobs[0] = { plays: "Bram", state: "done", started: 7, ended: Number.MAX_SAFE_INTEGER, turn: night.id };
+    jobs[0] = { id: "job-1", plays: "Bram", state: "done", started: 7, ended: Number.MAX_SAFE_INTEGER, turn: night.id };
     expect(await due(night.id)).toMatchObject({ count: 0 });
     // One that failed has nothing in hand.
-    jobs[0] = { plays: "Bram", state: "failed", started: 7, ended: 9, turn: night.id };
+    jobs[0] = { id: "job-1", plays: "Bram", state: "failed", started: 7, ended: 9, turn: night.id };
     expect(await due(night.id)).toMatchObject({ count: 1, names: ["Bram"] });
   });
 });

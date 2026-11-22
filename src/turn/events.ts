@@ -32,6 +32,7 @@ import type { Database } from "bun:sqlite";
 import { type Fields, type Guidance, loadGuidance, type TemplatePart } from "../app/guidance";
 import type { AgentRef, AttachMoment, ConsentGrant, ContextBlock, FilesPort, GapCheck, JobView, JsonObject, Log, RuleFiring, RunScope, Scope, TurnEvents } from "rp-harness/contract";
 import { castViews, type MemorySearch, type SourceReader, TAKE_IN_PART, TAKE_IN_VIEW, takeInViews, viewNames } from "../cast";
+import { SELF_READ } from "../cast/self-read";
 import { mapView, mapWording, noMapWords, rulesetData, rulesetParts, rulesetPlayed } from "../iface";
 import { LORE_BATCH, LORE_KNOWN, LORE_PLAN, type LoreIndex, type LoreProposals, loreBatchBlock, loreBatchNumber, loreKnownBlock, loreLines, loreNumberedBlock, lorePlanBlock } from "../lore";
 import { type DueSource, type Lane, type Part, readPart, type Store, type ViewLine, wordLine, worldState, type WorldStateBlock, worldStateFolds } from "../store";
@@ -63,6 +64,12 @@ export interface EventsDeps {
   notes: TreeNotes;
   /** The suggestions agents filed of the tree's files, for the Files page. */
   suggestions: TreeSuggestions;
+  /**
+   * The tools an agent definition in force at the scope holds by name (its header's `tools:`), as RPH reads the definition
+   * (`definitions.list`); none where no definition of that name is in force. A character's own start is cut where its definition holds
+   * `self_read`, which opens what it holds back.
+   */
+  tools(scope: Scope, definition: string): Promise<readonly string[]>;
   /** The lore's proposals, where an agent's suggestion about lore is kept for his approval. */
   proposals: () => Pick<LoreProposals, "suggested">;
   now(): number;
@@ -296,6 +303,8 @@ async function knownView(deps: EventsDeps, scope: Scope, agent: AgentRef, guidan
 const CAST_NAMED = /^cast:([^()]+)\((.*)\)$/;
 /** The name `cast:` takes for the character the agent plays. */
 const SELF = "self";
+/** The sizes of a character's own start where its agent holds no `self_read` to open what a start holds back: none, so every view is whole, as before there were sizes. */
+const WHOLE_START = { newlyPerceivedTokens: null, importedTokens: null, foldTokens: null } as const;
 
 /**
  * Whether a name is a character's own to hold (plan §7, §9.4): its own views of the cast (`cast:self(…)`, or `cast:` by its own name) and the
@@ -314,8 +323,10 @@ function ownTo(character: string, ref: string): boolean {
  * force for the chat, one after another; with nothing in any of them (the cast holds no record of the character yet), each one's part
  * for nothing, as for an agent of nobody given `cast:self(…)`. Null when the ref is not the cast's, or no part lays out a view it names.
  * A name among them that is not the cast's is left out.
- * Given to the agent that plays the character, they are its own start (plan 3.2 §6.4): sized by the chat's settings and laid out from
- * what the character may know, with the scenes its outline lays what it perceived out by read here, from the story record.
+ * Given to the agent that plays the character, they are its own start (plan 3.2 §6.4): laid out from what the character may know, with
+ * the scenes its outline lays what it perceived out by read here, from the story record, and sized by the chat's settings where its
+ * definition holds `self_read`, the call each line of what a start holds back names. A definition without it (one of the user's from
+ * before there was one) is given every view whole, as before: nothing is held back that its agent could not open.
  */
 async function castNamed(deps: EventsDeps, scope: Scope, agent: AgentRef, ref: string, moment: AttachMoment): Promise<string | null> {
   const said = CAST_NAMED.exec(ref);
@@ -344,8 +355,8 @@ async function castNamed(deps: EventsDeps, scope: Scope, agent: AgentRef, ref: s
     sources: deps.sources,
     ...(deps.search !== undefined ? { search: deps.search } : {}),
     layouts,
-    // Given to the agent that plays the character, the views are its own start: sized by the chat's settings and made from what the character may know.
-    ...(agent.plays !== undefined ? { own: { plays: agent.plays, ...settings.castStart, foldTokens: settings.worldState.foldTokens } } : {}),
+    // Given to the agent that plays the character, the views are its own start: made from what the character may know, and sized by the chat's settings where it can open what they hold back.
+    ...(agent.plays !== undefined ? { own: { plays: agent.plays, ...((await deps.tools(scope, agent.definition)).includes(SELF_READ.name) ? { ...settings.castStart, foldTokens: settings.worldState.foldTokens } : WHOLE_START) } } : {}),
     scenes: (turns) => scenesAcross(deps.store, scope.user, scope.chat, turn, turns),
   });
   // What waits to be taken in, as work, and the views that take an argument (`src/cast/take-in.ts`): each in its place among the names.

@@ -251,7 +251,13 @@ export function readCast(client: Pick<RpeClient, "call">, chat: string, onChange
       if (asked?.stage !== "asked") return;
       show({ takeIn: { ...asked, stage: "out" } });
       client.call("POST /api/v1/chats/:chat/jobs/take-in", { chat }, { body: { characters: asked.who } }).then(replyOf).then(
-        (answer) => show({ takeIn: { ...asked, stage: answer.jobs.length > 0 ? "started" : "refused", runsOn: null, jobs: answer.jobs, refused: answer.refused } }),
+        (answer) => {
+          show({ takeIn: { ...asked, stage: answer.jobs.length > 0 ? "started" : "refused", runsOn: null, jobs: answer.jobs, refused: answer.refused } });
+          // What a job started has in hand no longer waits: the list and the open character are read again, and the press goes by what still does.
+          if (answer.jobs.length === 0) return;
+          readList();
+          if (shown.open !== null) readOne(shown.open);
+        },
         (error: unknown) => show({ takeIn: { ...asked, stage: "refused", runsOn: null, problem: errorWords(error) } }),
       );
     },

@@ -10,7 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JsonObject } from "rp-harness/contract";
-import { type CastCharacter, type CastEdited, type CastList, type CastPerceptionWritten, castRoutes, type CastRoutesDeps, type CastStruck, type PerceptionRecord } from "../../src/cast/index";
+import { type CastCharacter, type CastEdited, type CastList, type CastPerceptionWritten, castRoutes, type CastRoutesDeps, type CastStruck, type JobRead, type PerceptionRecord } from "../../src/cast/index";
 import { addCharacter, type CastWrite, pinCasting } from "../../src/cast/record";
 import type { BookReader } from "../../src/cast/secrets";
 import { knowersOf } from "../../src/packs/minds/core/knowledge";
@@ -54,9 +54,9 @@ function ownChanges(t: Table): { op: string; source: string | null }[] {
   return t.db.query<{ op: string; source: string | null }, [string]>("SELECT op, source FROM change WHERE chat = ? AND by = 'player' AND op NOT LIKE 'cast.%' ORDER BY ord").all(CHAT);
 }
 
-/** The Cast page over a table: the routes as the application mounts them, called through each route's own reader and handler. */
-function pageOn(t: Table, onStage: CastRoutesDeps["onStage"] = async () => new Map()): Page {
-  const deps: CastRoutesDeps = { store: t.store, writes: t.writes, files: () => shippedTexts(), settings: async () => ({}), onStage, sources: t.shelf.reader, changed: (chat) => told.push(chat), now: () => 7 };
+/** The Cast page over a table: the routes as the application mounts them, called through each route's own reader and handler; the chat's jobs are `jobs`, none unless given. */
+function pageOn(t: Table, onStage: CastRoutesDeps["onStage"] = async () => new Map(), jobs: readonly JobRead[] = []): Page {
+  const deps: CastRoutesDeps = { store: t.store, writes: t.writes, files: () => shippedTexts(), settings: async () => ({}), onStage, sources: t.shelf.reader, changed: (chat) => told.push(chat), now: () => 7, jobs: async () => jobs };
   const [listRoute, oneRoute, strikeRoute, recordRoute, perceiveRoute, castingRoute, baseRoute, sourcesRoute, personRoute] = castRoutes(deps);
   return {
     t,
@@ -211,6 +211,30 @@ describe("the cast of a chat", () => {
     expect(await page.list({}, USER, "chat-nowhere")).toEqual({ chat: "chat-nowhere", turn: null, characters: [] });
     await expect(page.list({ turn: "turn-nowhere" })).rejects.toMatchObject({ status: 404, message: words("no_turn", { id: "turn-nowhere" }) });
     expect(words("no_chat", { id: CHAT })).toContain(CHAT);
+  });
+
+  test("leaves out what a job of a character's own agent has in hand, as the cast's facts do: while the job goes on what it was given waits for no one, and once it has ended the record says what is left", async () => {
+    const jobs: JobRead[] = [];
+    const page = pageOn(await openTable(), undefined, jobs);
+    const { t } = page;
+    const { wren, odile } = await t.writes.run((db) => ({ wren: addCharacter(db, USER, CHAT, "Wren", 1).id, odile: addCharacter(db, USER, CHAT, "Odile", 1).id }));
+    const turn = await t.begin();
+    await t.write(turn, [
+      { character: wren, part: "casting", item: `casting:${wren}`, value: { as: "principal" } },
+      ...["The bell rang twice.", "The door stayed shut.", "Someone laughed below."].map((content): CastWrite => ({ character: wren, part: "perception", item: null, value: { of: turn.id, reach: "whole", content } })),
+      { character: odile, part: "perception", item: null, value: { of: turn.id, reach: "whole", content: "The lamp went out." } },
+    ]);
+    await t.tie(turn);
+    const waits = async (): Promise<Record<string, number>> => Object.fromEntries((await page.list()).characters.map((c) => [c.name, c.waits.perceptions]));
+    expect(await waits()).toEqual({ Wren: 3, Odile: 1 });
+
+    // Her own agent's job starts after all three were written, under her name as any spelling of it: they are in its hands, and Odile's are not.
+    jobs.push({ id: "job-1", plays: "wren", state: "running", started: 10, ended: null, turn: null });
+    expect(await waits()).toEqual({ Wren: 0, Odile: 1 });
+    expect((await page.one(wren)).character.waits).toMatchObject({ perceptions: 0, since: null, turns: 0 });
+    // It ended having taken nothing in: at the chat's newest turn what it wrote is in the record, and all three wait again.
+    jobs[0] = { id: "job-1", plays: "wren", state: "done", started: 10, ended: 20, turn: null };
+    expect(await waits()).toEqual({ Wren: 3, Odile: 1 });
   });
 });
 
@@ -541,11 +565,11 @@ describe("the owner's own edits of a character", () => {
       "bram",
     );
     await t.tie(turn);
-    const first = await callRoute(castRoutes({ store: t.store, writes: t.writes, files: () => shippedTexts(), settings: async () => ({ queryItems: 50 }), onStage: async () => new Map(), sources: t.shelf.reader, changed: () => {} })[1], { params: { chat: CHAT, character: "Bram" }, query: {}, user: USER });
+    const first = await callRoute(castRoutes({ store: t.store, writes: t.writes, files: () => shippedTexts(), settings: async () => ({ queryItems: 50 }), onStage: async () => new Map(), sources: t.shelf.reader, changed: () => {}, jobs: async () => [] })[1], { params: { chat: CHAT, character: "Bram" }, query: {}, user: USER });
     expect(first.listed).toBe(50);
     expect(first.memories).toMatchObject({ total: 600, before: 550, after: 0 });
     expect(first.memories.items.map((m) => m.fields.gist).at(-1)).toBe("m599");
-    const back = await callRoute(castRoutes({ store: t.store, writes: t.writes, files: () => shippedTexts(), settings: async () => ({ queryItems: 50 }), onStage: async () => new Map(), sources: t.shelf.reader, changed: () => {} })[1], { params: { chat: CHAT, character: "Bram" }, query: { part: "memories", skip: "550" }, user: USER });
+    const back = await callRoute(castRoutes({ store: t.store, writes: t.writes, files: () => shippedTexts(), settings: async () => ({ queryItems: 50 }), onStage: async () => new Map(), sources: t.shelf.reader, changed: () => {}, jobs: async () => [] })[1], { params: { chat: CHAT, character: "Bram" }, query: { part: "memories", skip: "550" }, user: USER });
     expect(back.memories).toMatchObject({ total: 600, before: 0, after: 550 });
     expect(back.memories.items.map((m) => m.fields.gist)[0]).toBe("m0");
   });

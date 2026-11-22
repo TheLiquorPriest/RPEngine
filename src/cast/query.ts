@@ -8,11 +8,11 @@
 // question from it (`hostTool`).
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
-import { IFACE_DEFAULTS, oneOf, QUESTION, type Reply, TEXT, WHOLE, YES_NO } from "../iface/kit";
+import { oneOf, QUESTION, type Reply, TEXT, WHOLE, YES_NO } from "../iface/kit";
 import { nearestOf } from "../iface/reading";
 import { textOf } from "../iface/texts";
 import { askOf, holdingsFor, minds, whoKnows } from "./knowledge";
-import { baseView, type CastCall, type CastReading, type CastToolSpec, growthOver, itemView, readingOr, sourceView, whoView } from "./kit";
+import { baseView, type CastCall, type CastReading, type CastToolSpec, growthOver, itemView, nearOf, readingOr, sourceView, whoView } from "./kit";
 import { perceptionView } from "./perceive";
 import { baseHistory, baseOf, bindingsOf, type CastItem, castingInForce, castingItemId, castOn, charactersOf, findCharacter, nameKey, type RowPart } from "./record";
 import { sourcesNow } from "./sources";
@@ -89,8 +89,8 @@ async function query(args: JsonObject, call: CastCall): Promise<Reply> {
   }
   const character = findCharacter(db, user, reading.chats, args.who);
   if (character === null) {
-    const near = nearestOf(args.who, charactersOf(db, user, reading.chats).map((c) => c.name), IFACE_DEFAULTS).slice(0, IFACE_DEFAULTS.nearMatches);
-    return reply.line("no_character", { who: args.who.trim(), near: textOf(near) }).fail();
+    const near = nearOf(call);
+    return reply.line("no_character", { who: args.who.trim(), near: textOf(nearestOf(args.who, charactersOf(db, user, reading.chats).map((c) => c.name), near).slice(0, near.nearMatches)) }).fail();
   }
 
   const casting = castingInForce(reading.record, character);

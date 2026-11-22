@@ -108,7 +108,7 @@ import {
 import { freshnessOf, type SourceNow, type SourceReader, sourcesNow } from "./sources";
 import { perceptionTokens, takeInBatches } from "./take-in";
 import { CAST_LANE, type Unread } from "./update";
-import { turnsSince, waitingOf } from "./waiting";
+import { inHandOf, type InHand, type JobsOf, playedByIn, turnsSince, waitingOf } from "./waiting";
 
 export const CAST_PATH = "/api/v1/chats/:chat/cast";
 export const CHARACTER_PATH = "/api/v1/chats/:chat/cast/:character";
@@ -142,6 +142,8 @@ export interface CastRoutesDeps {
   now?: () => number;
   /** A text's tokens as the chat counts them, for how large what waits for a character's agent is; without it the pages show no size. */
   tokens?(user: string, chat: string): Promise<(text: string) => number>;
+  /** The chat's jobs, as the cast's facts read them (`JobsOf`): what a job of a character's own agent has in hand is not shown as waiting. */
+  jobs: JobsOf;
 }
 
 /** Why a page's request is not done: its status, and the line of the cast's answers that says so. */
@@ -353,8 +355,18 @@ async function sizedBy(deps: CastRoutesDeps, user: string, chat: string): Promis
   return { tokens, most: settings.takeInTokens ?? CAST_DEFAULTS.takeInTokens };
 }
 
-/** Each character on the reading as the cast lists it, in the order given, with what waits for its own agent (`waiting.ts`) and, by `size`, how large that is and how many batches its agent would take it in as. */
-function membersOf(r: Reading, characters: readonly Character[], size: Sized): CastMemberShown[] {
+/**
+ * The jobs of each character's own agent that have its perceptions in hand at the reading, read as the cast's facts read them
+ * (`inHandOf`): what a job going on was given is in its hands, and is not counted as waiting for another.
+ */
+async function inHandAt(deps: CastRoutesDeps, r: Reading): Promise<(character: Character) => InHand[]> {
+  const { turn, chat } = r.record.at;
+  const began = turn === null ? Number.POSITIVE_INFINITY : (r.s.turn(turn)?.created ?? Number.POSITIVE_INFINITY);
+  return inHandOf(await deps.jobs({ user: r.user, chat }, began), r.record.at, began, playedByIn(r.store.db, r.user, r.chats));
+}
+
+/** Each character on the reading as the cast lists it, in the order given, with what waits for its own agent (`waiting.ts`; what a job of it has in hand, by `inHand`, left out) and, by `size`, how large that is and how many batches its agent would take it in as. */
+function membersOf(r: Reading, characters: readonly Character[], size: Sized, inHand: (character: Character) => readonly InHand[]): CastMemberShown[] {
   const counts = new Map<string, CastCounts>();
   const from = new Map<string, { carried: boolean; played: boolean }>();
   for (const item of r.record.items.values()) {
@@ -374,7 +386,7 @@ function membersOf(r: Reading, characters: readonly Character[], size: Sized): C
   }
   const { at } = r.record;
   const played = r.s.playedOf(at.turns);
-  const waiting = new Map(waitingOf(r.record, characters, played).map((w) => [w.character.id, w]));
+  const waiting = new Map(waitingOf(r.record, characters, played, inHand).map((w) => [w.character.id, w]));
   return characters.map((c) => {
     const casting = castingInForce(r.record, c);
     const w = waiting.get(c.id);
@@ -469,7 +481,7 @@ async function characterShown(deps: CastRoutesDeps, r: Reading, character: Chara
   const standing = new Map(memoriesNow(r.record, character.id, r.clock?.now ?? null, settings).map((m) => [m.item.id, m]));
   const versions = baseHistory(db, r.user, character.id, chat);
   const newest = new Map(versions.map((v) => [v.part, v.version]));
-  const [member] = membersOf(r, [character], deps.tokens === undefined ? null : { tokens: await deps.tokens(r.user, chat), most: settings.takeInTokens });
+  const [member] = membersOf(r, [character], deps.tokens === undefined ? null : { tokens: await deps.tokens(r.user, chat), most: settings.takeInTokens }, await inHandAt(deps, r));
   const base = [...baseOf(db, r.user, character.id, chat).values()].sort((a, b) => BASE_PARTS.indexOf(a.part) - BASE_PARTS.indexOf(b.part));
   const away = r.record.items.get(awayItemId(character.id));
   // The older minds pack's notes of a character are one of its carried files, shown with the names and dates the world gives them at the reading's point.
@@ -550,7 +562,7 @@ async function edited(deps: CastRoutesDeps, user: string, chat: string, said: st
   const r = readingAt(deps.store, user, chat, null);
   const character = charactersOf(deps.store.db, user, r.chats).find((c) => c.id === done.id) as Character;
   const lines = await castLines(deps.files(user, chat));
-  return { changed: done.changed, character: membersOf(r, [character], await sizedBy(deps, user, chat))[0] as CastMemberShown, notes: (done.notes ?? []).flatMap((u) => lines.line(u.line, u.fields) ?? []) };
+  return { changed: done.changed, character: membersOf(r, [character], await sizedBy(deps, user, chat), await inHandAt(deps, r))[0] as CastMemberShown, notes: (done.notes ?? []).flatMap((u) => lines.line(u.line, u.fields) ?? []) };
 }
 
 /** The revision of each source bound to a character as Lumiverse holds it now, for the base the owner redraws to say what it was drawn against; one Lumiverse cannot be asked about, or holds none, is left out. */
@@ -585,7 +597,7 @@ export function castRoutes(deps: CastRoutesDeps) {
         inWords(deps, user, params.chat, async (): Promise<CastList> => {
           const turn = asked(deps.store, user, params.chat, query.turn);
           const r = readingAt(deps.store, user, params.chat, turn);
-          return { chat: params.chat, turn, characters: membersOf(r, charactersOf(deps.store.db, user, r.chats), await sizedBy(deps, user, params.chat)) };
+          return { chat: params.chat, turn, characters: membersOf(r, charactersOf(deps.store.db, user, r.chats), await sizedBy(deps, user, params.chat), await inHandAt(deps, r)) };
         }),
     }),
     route({

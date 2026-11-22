@@ -6,7 +6,8 @@
 // switches over all his jobs with the limits in force for jobs and the day's use against each that
 // counts one; and every control. He starts any job, as his own and tied to no turn (R-27): of a chat, or
 // of no chat (C-23); and, from the Cast page, the job in which a character's own agent takes in what it
-// has perceived and not yet taken in. He starts again a job that was interrupted, failed or cancelled, with the same
+// has perceived and not yet taken in: one for each character the cast holds by the names given, none for
+// one whose own agent is at work already in a job. He starts again a job that was interrupted, failed or cancelled, with the same
 // task; carries on one stopped at one of its limits with more; resumes an interrupted one from its own
 // session; holds one that waits and lets it go; pauses one that runs and lets it go; says a word to
 // one that runs; answers one that asks; cancels one. Where RPH starts nothing or a control does
@@ -16,6 +17,7 @@
 import type { JobLimits, JobRefusal, JobState, JobView, RunScope, Scope, Usage, UserScope } from "rp-harness/contract";
 import { loadGuidance } from "../app/guidance";
 import { agentOperation, agentRef, type Exactly, type Holds, type Infer, jobRow, jobView, route, RouteError, shape, traceRecord, usage } from "../app";
+import { CAST_ANSWERS, type Character, chatLine, findCharacter, isGoing, playedByIn } from "../cast";
 import { type ConfigRead, portTexts, readConfig } from "../app/config-read";
 import { harnessSettings } from "../app/setting-list";
 import { toldRows } from "./events";
@@ -278,22 +280,40 @@ export function jobRoutes(deps: JobRoutesDeps) {
       path: "/api/v1/chats/:chat/jobs/take-in",
       access: "page",
       group: "jobs",
-      does: "He starts jobs of the chat, as his own and tied to no turn, one for each character he names: in each, the character's own agent (the character definition, playing that character, started for the purpose take-in) takes in what it has perceived and not yet taken in, briefed by the line take_in of `.prompts/cast-jobs.md`. Where a great deal waits, its agent hands it out in batches to instances of itself (the setting cast.takeInTokens). A character whose job could not be started is answered with why, and the others' jobs are started all the same.",
+      does: "He starts jobs of the chat, as his own and tied to no turn, one for each character he names: in each, the character's own agent (the character definition, playing that character, started for the purpose take-in) takes in what it has perceived and not yet taken in, briefed by the line take_in of `.prompts/cast-jobs.md`. Where a great deal waits, its agent hands it out in batches to instances of itself (the setting cast.takeInTokens). Each name is found as the cast finds it, and two names of one character start one job. A character whose job was not started is answered with why, in the words of `.prompts/cast-answers.md` or RPE's own: a name the cast does not hold (no_character), or one whose own agent is at work already in a job of the chat, which is named (page_take_in_going); the others' jobs are started all the same.",
       body: takeInAsk,
       reply: takeInReply,
       handle: async ({ user, params, body }) => {
         const scope: Scope = { user, chat: params.chat, session: NO_SESSION };
         const names = [...new Set(body.characters.map((name) => name.trim()).filter((name) => name !== ""))];
         if (names.length === 0) throw new RouteError(400, "No job was started: no character was named.");
-        const part = await loadGuidance(turns.files, scope).part(CAST_JOBS_PART);
+        const guidance = loadGuidance(turns.files, scope);
+        const [part, answers] = await Promise.all([guidance.part(CAST_JOBS_PART), guidance.part(CAST_ANSWERS)]);
         const started: { character: string; job: JobView }[] = [];
         const refused: { character: string; why: string }[] = [];
-        for (const character of names) {
-          const brief = part?.format === "lines" ? part.line("take_in", { name: character }) : undefined;
+        // Each name as the cast finds it, by name or id: two names of one character are one character, and one the cast does not hold is answered so.
+        const { db } = turns.store;
+        const chats = chatLine(turns.store.user(user), params.chat);
+        const characters = new Map<string, Character>();
+        for (const name of names) {
+          const character = findCharacter(db, user, chats, name);
+          if (character === null) refused.push({ character: name, why: (answers?.format === "lines" ? answers.line("no_character", { who: name }) : undefined) ?? "" });
+          else if (!characters.has(character.id)) characters.set(character.id, character);
+        }
+        // One run of a character's own agent at a time: a job of it that is going on has what waits for it in hand, and is named.
+        const going = characters.size === 0 ? [] : (await turns.castJobs({ user, chat: params.chat }, Number.POSITIVE_INFINITY)).filter(isGoing);
+        const playedBy = playedByIn(db, user, chats);
+        for (const character of characters.values()) {
+          const busy = going.find((job) => job.plays !== null && playedBy(job.plays) === character.id);
+          if (busy !== undefined) {
+            refused.push({ character: character.name, why: (answers?.format === "lines" ? answers.line("page_take_in_going", { who: character.name, job: busy.id }) : undefined) ?? "" });
+            continue;
+          }
+          const brief = part?.format === "lines" ? part.line("take_in", { name: character.name }) : undefined;
           if (brief === undefined || brief.trim() === "") throw new RouteError(409, `No job was started: the part ${CAST_JOBS_PART} is switched off or has no line take_in, which briefs the job.`);
-          const answer = await jobs.start(scope, { agent: CHARACTER_DEFINITION, brief, plays: character, for: TAKE_IN_PURPOSE });
-          if ("refused" in answer) refused.push({ character, why: refusalWords(answer) });
-          else started.push({ character, job: answer });
+          const answer = await jobs.start(scope, { agent: CHARACTER_DEFINITION, brief, plays: character.name, for: TAKE_IN_PURPOSE });
+          if ("refused" in answer) refused.push({ character: character.name, why: refusalWords(answer) });
+          else started.push({ character: character.name, job: answer });
         }
         return { jobs: started, refused };
       },

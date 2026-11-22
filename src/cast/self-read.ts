@@ -14,7 +14,7 @@
 // record's order.
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
-import { IFACE_DEFAULTS, oneOf, QUESTION, type Reply, TEXT, WHOLE } from "../iface/kit";
+import { oneOf, QUESTION, type Reply, TEXT, WHOLE } from "../iface/kit";
 import { nearestOf } from "../iface/reading";
 import { textOf } from "../iface/texts";
 import { type CastCall, type CastToolSpec, nearIds } from "./kit";
@@ -195,7 +195,7 @@ async function selfRead(args: JsonObject, call: CastCall): Promise<Reply> {
         // A perception of its own that it has taken in is no longer read here; any other id is one it does not have, whoever's it is.
         const item = self.reading.record.items.get(id);
         if (name === "perceptions" && item !== undefined && item.part === "perception" && item.character === self.character.id && !item.dropped) return reply.line("own_taken", { id }).fail();
-        return reply.line("own_unknown_id", { part: name, id: JSON.stringify(id), near: textOf(nearIds(id, all.map((entry) => entry.id))) }).fail();
+        return reply.line("own_unknown_id", { part: name, id: JSON.stringify(id), near: textOf(nearIds(id, all.map((entry) => entry.id), self.near)) }).fail();
       }
       places.push(at);
     }
@@ -209,17 +209,17 @@ async function selfRead(args: JsonObject, call: CastCall): Promise<Reply> {
     const days = [...new Set(all.flatMap((entry) => dayOf(entry) ?? []))];
     if (days.length === 0) return reply.line("own_no_days", { part: name, ...(TAKES[name].includes("scene") ? { scenes: true } : {}) }).fail();
     matches = matches.filter((entry) => nameKey(dayOf(entry) ?? "") === nameKey(day));
-    if (matches.length === 0) return reply.line("own_unknown_day", { part: name, day, days: textOf(nearestOf(day, days, IFACE_DEFAULTS).slice(0, IFACE_DEFAULTS.nearMatches)) });
+    if (matches.length === 0) return reply.line("own_unknown_day", { part: name, day, days: textOf(nearestOf(day, days, self.near).slice(0, self.near.nearMatches)) });
   }
+  // A scene by its id, as the outline names it: its title is the story record's words, which never reach the character.
   const scene = said("scene");
   if (scene !== undefined) {
     const turns = [...new Set(all.flatMap((entry) => entry.turn ?? []))];
-    const sceneOf = call.deps.scenes?.({ user: call.scope.user, chat: call.scope.chat }, call.scope.turn ?? null, turns) ?? new Map();
-    const scenes = [...new Map([...sceneOf.values()].flatMap((s) => (s === null ? [] : [[s.id, s] as const]))).values()];
+    const sceneOf = call.deps.scenes?.({ user: call.scope.user, chat: call.scope.chat }, call.scope.turn ?? null, turns) ?? new Map<string, string | null>();
+    const scenes = [...new Set([...sceneOf.values()].flatMap((s) => (s === null ? [] : [s])))];
     if (scenes.length === 0) return reply.line("own_no_scenes", { part: name }).fail();
-    const wanted = scenes.filter((s) => s.id === scene || (s.title !== null && nameKey(s.title) === nameKey(scene))).map((s) => s.id);
-    matches = matches.filter((entry) => entry.turn !== null && wanted.includes(sceneOf.get(entry.turn)?.id ?? ""));
-    if (matches.length === 0) return reply.line("own_unknown_scene", { part: name, scene, scenes: textOf(scenes.slice(-IFACE_DEFAULTS.nearMatches).map((s) => (s.title === null ? s.id : `${s.title} [${s.id}]`))) });
+    matches = matches.filter((entry) => entry.turn !== null && nameKey(sceneOf.get(entry.turn) ?? "") === nameKey(scene));
+    if (matches.length === 0) return reply.line("own_unknown_scene", { part: name, scene, scenes: textOf(scenes.slice(Math.max(0, scenes.length - self.near.nearMatches))) });
   }
   if (typeof args.tier === "string") matches = matches.filter((entry) => entry.tier === args.tier);
   const named = said("name");

@@ -25,7 +25,7 @@ import { textOf } from "../iface/texts";
 import type { LedgerEvent } from "../shared/ledger";
 import { type FactId, HOLDING_BELIEFS, HOLDING_HOWS, type HoldingBelief, type HoldingHow } from "../shared/minds";
 import { isRecord } from "../shared/json";
-import { type CastCall, type CastReading, type CastToolSpec, nearIds, readingOr, whoView } from "./kit";
+import { type CastCall, type CastReading, type CastToolSpec, nearIds, nearOf, readingOr, whoView } from "./kit";
 import { type CastItem, type CastRow, type CastWrite, type CastWriter, writeCast } from "./record";
 import { LORE_STAMP, PROVENANCE_READS, readSource, sourceLines, stampOn } from "./source";
 import { forgetsOf, type HoldingGiven, holdingChanges, secretResolver, secretsHeld, secretsHeldAgain, secretsLetGo, SecretWorld, worldAt } from "./secrets";
@@ -141,7 +141,7 @@ async function readPerception(call: CastCall, cast: CastReading, world: SecretWo
   if (id !== undefined) {
     const found = cast.record.items.get(id as string);
     if (found === undefined || found.part !== "perception" || found.character !== character.id) {
-      const near = nearIds(String(id), cast.record.of(character.id, "perception", true).map((p) => p.id));
+      const near = nearIds(String(id), cast.record.of(character.id, "perception", true).map((p) => p.id), nearOf(call));
       out.fatal.push({ line: "unknown_id", fields: { n, op: OP, who: character.name, part: OP, id: JSON.stringify(id), near: textOf(near) } });
       return out;
     }

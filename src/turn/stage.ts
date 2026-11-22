@@ -6,7 +6,8 @@
 // play (`findPlaces`). The same scene names the stretch of the chat an agent can ask for as `scene` (`chat:history[scene]`). The cast's
 // facts of what waits for a character's own agent read which scene each turn was played in and which scenes are closed at a reading.
 // A character's outline of what it perceived, and its own reading of it by scene (plan 3.2 §6.4), take the scene each turn lies in from
-// one reading of the record (`scenesAcross`), since the cast may not read the story.
+// one reading of the record (`scenesAcross`), since the cast may not read the story: by the scene's id alone, for a title is the story
+// record's words, which are the omniscient side's and never reach the character.
 
 import type { HistoryRange } from "rp-harness/contract";
 import { isGone, kindIs } from "../engine/scope";
@@ -186,13 +187,14 @@ export function closedScenesAt(store: Store, user: string, chat: string, turn: s
 
 /**
  * The scene each of `turns` lies in as the story record stands at one reading of the chat (at `at`, with what it has recorded; at the
- * head for null): the scene whose messages hold the turn's reply, the one that starts later where two do; for a turn whose reply is
- * not saved yet, the scene the record holds open. Null for a turn in none. It reads the record once, where `scenesOf` reads each
- * turn's own state: what a long list is laid out and read by (a character's outline of what it perceived, `self_read` by scene),
- * never what a rule counts by.
+ * head for null), by its id: the scene whose messages hold the turn's reply, the one that starts later where two do; for a turn whose
+ * reply is not saved yet, the scene the record holds open. Null for a turn in none. It reads the record once, where `scenesOf` reads each
+ * turn's own state: what a long list is laid out and read by (a character's outline of what it perceived, `self_read` by scene), never
+ * what a rule counts by. It gives no title: what it is read for is the character's own, and a scene's title is the story record's words
+ * (the Author's account of what happened in it), which the character's reads never hold.
  */
-export function scenesAcross(store: Store, user: string, chat: string, at: string | null, turns: readonly string[]): Map<string, SceneRef | null> {
-  const out = new Map<string, SceneRef | null>();
+export function scenesAcross(store: Store, user: string, chat: string, at: string | null, turns: readonly string[]): Map<string, string | null> {
+  const out = new Map<string, string | null>();
   const u = store.user(user);
   if (u.chat(chat) === null) return out;
   const record = StoryRecord.read(store, user, storyAt(u, chat, at));
@@ -204,7 +206,7 @@ export function scenesAcross(store: Store, user: string, chat: string, at: strin
   for (const turn of turns) {
     const reply = record.at.replyOf(turn);
     const scene = reply === null ? (open !== null && open.closedBy === null ? open : null) : (spans.filter((s) => s.from <= reply && reply <= s.to).sort((a, b) => b.from - a.from)[0]?.scene ?? null);
-    out.set(turn, scene === null ? null : sceneRef(scene));
+    out.set(turn, scene === null ? null : scene.id);
   }
   return out;
 }
