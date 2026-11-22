@@ -134,6 +134,8 @@ function shortened(reply: Reply, room: number, cuts: boolean): Short | null {
  * or the answer whole, where it failed, where it is its own receipt, where no line in force names the file, and where the file could
  * not be kept. The lines the receipt adds are `lines`' own (`receipt_left`, `receipt_kept`); what the Turn page shows of the call gains
  * `receipt` in its details: the file's path, the whole answer's length, and how many of what was written the receipt left to the file.
+ * The answer names the file as the one that holds it whole (`kept`), so that the harness keeps no second copy and what a session
+ * carries of the answer into later turns names it too.
  */
 export async function receiptOf(reply: Reply, lines: Lines, keeper: ReceiptKeeper, call: { scope: Scope; callId: string; tool: string }): Promise<ToolResult> {
   const whole = reply.result();
@@ -150,6 +152,7 @@ export async function receiptOf(reply: Reply, lines: Lines, keeper: ReceiptKeepe
   const said = [left, named].filter((line): line is string => line !== undefined && line.trim() !== "");
   return {
     ...whole,
+    kept: path,
     content: [...short.content, ...said.map((line): ToolContent => ({ type: "text", text: line }))],
     details: { ...reply.details, parts: [...short.kinds, ...said.map((): PartKind => "line")], receipt: { path, chars: text.length, ...(short.left > 0 ? { left: short.left } : {}) } },
   };
