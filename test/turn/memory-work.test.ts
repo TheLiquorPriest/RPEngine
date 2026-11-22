@@ -271,9 +271,10 @@ test("the Cast page's press: the cast list and the Turn page's record say what w
 
   const list = await b.page<{ characters: { name: string; waits: { perceptions: number; dreamt: unknown } }[] }>("GET", `/api/v1/chats/${CHAT}/cast`);
   expect(list.body.characters.find((c) => c.name === WREN)?.waits).toMatchObject({ perceptions: 1, dreamt: null });
-  const started = await b.page<{ job: { agent: string; plays?: string; startedBy: unknown } }>("POST", `/api/v1/chats/${CHAT}/jobs/take-in`, { character: WREN });
+  const started = await b.page<{ job: { agent: string; plays?: string; for?: string; startedBy: unknown } }>("POST", `/api/v1/chats/${CHAT}/jobs/take-in`, { character: WREN });
   expect(started.status).toBe(200);
-  expect(started.body.job).toMatchObject({ agent: "character", plays: WREN, startedBy: "user" });
+  // It names what it is started for (plan 3.2 §6.3): its use is counted under it, and the character's definition may hand it a list of its own for it.
+  expect(started.body.job).toMatchObject({ agent: "character", plays: WREN, for: "take-in", startedBy: "user" });
   await b.until("the job to end", async () => (await b.turns.harness.jobs.list({ user: USER, chat: CHAT })).jobs.find((j) => j.ended !== undefined && j.state === "done"));
   expect(told(b, "Take in what you have perceived and not yet taken in.")).toBeGreaterThan(0);
 

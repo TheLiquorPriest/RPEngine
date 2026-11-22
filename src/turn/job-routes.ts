@@ -111,6 +111,8 @@ const jobStartAsk = shape.named(
     definition: shape.text({ blank: false }),
     brief: T,
     given: opt(shape.list(T), "What it is given by name, as an agent's attachments are named."),
+    for: opt(T, "The purpose it is started for, one its definition names under `purposes:`: its agent is handed that list in place of what the definition gives every start. One the definition does not have hands it what every start is given."),
+    leave: opt(shape.list(T), "Names of what it would be handed that this start leaves out."),
     limits: opt(jobLimitsAsk, "Limits of its own: each holds in place of the setting's for this job."),
   }),
 );
@@ -119,6 +121,8 @@ const jobStartAsk = shape.named(
 const CAST_JOBS_PART = "cast-jobs";
 /** The definition a character's own agent runs as (`.agents/character.md`). */
 const CHARACTER_DEFINITION = "character";
+/** The purpose a character's own agent is started for when it takes in what it perceived (plan 3.2 §6.3): its definition's list for it, where it has one. */
+const TAKE_IN_PURPOSE = "take-in";
 
 const takeInAsk = shape.named("TakeInAsk", "The character whose own agent is to take in what it has perceived and not yet taken in, by its name as the cast holds it.", shape.object({ character: shape.text({ blank: false }) }));
 export const jobReply = shape.named("JobReply", "A job as it stands after the call.", shape.object({ job: jobView }));
@@ -171,7 +175,14 @@ export function jobRoutes(deps: JobRoutesDeps) {
 
   /** He starts a job, as his own and tied to no turn (R-27): of the chat the scope names, or of none. */
   const start = async (scope: Scope | UserScope, ask: Infer<typeof jobStartAsk>): Promise<{ job: JobView }> => {
-    const view = await jobs.start(scope, { agent: ask.definition, brief: ask.brief, ...(ask.given !== undefined ? { attach: ask.given } : {}), ...(ask.limits !== undefined ? { limits: ask.limits } : {}) });
+    const view = await jobs.start(scope, {
+      agent: ask.definition,
+      brief: ask.brief,
+      ...(ask.given !== undefined ? { attach: ask.given } : {}),
+      ...(ask.for !== undefined && ask.for.trim() !== "" ? { for: ask.for.trim() } : {}),
+      ...(ask.leave !== undefined && ask.leave.length > 0 ? { leave: ask.leave } : {}),
+      ...(ask.limits !== undefined ? { limits: ask.limits } : {}),
+    });
     return { job: viewOrThrow(view, "No job was started") };
   };
 
@@ -266,7 +277,7 @@ export function jobRoutes(deps: JobRoutesDeps) {
         const part = await loadGuidance(turns.files, scope).part(CAST_JOBS_PART);
         const brief = part?.format === "lines" ? part.line("take_in", { name: body.character }) : undefined;
         if (brief === undefined || brief.trim() === "") throw new RouteError(409, `No job was started: the part ${CAST_JOBS_PART} is switched off or has no line take_in, which briefs the job.`);
-        return { job: viewOrThrow(await jobs.start(scope, { agent: CHARACTER_DEFINITION, brief, plays: body.character }), "No job was started") };
+        return { job: viewOrThrow(await jobs.start(scope, { agent: CHARACTER_DEFINITION, brief, plays: body.character, for: TAKE_IN_PURPOSE }), "No job was started") };
       },
     }),
     route({

@@ -8,7 +8,7 @@
 
 import type { ListedDefinition } from "rp-harness/contract";
 import { useState } from "preact/hooks";
-import type { ConnectionShown, RegisteredTool, StackReply } from "../../../shared/api";
+import type { ConnectionShown, GivenName, RegisteredTool, StackReply } from "../../../shared/api";
 import { useApp } from "../../app";
 import { Badge, Banner, Button, Disclosure, Section } from "../../../frontend/components";
 import { useRead } from "../../reading";
@@ -147,27 +147,79 @@ function StackSection(props: { chat: string | null; agent: string }) {
   );
 }
 
+/** A size in tokens as a row says it; nothing where none is known (RPH's own kinds are measured at the run). */
+export function tokensWords(tokens: number | null | undefined): string {
+  return tokens === null || tokens === undefined ? "" : counted(tokens, "token");
+}
+
+/** One name a definition is given, with what provides it, its size at the chat's newest turn, and a mark where nothing provides it. */
+function GivenRow(props: { name: string; found: GivenName | undefined; missing: boolean }) {
+  const { name, found, missing } = props;
+  const size = tokensWords(found?.tokens);
+  return (
+    <li class="rpe-line" data-given-name={name}>
+      <code>{name}</code>{" "}
+      {found === undefined ? null : (
+        <span class="rpe-meta">
+          {GIVEN_KIND_WORDS[found.kind] ?? found.kind}
+          {found.by === "rpe" ? ", RPE's" : ", RPH's"}
+          {size === "" ? null : <span data-given-tokens={found.tokens ?? ""}>, {size} here now</span>}
+        </span>
+      )}{" "}
+      {missing || found?.found === false ? <Badge tone="warn">nothing provides it</Badge> : null}
+    </li>
+  );
+}
+
 function GivenSection(props: { chat: string | null; agent: ListedDefinition }) {
   const app = useApp();
   const chat = props.chat;
   const given = useRead(chat === null ? null : () => app.client.call("GET /api/v1/chats/:chat/given", { chat }), [chat, props.agent.name]);
   const mine = given.value?.definitions.find((d) => d.name === props.agent.name);
+  const purposes = Object.entries(props.agent.purposes ?? {});
+  /** The sizes RPE knows of a list, summed: what a start would be handed of RPE's views here now. */
+  const sum = (rows: readonly GivenName[] | undefined): string => {
+    const known = (rows ?? []).flatMap((g) => (g.tokens === null ? [] : [g.tokens]));
+    return known.length === 0 ? "" : tokensWords(known.reduce((a, b) => a + b, 0));
+  };
+  const all = sum(mine?.given);
   return (
     <Section id="given" title="What it is given">
       {props.agent.given.length === 0 ? <p class="lre-muted rpe-line">Nothing by name.</p> : null}
       <ul class="rpe-plain lre-stack" data-given>
-        {props.agent.given.map((name) => {
-          const found = mine?.given.find((g) => g.name === name);
-          const missing = mine?.missing.includes(name) === true;
-          return (
-            <li key={name} class="rpe-line" data-given-name={name}>
-              <code>{name}</code>{" "}
-              {found === undefined ? null : <span class="rpe-meta">{GIVEN_KIND_WORDS[found.kind] ?? found.kind}{found.by === "rpe" ? ", RPE's" : ", RPH's"}</span>}{" "}
-              {missing || found?.found === false ? <Badge tone="warn">nothing provides it</Badge> : null}
-            </li>
-          );
-        })}
+        {props.agent.given.map((name) => (
+          <GivenRow key={name} name={name} found={mine?.given.find((g) => g.name === name)} missing={mine?.missing.includes(name) === true} />
+        ))}
       </ul>
+      {all === "" ? null : (
+        <p class="rpe-meta" data-given-sum>
+          A start that names no purpose would be handed {all} of RPE's views here now; what RPH finds itself (files, messages, lore, the prompt) is measured at the run.
+        </p>
+      )}
+      {purposes.length === 0 ? null : (
+        <div class="lre-stack" data-purposes>
+          <span class="rpe-caption">For a purpose a start names</span>
+          <p class="rpe-meta">A start that names one of these (`for`) is handed its list in place of the one above.</p>
+          {purposes.map(([purpose, names]) => {
+            const found = mine?.purposes.find((p) => p.name === purpose);
+            const size = sum(found?.given);
+            return (
+              <div key={purpose} class="lre-stack" data-purpose={purpose}>
+                <span class="rpe-line">
+                  <code>{purpose}</code>
+                  {size === "" ? null : <span class="rpe-meta">: {size} of RPE's views here now</span>}
+                </span>
+                {names.length === 0 ? <p class="lre-muted rpe-line">Nothing by name.</p> : null}
+                <ul class="rpe-plain lre-stack">
+                  {names.map((name) => (
+                    <GivenRow key={name} name={name} found={found?.given.find((g) => g.name === name)} missing={mine?.missing.includes(name) === true} />
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
+        </div>
+      )}
       {chat === null ? <p class="rpe-meta">Open a chat to see what each name brings there.</p> : given.problem === null ? null : <p class="rpe-line">{given.problem}</p>}
     </Section>
   );

@@ -337,7 +337,7 @@ export const toldShown = shape.named(
     gapChecks: shape.list(shape.object({ check: gapCheck, at: N })),
     consents: shape.list(shape.object({ grant: consentGrant, at: N })),
     rules: shape.list(shape.object({ firing: ruleFiring, at: N })),
-    attachments: shape.list(shape.object({ agent: agentRef, refs: shape.json(), at: N })),
+    attachments: shape.list(shape.object({ agent: agentRef, refs: shape.json(), purpose: opt(T, "The purpose its start, or the message that went on with it, named (`for`); absent where none was named."), at: N })),
     dropped: shape.list(shape.object({ agent: agentRef, at: N })),
   }),
 );

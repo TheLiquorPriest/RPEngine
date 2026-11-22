@@ -1,5 +1,6 @@
-// Start a job by hand (plan §13.5, R-27, AuUI-205): a definition from the agents route, a brief, what it is given by name, and limits of its own
-// (calls, tokens in, tokens out, tokens, time; each holds only where tighter than `jobs.run.*`), in the chat open. It is his own job: what it records is
+// Start a job by hand (plan §13.5, R-27, AuUI-205): a definition from the agents route, a brief, the purpose it is started for where its definition names any
+// (plan 3.2 §6.3), what it is given by name, and limits of its own (calls, tokens in, tokens out, tokens, time; each holds only where tighter than `jobs.run.*`),
+// in the chat open. Under the choice stands what the start would hand its agent by name, each with its size here now. It is his own job: what it records is
 // his, placed before the next turn that begins after it ends. RPE's refusal (jobs off, a limit of the day reached, a bad limit) is shown in its words.
 
 import { useState } from "preact/hooks";
@@ -7,7 +8,7 @@ import type { JobLimits, JobView } from "../../../shared/api";
 import { useApp } from "../../app";
 import { Banner, Button, Section } from "../../../frontend/components";
 import { useRead } from "../../reading";
-import { errorWords } from "../../words";
+import { counted, errorWords } from "../../words";
 import { JobFollow } from "./follow";
 
 /** The limits a job may be given of its own: each by the key the route takes it under, and as its field is labelled. */
@@ -37,7 +38,9 @@ export function StartSection(props: { chat: string | null; onStarted(job: JobVie
   const app = useApp();
   const { chat } = props;
   const agents = useRead(() => app.client.call("GET /api/v1/agents", {}, { query: chat === null ? {} : { chat } }), [chat]);
+  const handed = useRead(chat === null ? null : () => app.client.call("GET /api/v1/chats/:chat/given", { chat }), [chat]);
   const [definition, setDefinition] = useState("");
+  const [purpose, setPurpose] = useState("");
   const [brief, setBrief] = useState("");
   const [given, setGiven] = useState("");
   const [typed, setTyped] = useState<Record<string, string>>({});
@@ -60,7 +63,7 @@ export function StartSection(props: { chat: string | null; onStarted(job: JobVie
     setBusy(true);
     setProblem(null);
     const names = given.split(",").map((n) => n.trim()).filter((n) => n !== "");
-    app.client.call("POST /api/v1/chats/:chat/jobs", { chat }, { body: { definition, brief, ...(names.length === 0 ? {} : { given: names }), ...(Object.keys(limits).length === 0 ? {} : { limits }) } }).then(
+    app.client.call("POST /api/v1/chats/:chat/jobs", { chat }, { body: { definition, brief, ...(names.length === 0 ? {} : { given: names }), ...(purpose === "" ? {} : { for: purpose }), ...(Object.keys(limits).length === 0 ? {} : { limits }) } }).then(
       (answer) => {
         setBusy(false);
         setStarted(answer.job);
@@ -72,11 +75,24 @@ export function StartSection(props: { chat: string | null; onStarted(job: JobVie
       },
     );
   };
+  const chosen = (agents.value?.agents ?? []).find((a) => a.name === definition);
+  const purposes = Object.keys(chosen?.purposes ?? {});
+  // What the start would hand its agent by name: its definition's list for the purpose chosen, or the one every start is given.
+  const mine = handed.value?.definitions.find((d) => d.name === definition);
+  const list = purpose === "" ? mine?.given : mine?.purposes.find((p) => p.name === purpose)?.given;
+  const sized = (list ?? []).flatMap((g) => (g.tokens === null ? [] : [g.tokens]));
   return (
     <Section id="start" title="Start a job">
       <label class="lre-field">
         <span class="label">The agent that does it</span>
-        <select class="lre-input" value={definition} onChange={(e) => setDefinition((e.currentTarget as HTMLSelectElement).value)}>
+        <select
+          class="lre-input"
+          value={definition}
+          onChange={(e) => {
+            setDefinition((e.currentTarget as HTMLSelectElement).value);
+            setPurpose("");
+          }}
+        >
           <option value="">choose an agent</option>
           {(agents.value?.agents ?? []).filter((a) => !a.off).map((a) => (
             <option key={a.name} value={a.name}>
@@ -85,6 +101,33 @@ export function StartSection(props: { chat: string | null; onStarted(job: JobVie
           ))}
         </select>
       </label>
+      {purposes.length === 0 ? null : (
+        <label class="lre-field">
+          <span class="label">What it is started for</span>
+          <select class="lre-input" data-purpose value={purpose} onChange={(e) => setPurpose((e.currentTarget as HTMLSelectElement).value)}>
+            <option value="">no purpose: everything its definition gives a start</option>
+            {purposes.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {definition === "" || list === undefined ? null : (
+        <div class="lre-stack" data-would-hand>
+          <span class="rpe-caption">What it would be handed</span>
+          {list.length === 0 ? <p class="lre-muted rpe-line">Nothing by name.</p> : null}
+          <ul class="rpe-plain lre-stack">
+            {list.map((g) => (
+              <li key={g.name} class="rpe-line" data-would-hand-name={g.name}>
+                <code>{g.name}</code> <span class="rpe-meta">{g.by === "rph" ? "measured at the run" : g.tokens === null ? "nothing provides it here now" : `${counted(g.tokens, "token")} here now`}</span>
+              </li>
+            ))}
+          </ul>
+          {sized.length === 0 ? null : <p class="rpe-meta">{counted(sized.reduce((a, b) => a + b, 0), "token")} of RPE's views here now, before what you add below.</p>}
+        </div>
+      )}
       <label class="lre-field">
         <span class="label">What it is to do</span>
         <textarea class="lre-input" rows={4} value={brief} onInput={(e) => setBrief((e.currentTarget as HTMLTextAreaElement).value)} />

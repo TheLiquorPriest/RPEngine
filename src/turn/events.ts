@@ -315,7 +315,9 @@ export async function givenViews(deps: EventsDeps, scope: Scope, agent: AgentRef
   const out: { ref: string; text: string | null }[] = [];
   for (const ref of refs) {
     try {
-      const mine = ref === LORE_BATCH ? await loreBatchBlock(deps.loreIndex, scope, inForce(), agent) : ref === LORE_KNOWN ? await knownView(deps, scope, agent, inForce()) : await turnView(reading, ref);
+      // A preview hands nothing over, so the batch it measures is held for nobody (plan 3.2 §6.3).
+      const holder = moment.preview === true ? undefined : agent;
+      const mine = ref === LORE_BATCH ? await loreBatchBlock(deps.loreIndex, scope, inForce(), holder) : ref === LORE_KNOWN ? await knownView(deps, scope, agent, inForce()) : await turnView(reading, ref);
       out.push({ ref, text: mine !== undefined ? mine : ((await deps.views?.(scope, agent, ref)) ?? (await castNamed(deps, scope, agent, ref, moment))) });
     } catch (error) {
       deps.log.warn("What an agent was to be given by name could not be read.", { agent: agent.id, ref, error: error instanceof Error ? error.message : String(error) });
@@ -403,7 +405,8 @@ export function turnEvents(deps: EventsDeps): TurnEvents {
       }, "keeping the intent record");
     },
     async attachments(at, agent, refs, moment) {
-      await tell(at, "attachments", { agent, refs, moment });
+      // A preview started nobody: what it would hand over is measured and nothing of it is kept as given. A start's purpose is kept with it, in the moment.
+      if (moment.preview !== true) await tell(at, "attachments", { agent, refs, moment });
       // RPE's own views are a chat's: a job of no chat is given only what a host's view gives by name (Build's, for its model jobs).
       if (at.chat === undefined) {
         const given: { name: string; text: string }[] = [];

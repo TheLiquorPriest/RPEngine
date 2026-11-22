@@ -5869,7 +5869,7 @@ export interface GapCheck {
 
 ### `GivenName`
 
-A name a definition's `given:` lists: what kind of thing it is, who finds it (RPH its own kinds, RPE its views), and whether RPE gives it at the chat's newest turn (null for RPH's, found at the run).
+A name a definition's `given:`, or one of its purposes, lists: what kind of thing it is, who finds it (RPH its own kinds, RPE its views), whether RPE gives it at the chat's newest turn (null for RPH's, found at the run), and its size there in tokens, at the chat's characters to a token (null for RPH's and for a name nothing provides).
 
 ```ts
 export interface GivenName {
@@ -5877,18 +5877,19 @@ export interface GivenName {
   kind: "file" | "chat" | "lore" | "prompt" | "world" | "story" | "cast" | "turn" | "index" | "ruleset" | "map" | "view";
   by: "rph" | "rpe";
   found: boolean | null;
+  tokens: number | null;
 }
 ```
 
 ### `GivenReply`
 
-What each agent definition in force for a chat is given by name, read at the chat's newest turn (null: it has none yet), and the names of RPE's that nothing provides.
+What each agent definition in force for a chat is given by name, for a start that names no purpose (`given`) and for each purpose a start may name (`purposes`: each with what the definition hands a start for it in place of `given`), read at the chat's newest turn (null: it has none yet) with each name's size there, and the names of RPE's that nothing provides.
 
 ```ts
 export interface GivenReply {
   chat: string;
   turn: string | null;
-  definitions: { name: string; off: boolean; given: GivenName[]; missing: string[] }[];
+  definitions: { name: string; off: boolean; given: GivenName[]; purposes: { name: string; given: GivenName[] }[]; missing: string[] }[];
 }
 ```
 
@@ -6125,6 +6126,10 @@ export interface JobStartAsk {
   brief: string;
   /** What it is given by name, as an agent's attachments are named. */
   given?: string[];
+  /** The purpose it is started for, one its definition names under `purposes:`: its agent is handed that list in place of what the definition gives every start. One the definition does not have hands it what every start is given. */
+  for?: string;
+  /** Names of what it would be handed that this start leaves out. */
+  leave?: string[];
   /** Limits of its own: each holds in place of the setting's for this job. */
   limits?: JobLimitsAsk;
 }
@@ -10471,7 +10476,7 @@ export interface TurnTold {
   gapChecks: { check: GapCheck; at: number }[];
   consents: { grant: ConsentGrant; at: number }[];
   rules: { firing: RuleFiring; at: number }[];
-  attachments: { agent: AgentRef; refs: JsonValue; at: number }[];
+  attachments: { agent: AgentRef; refs: JsonValue; purpose?: string; at: number }[];
   dropped: { agent: AgentRef; at: number }[];
 }
 ```
