@@ -1,13 +1,19 @@
 // `story_query` (plan §8.1, §6.8): any part of the story record as it stands on the call's path, by
 // id, by a range of messages, by who is involved, by what is open, due or held hot, with each item's
 // history when asked. It reads only. It picks by the record's own marks, names and positions, never by
-// what an item says, and answers in the record's order.
+// what an item says, and answers in the record's order. Asked `how: gist` (plan 3.2 §7.1) it gives each
+// item by what the record itself holds that stands for it, its title and its summary, with the size of
+// the item whole; code writes no summary of its own.
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
 import { oneOf, type Reply, TEXT, WHOLE, YES_NO } from "../iface/kit";
+import { textOf } from "../iface/texts";
 import { questRefOf } from "../quests/read";
 import { allSpans, itemView, namesOf, nearIds, placeRefOf, recordOr, type StoryCall, storyClock, type StoryToolSpec, treeOf } from "./kit";
 import { nameKey, STORY_PARTS, type Span, type StoryItem, type StoryPart, type StoryRecord } from "./record";
+
+/** How an answer gives each item (plan 3.2 §7.1): whole, as when nothing is said, or by its gist. A part of the record is asked for by the tool's own arguments. */
+const HOWS = ["gist", "whole"] as const;
 
 const QUERY_PROPERTIES: Record<string, JsonObject> = {
   part: oneOf(STORY_PARTS),
@@ -21,7 +27,29 @@ const QUERY_PROPERTIES: Record<string, JsonObject> = {
   due: YES_NO,
   hot: YES_NO,
   history: YES_NO,
+  how: oneOf(HOWS),
 };
+
+/**
+ * An item by its gist, from its whole view: its id, where it lies, whether it is closed or dropped, and what the record holds that
+ * stands for it, its title and its summary. An item with neither is given by the first line of its text that holds words (`first`),
+ * which is no gist of anyone's writing: the answer's line says so. With a counter, `tokens` is the size of the item whole, as a
+ * query by its id reads it.
+ */
+function gistView(whole: JsonObject, tokens: ((text: string) => number) | undefined): JsonObject {
+  const out: JsonObject = { id: whole.id ?? null };
+  for (const key of ["title", "summary"]) {
+    const value = whole[key];
+    if (typeof value === "string" && value.trim() !== "") out[key] = value;
+  }
+  if (out.title === undefined && out.summary === undefined && typeof whole.text === "string") {
+    const first = whole.text.split("\n").find((line) => /[\p{L}\p{N}]/u.test(line));
+    if (first !== undefined) out.first = first.trim();
+  }
+  for (const key of ["message", "from", "to", "closed", "dropped"]) if (whole[key] !== undefined) out[key] = whole[key] as JsonValue;
+  if (tokens !== undefined) out.tokens = tokens(JSON.stringify(whole));
+  return out;
+}
 
 /** The parts an item of which can be closed, and so be open. */
 const CLOSABLE: Readonly<Partial<Record<StoryPart, true>>> = { chapter: true, scene: true, thread: true, future: true };
@@ -45,7 +73,8 @@ function placeOf(record: StoryRecord, item: StoryItem, spans: ReadonlyMap<string
 
 async function query(args: JsonObject, call: StoryCall): Promise<Reply> {
   const reply = call.reply();
-  const unreadable = (field: string, value: JsonValue | undefined, choices: readonly JsonValue[] = []): Reply => reply.line("unreadable", { field, value: JSON.stringify(value), choices }).fail();
+  // The choices go in as one list in words: a list of values would say the sentence once for each.
+  const unreadable = (field: string, value: JsonValue | undefined, choices: readonly JsonValue[] = []): Reply => reply.line("unreadable", { field, value: JSON.stringify(value), choices: textOf(choices) }).fail();
   const part = args.part;
   if (part !== undefined && !(STORY_PARTS as readonly JsonValue[]).includes(part)) return unreadable("part", part, STORY_PARTS);
   for (const field of ["from", "to"]) if (args[field] !== undefined && !(typeof args[field] === "number" && Number.isInteger(args[field]))) return unreadable(field, args[field]);
@@ -53,6 +82,14 @@ async function query(args: JsonObject, call: StoryCall): Promise<Reply> {
   if (args.who !== undefined && typeof args.who !== "string") return unreadable("who", args.who);
   if (args.place !== undefined && typeof args.place !== "string") return unreadable("place", args.place);
   if (args.id !== undefined && typeof args.id !== "string") return unreadable("id", args.id);
+  if (args.how !== undefined && !(HOWS as readonly JsonValue[]).includes(args.how)) return unreadable("how", args.how, HOWS);
+  const gists = args.how === "gist";
+  const { tokens } = call.deps;
+  /** What a gist answer closes with: how much it shows of how much, and the call that reads an item whole. */
+  const gistLine = (shown: readonly JsonObject[], wholes: readonly JsonObject[]): void => {
+    const first = shown.some((g) => g.first !== undefined);
+    reply.line("gists", { items: shown.length, one: shown.length === 1, ...(first ? { first: true } : {}), ...(tokens !== undefined ? { shown: tokens(JSON.stringify(shown)), whole: tokens(JSON.stringify(wholes)) } : {}) });
+  };
 
   const record = recordOr(call, reply);
   if (record === null) return reply;
@@ -63,7 +100,12 @@ async function query(args: JsonObject, call: StoryCall): Promise<Reply> {
   if (typeof args.id === "string") {
     const item = record.items.get(args.id.trim());
     if (item === undefined) return reply.line("unknown_id", { id: JSON.stringify(args.id), ...(typeof part === "string" ? { part } : {}), ...nearIds(call.lines, call.settings, record, args.id, typeof part === "string" ? (part as StoryPart) : null) }).fail();
-    return reply.data({ [item.part]: [itemView(record, item, clock, spans, history)] });
+    const whole = itemView(record, item, clock, spans, history);
+    if (!gists) return reply.data({ [item.part]: [whole] });
+    const gist = gistView(whole, tokens);
+    reply.data({ [item.part]: [gist] });
+    gistLine([gist], [whole]);
+    return reply;
   }
   if (args.due === true && clock === null) reply.line("no_clock_due", {});
 
@@ -94,15 +136,23 @@ async function query(args: JsonObject, call: StoryCall): Promise<Reply> {
   if (matches.length === 0) return reply.line("none", {});
   const shown = matches.slice(0, call.settings.queryItems);
   const data: JsonObject = {};
+  const wholes: JsonObject[] = [];
+  const given: JsonObject[] = [];
   for (const item of shown) {
     const list = (data[item.part] ??= []) as JsonValue[];
-    list.push(itemView(record, item, clock, spans, history));
+    const whole = itemView(record, item, clock, spans, history);
+    wholes.push(whole);
+    const view = gists ? gistView(whole, tokens) : whole;
+    given.push(view);
+    list.push(view);
   }
   const now = args.due === true && clock !== null ? clock.text(clock.now) : null;
   if (now !== null) data.now = now;
   reply.data(data);
+  if (gists) gistLine(given, wholes);
   const rest = matches.slice(shown.length);
-  if (rest.length > 0) reply.line("more", { count: rest.length, next: rest[0]?.id ?? "" });
+  // What is left out is counted, and sized where a counter is given: an answer that is not the whole says how much it is of how much.
+  if (rest.length > 0) reply.line("more", { count: rest.length, next: rest[0]?.id ?? "", ...(tokens !== undefined ? { tokens: tokens(JSON.stringify(rest.map((item) => itemView(record, item, clock, spans, history)))) } : {}) });
   return reply;
 }
 

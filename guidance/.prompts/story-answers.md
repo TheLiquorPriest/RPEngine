@@ -40,7 +40,8 @@ quest_unresolved: Operation {{n}} ({{op}}): the quest {{quest}} names no quest o
 place_unresolved: Operation {{n}} ({{op}}): the place {{place}} names no place of this world, so it is kept as the words you wrote and tied to none.
 none: Nothing in the story record matches.
 no_clock_due: This chat keeps no story time, so nothing falls due.
-more: {{count}} more match. Ask again with a part, a range or a name to see them; the next is {{next}}.
+more: {{count}} more match{{#tokens}}, {{tokens}} tokens whole{{/tokens}}. Ask again with a part, a range or a name to see them, or with how gist for each by its title and summary; the next is {{next}}.
+gists: {{#one}}This is its gist{{/one}}{{^one}}These are {{items}} gists{{/one}}: what the record holds that stands for each, its title and its summary{{#first}}; where an item has neither, first is the first line of its text, which is no summary{{/first}}.{{#whole}} This shows {{shown}} tokens of {{whole}}; tokens is the size of each whole.{{/whole}} story_query with an id reads one whole.
 correction_empty: Nothing of that could be corrected: {{id}} takes {{fields}}.
 correction_ignored: {{id}} does not take {{fields}}, so {{fields}} was left out.
 timeline_gone: The timeline has no {{id}} any more, so the page after it cannot be told. Read the timeline again from its start.

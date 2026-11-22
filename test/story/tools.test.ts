@@ -482,3 +482,71 @@ describe("story_record's receipt", () => {
     expect(r.details).toEqual({ parts: ["line", "line", "line", "line", "data", "line"], receipt: { path: `cache/answers/${callId}.md`, chars: file.length } });
   });
 });
+
+describe("story_query by gist (plan 3.2 §7.1)", () => {
+  /** A counter as the turn gives one: the chat's characters to a token. */
+  const tokens = (text: string): number => Math.ceil(text.length / 4);
+
+  /** Two scenes, the first closed with a summary, and a beat in each. */
+  async function played(): Promise<Bench> {
+    const b = await bench({ tokens });
+    const first = await b.t.begin();
+    await b.call("story_record", { operations: [{ op: "scene", new: true, title: "The ferry", who: ["Wren"], place: "the east landing", purpose: "Wren must cross before the tide turns." }, { op: "beat", text: "The ferryman names his price.\nWren counts her coin twice." }] }, first.id);
+    await b.t.tie(first);
+    const second = await b.t.begin();
+    await b.call("story_record", { operations: [{ op: "scene", summary: "Wren crosses for one silver, and the ferryman keeps her name.", close: true }, { op: "scene", new: true, title: "The far bank" }, { op: "beat", text: "Nobody waits on the far bank." }] }, second.id);
+    await b.t.tie(second);
+    return b;
+  }
+
+  test("each scene comes by its title and the summary the record holds, with the size of the whole, and the answer says how much it shows of how much", async () => {
+    const b = await played();
+    const whole = dataOf(await b.call("story_query", { part: "scene" })).scene as JsonObject[];
+    const answer = await b.call("story_query", { part: "scene", how: "gist" });
+    wordsFromFiles(answer);
+    const gists = dataOf(answer).scene as JsonObject[];
+    expect(gists).toEqual([
+      { id: whole[0]?.id, title: "The ferry", summary: "Wren crosses for one silver, and the ferryman keeps her name.", from: whole[0]?.from, to: whole[0]?.to, closed: true, tokens: tokens(JSON.stringify(whole[0])) },
+      // An open scene has no summary yet: its title stands for it, and nothing is written in a summary's place.
+      { id: whole[1]?.id, title: "The far bank", from: whole[1]?.from, to: whole[1]?.to, tokens: tokens(JSON.stringify(whole[1])) },
+    ]);
+    const said = texts(answer).at(-1) ?? "";
+    expect(said).toBe(`These are 2 gists: what the record holds that stands for each, its title and its summary. This shows ${tokens(JSON.stringify(gists))} tokens of ${tokens(JSON.stringify(whole))}; tokens is the size of each whole. story_query with an id reads one whole.`);
+    // The whole is there for the asking, by the id a gist names.
+    expect((dataOf(await b.call("story_query", { id: String(gists[0]?.id) })).scene as JsonObject[])[0]).toEqual(whole[0]);
+    expect((dataOf(await b.call("story_query", { id: String(gists[0]?.id), how: "whole" })).scene as JsonObject[])[0]).toEqual(whole[0]);
+  });
+
+  test("an item with neither a title nor a summary is given by the first line of its text, and the answer says that is no summary", async () => {
+    const b = await played();
+    const answer = await b.call("story_query", { part: "beat", how: "gist" });
+    wordsFromFiles(answer);
+    const beats = dataOf(answer).beat as JsonObject[];
+    expect(beats.map((beat) => beat.first)).toEqual(["The ferryman names his price.", "Nobody waits on the far bank."]);
+    expect(beats.every((beat) => typeof beat.tokens === "number" && beat.text === undefined)).toBe(true);
+    expect(texts(answer).at(-1)).toContain("where an item has neither, first is the first line of its text, which is no summary");
+  });
+
+  test("what a full answer leaves out is counted with its size, and how takes gist or whole and nothing else", async () => {
+    const b = await bench({ tokens, settings: { queryItems: 1 } });
+    const turn = await b.t.begin();
+    await b.call("story_record", { operations: [{ op: "beat", text: "The bell rings once." }, { op: "beat", text: "The bell rings twice." }] }, turn.id);
+    await b.t.tie(turn);
+    const answer = await b.call("story_query", { part: "beat" });
+    wordsFromFiles(answer);
+    expect(texts(answer).at(-1)).toMatch(/^1 more match, \d+ tokens whole\. /);
+    const refused = await b.call("story_query", { part: "beat", how: "part" });
+    expect(refused.error).toBe(true);
+    expect(texts(refused)[0]).toBe('how cannot be read: you sent "part". It is one of: gist, whole.');
+  });
+
+  test("with no counter given, a gist says no size and still names the call that reads the whole", async () => {
+    const b = await bench();
+    const turn = await b.t.begin();
+    await b.call("story_record", { operations: [{ op: "scene", new: true, title: "The ferry" }] }, turn.id);
+    await b.t.tie(turn);
+    const answer = await b.call("story_query", { part: "scene", how: "gist" });
+    expect((dataOf(answer).scene as JsonObject[])[0]).not.toHaveProperty("tokens");
+    expect(texts(answer).at(-1)).toBe("This is its gist: what the record holds that stands for each, its title and its summary. story_query with an id reads one whole.");
+  });
+});
