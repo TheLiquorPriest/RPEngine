@@ -639,7 +639,7 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
   // A job's end is told through `events.job`, which records it; the lane, made below, brings the sessions of its turn up to date. Each
   // change of a job's state is told to every page that follows his jobs, by the job's row, its brief cut as the shared levels say now: a
   // page that has the job open reads it whole by its id.
-  const eventsDeps: EventsDeps = { db: app.db, writes: app.writes, store, runs, files, sources, search: memorySearch, loreIndex, notes, suggestions, proposals: options.proposals, due, ...(options.views !== undefined ? { views: options.views } : {}), now: () => clock.now(), jobEnded: (user, chat, turn) => lane.sessionsAfter(user, chat, turn), jobTold: (job) => JOB_KIND.publish(app.live, LIVE_JOBS, { job: jobRowOf(job, globalConfig(app.paths.files, app.log)) }), log: app.log };
+  const eventsDeps: EventsDeps = { db: app.db, writes: app.writes, store, runs, files, sources, search: memorySearch, loreIndex, notes, suggestions, proposals: options.proposals, due, ...(options.views !== undefined ? { views: options.views } : {}), now: () => clock.now(), jobEnded: (user, chat, turn) => lane.sessionsAfter(user, chat, turn), jobTold: (job) => JOB_KIND.publish(app.live, LIVE_JOBS, { job: jobRowOf(job, globalConfig(app.paths.files, app.log)) }), kept: (user, chat, turn) => prompts.keptAt(user, chat, turn), log: app.log };
   const events = turnEvents(eventsDeps);
   const env: Environment = {
     id: "rpe",

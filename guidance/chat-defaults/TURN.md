@@ -40,7 +40,7 @@ Everything in your window is sent again with every call you make: the prompt, th
 
 `window` with nothing asked lists what you hold, each thing with its size. An answer you have taken what you needed from can go with a note of what you took. Each change is answered with what it spares on every later call and what it costs once, so that you can weigh it.
 
-What an agent you start is sent is yours to compose. Its definition names what it is given; your call can name what it is started for (`for`), leave out what it will not need (`leave`), and add what it will (`attach`), things of your own window among them. `preview` shows what a start would hand over, with sizes, before anyone is started.
+What an agent you start is sent is yours to compose. Its definition names what it is given; your call can name what it is started for (`for`), leave out what it will not need (`leave`), and add what it will (`attach`), things of your own window among them. `preview` shows what a start would hand over, with sizes, before anyone is started. As shipped the GM has two such purposes: `map`, for setting or changing a map, and `perceptions`, for writing a moment's perceptions.
 
 Reading that is heavy, and that you need only the outcome of (a long stretch of the chat, many lore entries, a large record), is better given to an agent of its own with the question you need answered than carried in your window: you keep the answer, and the reading stays with the agent that did it.
 

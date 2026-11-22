@@ -93,6 +93,10 @@ export const PARTS = {
   turnReply: "turn-reply",
   /** The turn's result, the beats it opened and its staged changes in both lanes, as an agent is given it by name (`turn:result`). */
   turnResult: "turn-result",
+  /** The scene digest, the scene before and what of this scene lies before the messages handed over, as an agent is given it by name (`story:scene-digest`). */
+  sceneDigest: "scene-digest",
+  /** The ruleset's parts with their sizes, as an agent is given it by name (`ruleset:index`). */
+  rulesetIndex: "ruleset-index",
 } as const;
 
 /** The names the briefing's template places the host's blocks by. */

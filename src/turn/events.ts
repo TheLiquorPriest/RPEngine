@@ -29,19 +29,19 @@
 
 import type { Database } from "bun:sqlite";
 import { type Fields, type Guidance, loadGuidance, type TemplatePart } from "../app/guidance";
-import type { AgentRef, AttachMoment, ConsentGrant, ContextBlock, FilesPort, GapCheck, JobView, Log, RuleFiring, RunScope, Scope, TurnEvents } from "rp-harness/contract";
+import type { AgentRef, AttachMoment, ConsentGrant, ContextBlock, FilesPort, GapCheck, JobView, JsonObject, Log, RuleFiring, RunScope, Scope, TurnEvents } from "rp-harness/contract";
 import { castViews, type MemorySearch, type SourceReader } from "../cast";
-import { mapView, mapWording, noMapWords, rulesetData } from "../iface";
+import { mapView, mapWording, noMapWords, rulesetData, rulesetParts, rulesetPlayed } from "../iface";
 import { LORE_BATCH, LORE_KNOWN, type LoreIndex, type LoreProposals, loreBatchBlock, loreKnownBlock, loreLines } from "../lore";
 import { type DueSource, type Lane, type Part, readPart, type Store, type ViewLine, wordLine, worldState, type WorldStateBlock, worldStateFolds } from "../store";
-import { storyBrief } from "../story";
+import { sceneDigest, storyBrief } from "../story";
 import { storyAt } from "../story/path";
 import { StoryRecord } from "../story/record";
 import type { TreeNotes, TreeSuggestions } from "../tree";
 import type { Writes } from "./kv";
 import { endedError, type Runs } from "./runs";
 import { turnSettings } from "./settings";
-import { namedIn, stageAt, stageCues } from "./stage";
+import { namedIn, namedStretches, SCENE_WINDOW, stageAt, stageCues } from "./stage";
 import { guidanceTexts } from "./texts";
 import { castLayouts, DRAWN_MAP, drawnLayer, PARTS, tokenCount } from "./turns";
 
@@ -73,11 +73,13 @@ export interface EventsDeps {
   due: DueSource;
   /** A view the host adds by name: its text; null for a name that is none of its own. Asked after the turn's own views, before the cast's; for a job of no chat, alone. */
   views?: (scope: RunScope, agent: AgentRef, ref: string) => Promise<string | null>;
+  /** The first history message the prompt an agent's work reads kept (`TurnPrompts.keptAt`): where the part of the scene an agent is handed begins (`chat:history[scene-window]`), and so what the scene digest stands for. */
+  kept(user: string, chat: string, turn: string | null): string | null;
   log: Log;
 }
 
-/** The turn's own views an agent can be given by name (plan §5.4, §10.4, Appendix C), but the scene's. */
-const VIEWS = { storyBrief: "story:brief", due: "world:due", ruleset: "ruleset", reply: "turn:reply(saved)", result: "turn:result", mapDrawn: DRAWN_MAP } as const;
+/** The turn's own views an agent can be given by name (plan §5.4, §10.4, Appendix C; plan 3.2 §6.6: the scene digest and the ruleset's index), but the scene's. */
+const VIEWS = { storyBrief: "story:brief", sceneDigest: "story:scene-digest", due: "world:due", ruleset: "ruleset", rulesetIndex: "ruleset:index", reply: "turn:reply(saved)", result: "turn:result", mapDrawn: DRAWN_MAP } as const;
 
 /** The field a view's layout shows its part for nothing by: set only when an agent is given that view by name with nothing in it. */
 const NONE = "none";
@@ -141,15 +143,61 @@ function sectionOf(world: Compiled | null, section: keyof typeof SECTION_NONE): 
   return text === "" ? "" : part.body.render(part.header, { [section]: text }).trim();
 }
 
-/** The world's ruleset as `world_query` gives it, at the scope's turn or the chat's head (a chat the store does not hold, as an untouched one); null where there is no such turn or world. */
-function rulesetView(deps: EventsDeps, scope: Scope): string | null {
+/** The world's document and state at the scope's turn or the chat's head (a chat the store does not hold, as an untouched one); null where there is no such turn or world. */
+function worldAt(deps: EventsDeps, scope: Scope): { doc: NonNullable<ReturnType<Store["env"]["worlds"]>>; state: ReturnType<ReturnType<Store["user"]>["headState"]>["state"] } | null {
   const store = deps.store.user(scope.user);
   const turn = scope.turn === undefined ? null : store.turn(scope.turn);
   if (scope.turn !== undefined && turn?.chat !== scope.chat) return null;
   const state = turn === null ? store.headState(scope.chat).state : store.stateAt(turn.id).state;
   const doc = deps.store.env.worlds(state.world.revision);
-  return doc === undefined ? null : JSON.stringify({ ruleset: rulesetData(doc) });
+  return doc === undefined ? null : { doc, state };
 }
+
+/** The world's ruleset as data, with the world's own actions: what the view `ruleset` has always given. */
+function rulesetOf(deps: EventsDeps, scope: Scope): JsonObject | null {
+  const at = worldAt(deps, scope);
+  return at === null ? null : rulesetData(at.doc);
+}
+
+/** The world's ruleset whole (`ruleset`), with the world's own actions; null where there is no such turn or world. */
+function rulesetView(deps: EventsDeps, scope: Scope): string | null {
+  const ruleset = rulesetOf(deps, scope);
+  return ruleset === null ? null : JSON.stringify({ ruleset });
+}
+
+/**
+ * The world's ruleset by its parts (`ruleset:index`, plan 3.2 §6.6): each part of the ruleset as the chat plays it, which is what
+ * `ruleset_read` reads a part of and `world_query` gives whole at `ruleset`, with how many entries it holds and its size in tokens
+ * at the chat's characters to a token, laid out by the part `ruleset-index`. Null where there is no such turn or world, or the
+ * layout is off.
+ */
+async function rulesetIndexView(r: Reading): Promise<string | null> {
+  const layout = await r.guidance().part(PARTS.rulesetIndex);
+  const at = layout?.format === "template" ? worldAt(r.deps, r.scope) : null;
+  if (layout?.format !== "template" || at === null) return null;
+  const ruleset = rulesetPlayed(r.deps.store.env.registry, at.doc, at.state.world);
+  const settings = await turnSettings(r.deps.files, r.scope, r.deps.log);
+  const count = tokenCount(settings.charsPerToken);
+  const parts = rulesetParts(ruleset, count);
+  if (parts.length === 0) return nothing(layout);
+  return layout.render({ parts, tokens: count(JSON.stringify({ ruleset })) }).text.trim();
+}
+
+/**
+ * The scene digest (`story:scene-digest`, plan 3.2 §6.6): the scene before, by the summary the record holds, and this scene's beats
+ * for the messages before the part of it an agent is handed (`chat:history[scene-window]`, from the first message its prompt's window
+ * kept); laid out by the part `scene-digest`, with nothing in it, its part for nothing. Null where the layout is off.
+ */
+async function sceneDigestView(r: Reading): Promise<string | null> {
+  const layout = await r.guidance().part(PARTS.sceneDigest);
+  if (layout?.format !== "template") return null;
+  const { user, chat } = r.scope;
+  const turn = r.scope.turn ?? null;
+  const shownFrom = namedStretches(r.deps.store, user, chat, turn, r.deps.kept(user, chat, turn))[SCENE_WINDOW]?.from ?? null;
+  const { text } = sceneDigest({ store: r.deps.store, user, chat, turn, layout, shownFrom });
+  return text !== "" ? text : nothing(layout);
+}
+
 
 /**
  * The drawn layer of the map the player's character stands on (`map:drawn`), at the scope's turn or the chat's head: what the Author's
@@ -189,10 +237,14 @@ async function turnView(r: Reading, ref: string): Promise<string | null | undefi
       const { text } = storyBrief({ store: r.deps.store, user: r.scope.user, chat: r.scope.chat, turn: r.scope.turn ?? null, ...(onStage !== undefined ? { stage: onStage } : {}), layout });
       return text !== "" ? text : nothing(layout);
     }
+    case VIEWS.sceneDigest:
+      return await sceneDigestView(r);
     case VIEWS.due:
       return sectionOf(await r.world(r.maps), "due");
     case VIEWS.ruleset:
       return rulesetView(r.deps, r.scope);
+    case VIEWS.rulesetIndex:
+      return await rulesetIndexView(r);
     case VIEWS.reply: {
       // An agent of no turn has no turn's reply to be given.
       const { turn } = r.scope;

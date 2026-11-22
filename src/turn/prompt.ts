@@ -50,6 +50,8 @@ export interface TurnPrompts extends PromptPort {
   latestCut(user: string, chat: string): unknown;
   /** The first history message a turn's prompt kept, by the cut its request carried; null where the window cut nothing, or none was kept. */
   keptFrom(user: string, turn: string): string | null;
+  /** The first history message the prompt an agent's work reads kept: its turn's, or for work of no turn (null) the chat's latest kept prompt's; null where that prompt's window cut nothing, or none is kept. */
+  keptAt(user: string, chat: string, turn: string | null): string | null;
   /** Where the slices of the chat's prompts were found, by turn, as RPH saved it; null for a turn that has none kept. */
   located(user: string, turn: string): LocatedSlices | null;
   /** What a turn's request carried as kept: its raw layout, the receipt's cut (`Cut`, as JSON) and the prompt as passed on (null for a turn kept before it was); null for a turn whose prompt is not kept. */
@@ -154,6 +156,12 @@ export function turnPrompts(db: Database, writes: Writes, now: () => number, wri
     keptFrom(user, turn) {
       const row = db.query<{ cut: string }, [string, string]>("SELECT cut FROM turn_prompt WHERE user = ? AND turn = ?").get(user, turn);
       const cut: unknown = row === null ? null : JSON.parse(row.cut);
+      return isRecord(cut) && isRecord(cut.keep) && typeof cut.keep.id === "string" ? cut.keep.id : null;
+    },
+
+    keptAt(user, chat, turn) {
+      if (turn !== null) return this.keptFrom(user, turn);
+      const cut = this.latestCut(user, chat);
       return isRecord(cut) && isRecord(cut.keep) && typeof cut.keep.id === "string" ? cut.keep.id : null;
     },
 

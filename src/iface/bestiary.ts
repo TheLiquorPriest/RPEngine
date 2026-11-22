@@ -5,6 +5,8 @@
 // copies a row's values onto someone made from it; which row fits a stranger is the GM's to say.
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
+import { offeredActions } from "../engine/offered";
+import type { Registry } from "../engine/registry-impl";
 import { BESTIARY_TABLE } from "../packs/combat/core/bestiary";
 import { D20_ACTIONS, type D20Def, type D20TableRole, saveLabel } from "../shared/d20";
 import { say } from "../shared/lines";
@@ -85,4 +87,42 @@ export function rulesetData(world: Pick<WorldDoc, "ruleset" | "tables" | "checks
     actions: [...actions] as JsonValue,
     bestiary: bestiaryOf(world).map((r) => ({ ...r }) as unknown as JsonValue),
   };
+}
+
+/** The ruleset as a chat plays it, which `world_query` gives at `ruleset` and `ruleset_read` a part of: its data with every action the chat is offered, the packs' among them (`offeredActions`), by id in order. */
+export function rulesetPlayed(registry: Registry, world: WorldDoc, state: Parameters<Registry["context"]>[1]): JsonObject {
+  return rulesetData(world, [...offeredActions(registry, registry.context(world, state)).keys()].sort());
+}
+
+/** A part of the ruleset as its index lists it (plan 3.2 §6.6): its name, how many entries it holds where it is a list or keyed by id, and with a counter its size in tokens. (A type, not an interface, so it is a template's fields.) */
+export type RulesetPart = { part: string; entries?: number; tokens?: number };
+
+/** The ruleset's parts: each part of `rulesetData` at its top, in its order, with its size where a counter is given. */
+export function rulesetParts(ruleset: JsonObject, tokens?: (text: string) => number): RulesetPart[] {
+  return Object.entries(ruleset).map(([part, value]) => ({
+    part,
+    ...(Array.isArray(value) ? { entries: value.length } : typeof value === "object" && value !== null ? { entries: Object.keys(value).length } : {}),
+    ...(tokens !== undefined ? { tokens: tokens(JSON.stringify(value)) } : {}),
+  }));
+}
+
+/** A name as an entry is asked for by: trimmed, case ignored. */
+const asked = (text: string): string => text.trim().toLowerCase();
+
+/**
+ * One entry of a ruleset part, by its id or name: of a part keyed by id, that key's value; of a list of records, the one whose id,
+ * name or label it is; of a list of words, the word itself. Undefined where the part holds none by it, or holds no entries.
+ */
+export function rulesetEntry(value: JsonValue | undefined, said: string): JsonValue | undefined {
+  const want = asked(said);
+  if (Array.isArray(value)) {
+    return value.find((entry) => {
+      if (typeof entry === "string") return asked(entry) === want;
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
+      return ["id", "name", "label"].some((key) => typeof entry[key] === "string" && asked(entry[key]) === want);
+    });
+  }
+  if (typeof value !== "object" || value === null) return undefined;
+  const key = Object.keys(value).find((k) => asked(k) === want);
+  return key === undefined ? undefined : value[key];
 }

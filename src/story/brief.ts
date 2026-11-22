@@ -86,6 +86,44 @@ export function storyBrief(point: StoryPoint & { layout: StorySoFarInput["layout
   return { text: point.layout.render(fields).text.trimEnd(), fields };
 }
 
+/** The fields of `.prompts/scene-digest.md`; a part with nothing in it is left out. */
+export type SceneDigestFields = {
+  /** The scene before the open one, by what the record holds of it: its id, its title, the messages it spans (`span`, where the record places both ends) and its summary where one is written. */
+  before?: JsonObject;
+  /** The beats of the open scene that lie before the messages the agent is handed, oldest first, with the messages they span. */
+  earlier?: { from: number; to: number; items: JsonObject[] };
+};
+
+/**
+ * The scene digest (plan 3.2 §6.6): what stands in for the messages of the scene an agent is not handed. The scene before the open
+ * one by its title and the summary the record holds, and the open scene's own beats that lie before `shownFrom`, the first message
+ * the agent is handed (null: it is handed the whole scene, and no beat is listed). Code writes no summary: a scene with none
+ * recorded is given by its title alone, and the layout says so. Empty text when the record holds neither.
+ */
+export function sceneDigest(point: StoryPoint & { layout: StorySoFarInput["layout"]; shownFrom: number | null }): { text: string; fields: SceneDigestFields } {
+  const record = readAt(point);
+  const spans = record.spans("scene");
+  const scenes = record.of("scene");
+  const current = record.current("scene");
+  const open = current !== null && current.closedBy === null ? current : null;
+  const before = open === null ? scenes.at(-1) : scenes[scenes.indexOf(open) - 1];
+  const fields: SceneDigestFields = {};
+  if (before !== undefined) {
+    const span = spans.get(before.id);
+    const text = (name: string): JsonObject => (typeof before.fields[name] === "string" && before.fields[name].trim() !== "" ? { [name]: before.fields[name] } : {});
+    fields.before = { id: before.id, ...text("title"), ...text("summary"), ...(span?.from != null && span.to != null ? { span: { from: span.from, to: span.to } } : {}) };
+  }
+  const start = open === null ? null : record.startOf(open);
+  if (open !== null && start !== null && point.shownFrom !== null && point.shownFrom > start) {
+    const items = record.of("beat").flatMap((beat): JsonObject[] => {
+      const at = record.beatAt(beat);
+      return at !== null && at >= start && at < point.shownFrom! && typeof beat.fields.text === "string" ? [{ id: beat.id, text: beat.fields.text, message: at }] : [];
+    });
+    if (items.length > 0) fields.earlier = { from: start, to: point.shownFrom - 1, items };
+  }
+  if (Object.keys(fields).length === 0) return { text: "", fields };
+  return { text: point.layout.render(fields).text.trimEnd(), fields };
+}
 
 /** The written summaries of a timeline part, each with the messages it stands for; one whose messages were deleted stands where the turn that wrote it does, marked. One not placed yet (its turn is still open) is left out. */
 function summaries(record: StoryRecord, part: SpanPart): StorySummary[] {

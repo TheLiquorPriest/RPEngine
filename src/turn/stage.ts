@@ -98,17 +98,25 @@ export function stageAt(store: Store, user: string, chat: string, turn: string |
   return stageOf(store, state, sceneOf(new StoryRecord(storyAt(u, chat, turn), storySliceOf(state))));
 }
 
+/** The name of the stretch that is the part of the open scene the prompt's window holds (`chat:history[scene-window]`, plan 3.2 §6.6). */
+export const SCENE_WINDOW = "scene-window";
+
 /**
  * The stretches of a chat RPE names for agents (`ChatInfo.ranges`): `scene`, from the first message of the scene the story record
  * holds open at `turn`'s own reading (the chat's head for null) to the end of that line's messages, so a swipe's scene is the one its
- * parent left and never one the replaced attempt opened. None while no scene is open, or for a scene whose start the record cannot place.
+ * parent left and never one the replaced attempt opened; and `scene-window`, the part of it the prompt held: from `kept`, the first
+ * message that prompt's window kept, where that lies inside the scene, and the whole scene where the window cut nothing (null) or
+ * cut before it. None while no scene is open, or for a scene whose start the record cannot place.
  */
-export function namedStretches(store: Store, user: string, chat: string, turn: string | null): Record<string, HistoryRange> {
+export function namedStretches(store: Store, user: string, chat: string, turn: string | null, kept: string | null = null): Record<string, HistoryRange> {
   if (store.user(user).chat(chat) === null) return {};
   const record = StoryRecord.read(store, user, storyAt(store.user(user), chat, turn));
   const scene = record.current("scene");
   const from = scene === null || scene.closedBy !== null ? null : record.startOf(scene);
-  return from === null ? {} : { scene: { from, to: record.at.messages.length } };
+  if (from === null) return {};
+  const to = record.at.messages.length;
+  const keptAt = kept === null ? null : record.numberOf(kept);
+  return { scene: { from, to }, [SCENE_WINDOW]: { from: keptAt === null ? from : Math.min(Math.max(from, keptAt), to), to } };
 }
 
 /**
