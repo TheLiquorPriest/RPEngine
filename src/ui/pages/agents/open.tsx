@@ -122,6 +122,11 @@ function ToolsSection(props: { chat: string | null; agent: ListedDefinition }) {
           <code> tool_search</code> and <code>tool_use</code>.
         </p>
       )}
+      {props.agent.starts === undefined ? null : (
+        <p class="rpe-meta" data-starts>
+          {props.agent.starts.length === 0 ? "Its header lets it start no agent." : `With task, delegate and job_start it may start only: ${props.agent.starts.join(", ")} (its header's starts line).`}
+        </p>
+      )}
     </Section>
   );
 }

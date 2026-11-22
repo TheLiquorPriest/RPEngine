@@ -5,8 +5,10 @@ description: Reads lore entries a batch at a time and writes one index line for 
 # The kinds are listed in the body below. Add a kind by adding it to that list.
 model: default
 effort: low
-tools: [lore_read, lore_index_write, window]
+tools: [lore_read, lore_index_write, window, task]
 out_of_reach: [reply]
+# The agents it may start with task: instances of itself, each for a batch of the entries.
+starts: [indexer]
 reads: [ALL-AGENTS, rules, AGENTS]
 given:
   - index:batch

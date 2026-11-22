@@ -293,15 +293,15 @@ test("the shipped definitions are App. C's nine and Build's five, and no other: 
   expect([...SHIPPED.keys()].filter((path) => path.startsWith(".agents/")).map((path) => basename(path, ".md")).sort()).toEqual([...AGENTS, ...BUILD_JOBS].sort());
 });
 
-test("the Author's fixed tools, as RPH's loader reads them, are §6.8's thirty and `window`, name for name", async () => {
+test("the Author's fixed tools, as RPH's loader reads them, are §6.8's thirty with `window` and `task`, name for name", async () => {
   const fixed = [
     "prompt", "chat_read", "chat_search", "lore_read", "lore_search", "archive_search", "web_search", "gap_check", "delegate", "agent_message",
     "write_reply", "reply_release", "file_read", "file_find", "file_write", "skill_load", "job_start", "suggest", "todo", "tool_search", "tool_use",
     "world_query", "world_search", "world_apply", "roll", "story_query", "story_record", "cast_query", "cast_update", "perceive",
-    // Plan 3.2 §7.2: every agent's means over its own window.
-    "window",
+    // Plan 3.2 §7.2 and §7.3: every agent's means over its own window, and of splitting its work.
+    "window", "task",
   ];
-  expect(fixed).toHaveLength(31);
+  expect(fixed).toHaveLength(32);
   expect([...((await guidance.definition("author"))?.tools ?? [])].sort()).toEqual([...fixed].sort());
 });
 

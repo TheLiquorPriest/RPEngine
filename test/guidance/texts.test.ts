@@ -53,7 +53,7 @@ const WORDED: { row: string; markers: string[] }[] = [
   { row: "When a scene ends, and when a chapter turns", markers: ["a scene ends when", "a chapter turns when"] },
   { row: "Starting the mapping, indexing and summarizing jobs", markers: ["mapping the prompt, with the agent `mapper`", "indexing lore, with the agent `indexer`", "summarizing a stretch of the past that has beats"] },
   { row: "Writing a turn's steps down with `todo`", markers: ["write the steps down with `todo`"] },
-  { row: "Keeping what the turn needs in its window", markers: ["you can let go of with `window`", "is yours to compose", "is better given to an agent of its own"] },
+  { row: "Keeping what the turn needs in its window", markers: ["you can let go of with `window`", "is yours to compose", "is better given away than carried in your window", "`task` starts every piece at once"] },
   { row: "Settling the turn once the reply is out", markers: ["how, is your call, turn by turn", "`window` with `handoff`, a note that says what you decided this turn", "start the `keeper` with what you decided"] },
   { row: "Before the reply, only what the reply depends on", markers: ["what the reply depends on comes before it"] },
   { row: "The Author's record of the turn", markers: ["write your record of the turn"] },
