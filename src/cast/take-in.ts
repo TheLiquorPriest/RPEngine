@@ -10,9 +10,10 @@
 //   imported[<name>]                       one carried file, whole
 //
 // A range is by ids, which do not move: a perception taken in since the plan was read is left out of its
-// range, and one written since comes after every range. Code cuts by size and lays out what the record
-// holds, as the character's other views do (`cast-perceptions.md` hides the omniscient side's account of a
-// perception); it decides nothing about what a perception is worth.
+// range, and one written since comes after every range. Each perception is handed over as its character may
+// read it and sized as that copy is (`zoom.ts`, `ownPerception`): what it missed and how reliable a telling
+// was never come along, whatever a layout says. Code cuts by size and lays out what the record holds; it
+// decides nothing about what a perception is worth.
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
 import { isRecord } from "../shared/json";
@@ -20,10 +21,10 @@ import { type CastSettings, CAST_DEFAULTS, castClock, datedAt } from "./kit";
 import { fileName, fileNamed, importedFiles, importedText, isFiled } from "./imported";
 import { untakenPerceptions } from "./memory";
 import { castAt } from "./path";
-import { perceptionView } from "./perceive";
 import { type CastItem, castingInForce, CastRecord, chatLine, findCharacter } from "./record";
 import { worldAt } from "./secrets";
 import { type CastViewInput, type Layout, mindsShown } from "./views";
+import { type OwnReading, ownPerception, type Tokens, untakenSized } from "./zoom";
 
 /** The view that lists what waits to be taken in, as work. */
 export const TAKE_IN_VIEW = "take-in";
@@ -79,11 +80,15 @@ export function viewNames(list: string): string[] {
   return out.map((name) => name.trim()).filter((name) => name !== "");
 }
 
-/** A perception's words as they reach its character: what its view lays out of it, for its size. */
-export function perceptionWords(item: CastItem): string {
-  const { moment, content, knows, told_by: toldBy, reach } = item.fields;
-  const known = Array.isArray(knows) ? knows.filter((k): k is string => typeof k === "string").join("\n") : knows;
-  return [moment, reach, content, known, toldBy].filter((part): part is string => typeof part === "string" && part !== "").join("\n");
+/** A perception's size as its character's own agent is handed it (`ownPerception`), in tokens as the chat counts them: what a backlog is measured by wherever it is said. */
+export function perceptionTokens(reading: Pick<OwnReading, "record" | "clock">, item: CastItem, tokens: Tokens): number {
+  return tokens(JSON.stringify(ownPerception(reading, item)));
+}
+
+/** A perception that waits, with its size. */
+export interface Sized {
+  item: CastItem;
+  tokens: number;
 }
 
 /** A batch of what waits: perceptions from one id to another, oldest first, and their size. */
@@ -96,10 +101,10 @@ export interface TakeInBatch {
 }
 
 /**
- * `untaken`, oldest first as given, cut into batches of at most `most` tokens each, counted by `tokens`: a batch holds one perception at
- * least, however large, and no perception is cut. The ranges do not overlap and leave none out.
+ * `untaken`, oldest first as given, each with its size, cut into batches of at most `most` tokens each: a batch holds one perception
+ * at least, however large, and no perception is cut. The ranges do not overlap and leave none out.
  */
-export function takeInBatches(untaken: readonly CastItem[], most: number, tokens: (text: string) => number): TakeInBatch[] {
+export function takeInBatches(untaken: readonly Sized[], most: number): TakeInBatch[] {
   const out: TakeInBatch[] = [];
   let items: CastItem[] = [];
   let size = 0;
@@ -110,11 +115,10 @@ export function takeInBatches(untaken: readonly CastItem[], most: number, tokens
     items = [];
     size = 0;
   };
-  for (const item of untaken) {
-    const mine = tokens(perceptionWords(item));
-    if (items.length > 0 && size + mine > most) close();
-    items.push(item);
-    size += mine;
+  for (const one of untaken) {
+    if (items.length > 0 && size + one.tokens > most) close();
+    items.push(one.item);
+    size += one.tokens;
   }
   close();
   return out;
@@ -132,12 +136,12 @@ export interface TakeInPlan {
   files: WaitingFile[];
 }
 
-/** What waits for `character` at the record's reading, cut by the chat's setting. The older minds pack's notes count as one file, under their own name. */
-export function takeInPlan(record: CastRecord, character: string, most: number, tokens: (text: string) => number, text: (file: CastItem) => string | null): TakeInPlan {
-  const files = importedFiles(record, character)
+/** What waits for `character` at the reading, cut by the chat's setting. The older minds pack's notes count as one file, under their own name. */
+export function takeInPlan(reading: Pick<OwnReading, "record" | "clock">, character: string, most: number, tokens: Tokens, text: (file: CastItem) => string | null): TakeInPlan {
+  const files = importedFiles(reading.record, character)
     .filter((f) => !isFiled(f))
     .map((f): WaitingFile => ({ file: fileName(f), tokens: tokens(isRecord(f.fields.minds) ? JSON.stringify(f.fields.minds) : (text(f) ?? "")) }));
-  return { batches: takeInBatches(untakenPerceptions(record, character), most, tokens), files };
+  return { batches: takeInBatches(untakenSized(reading, character, tokens), most), files };
 }
 
 /** A view this module gives, as laid out. */
@@ -159,7 +163,7 @@ type Fields = Record<string, JsonValue | undefined>;
  * The views among `names` that this module gives, in the order named, of the character `input` names; none for a name of another
  * kind. A character the cast does not hold is given no text.
  */
-export function takeInViews(names: readonly string[], input: Omit<CastViewInput, "layouts" | "present" | "sources">, layouts: TakeInLayouts): TakeInView[] {
+export function takeInViews(names: readonly string[], input: Pick<CastViewInput, "store" | "user" | "chat" | "turn" | "job" | "character" | "tokens" | "settings">, layouts: TakeInLayouts): TakeInView[] {
   const asked = names.filter(isTakeInView);
   if (asked.length === 0) return [];
   const { db } = input.store;
@@ -168,10 +172,12 @@ export function takeInViews(names: readonly string[], input: Omit<CastViewInput,
   if (character === null) return asked.map((name) => ({ name, text: "" }));
   const record = CastRecord.read(input.store, input.user, castAt(user, input.chat, input.turn), input.job ?? null);
   const clock = castClock(input.store, input.user, input.chat, input.turn);
+  const reading = { record, clock };
   const settings: CastSettings = { ...CAST_DEFAULTS, ...(input.settings ?? {}) };
   const casting = castingInForce(record, character);
   const head: Fields = { name: character.name, ...(casting !== null ? { casting: casting.as } : {}), ...(casting?.line != null ? { line: casting.line } : {}) };
-  const shown = (items: readonly CastItem[]): JsonObject[] => items.map((p) => ({ ...perceptionView({ record }, p), ...datedAt(clock, p.at) }));
+  // Each perception as its character may read it, and nothing else of its row.
+  const shown = (items: readonly CastItem[]): JsonObject[] => items.map((p) => ownPerception(reading, p));
   const listed = (items: JsonObject[]): { items: JsonObject[] } => ({ items: items.map((item) => Object.fromEntries(Object.entries(item).map(([key, value]) => [key, Array.isArray(value) ? { ".": value } : value]))) });
   const laid = (layout: Layout | undefined, fields: Fields): string => (layout === undefined ? "" : layout.render(fields).text.trimEnd());
   const waiting = importedFiles(record, character.id).filter((f) => !isFiled(f));
@@ -195,7 +201,7 @@ export function takeInViews(names: readonly string[], input: Omit<CastViewInput,
       const file = fileNamed(waiting, argued.file);
       return { name, text: laid(layouts.imported, file === undefined ? { ...head, none: true } : fileFields(file)) };
     }
-    const plan = takeInPlan(record, character.id, settings.takeInTokens, input.tokens, (f) => importedText(db, input.user, f));
+    const plan = takeInPlan(reading, character.id, settings.takeInTokens, input.tokens, (f) => importedText(db, input.user, f));
     const perceptions = plan.batches.reduce((n, batch) => n + batch.items.length, 0);
     const dated = (item: CastItem | undefined): string | undefined => {
       const at = item === undefined ? {} : datedAt(clock, item.at);

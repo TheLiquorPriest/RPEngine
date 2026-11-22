@@ -1822,8 +1822,8 @@ export class TurnLane implements TurnPlayer, ChatChanges {
   async #castFolder(scope: Scope & { turn: string }, guidance: Guidance, settings: TurnSettings): Promise<CastFolder[]> {
     const stage = stageAt(this.#d.store, scope.user, scope.chat, scope.turn);
     if (stage === null || stage.who.length === 0) return [];
-    // Every view but the two outlines the briefing lists: the folder holds the whole forms they point to.
-    const all = (Object.keys(CAST_VIEWS) as CastViewName[]).filter((v) => !v.endsWith("-outline"));
+    // Every view but the outlines: the two the briefing lists, whose whole forms the folder holds, and the character's own, whose lines name calls only its own agent makes.
+    const all = (Object.keys(CAST_VIEWS) as CastViewName[]).filter((v) => v !== "outline" && !v.endsWith("-outline"));
     const input = { store: this.#d.store, user: scope.user, chat: scope.chat, turn: scope.turn, present: stage.who, sources: this.#d.sources, ...(this.#d.search !== undefined ? { search: this.#d.search } : {}), layouts: await castLayouts(guidance, all), tokens: tokenCount(settings.charsPerToken), settings: settings.cast, cues: stageCues(stage) };
     const out: CastFolder[] = [];
     for (const name of new Set(stage.who)) {

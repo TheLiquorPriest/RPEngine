@@ -1,9 +1,9 @@
 // The cast's tools as the host hands them to RPH (plan §6.8, Appendix A `ToolsPort`): `cast_query`
 // and `cast_update` for the omniscient side, `perceive`, and the character's own: its memory actions,
-// what is on its mind, and how it feels about people; each with its words from its file. Which agent
-// holds which is its definition's tool list. The list depends on no turn, so it holds for a session;
-// each call reads its user, chat and turn from its scope, and a character's own tool its character
-// from the agent that calls it.
+// what is on its mind, how it feels about people, and the reading of its own record (`self_read`);
+// each with its words from its file. Which agent holds which is its definition's tool list. The list
+// depends on no turn, so it holds for a session; each call reads its user, chat and turn from its
+// scope, and a character's own tool its character from the agent that calls it.
 
 import type { HostTool } from "rp-harness/contract";
 import { areaTools } from "../iface/kit";
@@ -12,9 +12,10 @@ import { DREAM, RECALL, REFLECT, REMEMBER } from "./memories";
 import { MIND_SET, RELATE } from "./own";
 import { PERCEIVE } from "./perceive";
 import { CAST_QUERY } from "./query";
+import { SELF_READ } from "./self-read";
 import { CAST_UPDATE } from "./update";
 
-export const CAST_TOOLS: readonly CastToolSpec[] = [CAST_QUERY, CAST_UPDATE, PERCEIVE, RECALL, REMEMBER, REFLECT, DREAM, MIND_SET, RELATE];
+export const CAST_TOOLS: readonly CastToolSpec[] = [CAST_QUERY, CAST_UPDATE, PERCEIVE, RECALL, REMEMBER, REFLECT, DREAM, MIND_SET, RELATE, SELF_READ];
 
 /**
  * The cast's tools for a chat, as RPH holds them: each with its description and arguments' texts

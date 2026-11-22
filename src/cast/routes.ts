@@ -106,7 +106,7 @@ import {
   type StageTurnShown,
 } from "./shapes";
 import { freshnessOf, type SourceNow, type SourceReader, sourcesNow } from "./sources";
-import { takeInBatches } from "./take-in";
+import { perceptionTokens, takeInBatches } from "./take-in";
 import { CAST_LANE, type Unread } from "./update";
 import { turnsSince, waitingOf } from "./waiting";
 
@@ -380,7 +380,7 @@ function membersOf(r: Reading, characters: readonly Character[], size: Sized): C
     const w = waiting.get(c.id);
     const oldest = w?.untaken[0];
     const dreamt = w?.dreamt ?? null;
-    const batches = size === null || w === undefined ? null : takeInBatches(w.untaken.map((u) => u.item), size.most, size.tokens);
+    const batches = size === null || w === undefined ? null : takeInBatches(w.untaken.map((u) => ({ item: u.item, tokens: perceptionTokens(r, u.item, size.tokens) })), size.most);
     return {
       id: c.id,
       name: c.name,

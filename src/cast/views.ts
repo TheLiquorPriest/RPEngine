@@ -7,23 +7,29 @@
 // on stage are what the Author is given of them (`castPresentViews`). Each is the record's own words,
 // laid out by its prompt part in `.prompts/`; what goes in is decided by the record's marks and by who
 // is on stage, which the caller says. Code ranks nothing and writes no word around the record's.
+//
+// Given to the agent that plays the character, the views are its own start (plan 3.2 §6.4): the newest of what it perceived whole
+// within its size and a line for what waits, its old mind files whole within theirs and the rest listed, its game side with what is
+// large closed, each laid out from what the character may know (`zoom.ts`), and an outline of the rest of its record. For anyone
+// else, and in the turn's folder, every view is whole.
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
 import type { ReadContext } from "../engine/registry";
 import { isRecord } from "../shared/json";
 import type { Store } from "../store";
 import { beatsAt } from "./beats";
-import { CAST_DEFAULTS, type CastClock, castClock, type CastSettings, datedAt } from "./kit";
+import type { SceneNamed } from "./facts";
+import { CAST_DEFAULTS, type CastClock, castClock, type CastSettings, type CastStart, datedAt } from "./kit";
+import { memoryView } from "./memories";
 import { castAt } from "./path";
-import { awayItemId, baseHistory, baseOf, bindingsOf, type Casting, CASTINGS, type Character, castingInForce, CastRecord, chatLine, findCharacter, MIND_KINDS, nameKey, RELATIONSHIP_DIMENSIONS } from "./record";
-import { gameSide } from "./game";
+import { baseHistory, baseOf, bindingsOf, type Casting, CASTINGS, type Character, castingInForce, CastRecord, chatLine, findCharacter, MIND_KINDS, nameKey, RELATIONSHIP_DIMENSIONS } from "./record";
 import { towardName } from "./refs";
 import { worldAt } from "./secrets";
-import { fileName, importedFiles, importedText, isFiled } from "./imported";
 import { memoriesNow, type MemoryNow, strongestFirst, type Tier, touches, untakenPerceptions } from "./memory";
-import { perceptionView } from "./perceive";
+import { perceivedTurn, perceptionView } from "./perceive";
 import type { MemorySearch } from "./search";
 import { type SourceReader, sourcesNow } from "./sources";
+import { filesListed, filesWaiting, foldedSide, newestWithin, outlineFields, type OwnFile, type OwnPerception, ownHistory, ownKnowledge, type OwnReading, ownRelationship, shows, sideFields, untakenSized } from "./zoom";
 
 /** What a view's layout is asked: to lay its fields out as text. The guidance's template part is one. */
 export interface Layout {
@@ -44,6 +50,8 @@ export const CAST_VIEWS = {
   // The two the briefing lists for those on stage (plan 3.2 §6.7): the whole views stay for whoever asks for them by name.
   "history-outline": "cast-history-outline",
   "imported-outline": "cast-imported-outline",
+  // The rest of a character's record, for its own agent (plan 3.2 §6.4): what its start does not hold whole, each line with its size and the call that opens it.
+  outline: "cast-outline",
 } as const;
 export type CastViewName = keyof typeof CAST_VIEWS;
 
@@ -67,10 +75,18 @@ export interface CastViewInput {
   search?: MemorySearch;
   /** The prompt parts in force that lay the views out, by view. A view whose part is not given (switched off) is given no text. */
   layouts: Partial<Record<CastViewName, Layout>>;
-  /** Settings over `CAST_DEFAULTS`: memory's, and what comes to mind's budget. */
+  /** Settings over `CAST_DEFAULTS`: memory's, what comes to mind's budget, and an outline's size. */
   settings?: Partial<CastSettings>;
-  /** A text's tokens, by the harness's own count (the turn's), for what comes to mind's budget. */
+  /** A text's tokens, by the harness's own count (the turn's): what every budget here is counted by, and every size a line says. */
   tokens: (text: string) => number;
+  /**
+   * Whom the agent given the views plays, with the sizes of its start (`CastStart`, and `foldTokens`, the world state's size for what
+   * one thing holds). Where that is the character the views are of, they are its own start: sized, and laid out from what the character
+   * may know. Absent, or for any other character: every view whole, as the turn's folder, the briefing and the omniscient side read them.
+   */
+  own?: CastStart & { plays: string; foldTokens: number };
+  /** The scene each of these turns lies in (null: none), as the host reads it from the story record, which the cast may not read: what the outline lays perceptions out by under their day. Absent: by day alone. */
+  scenes?: (turns: readonly string[]) => ReadonlyMap<string, SceneNamed | null>;
 }
 
 export interface CastView {
@@ -102,6 +118,10 @@ function listed(items: JsonObject[]): Listed | undefined {
   if (items.length === 0) return undefined;
   return { items: items.map((item) => Object.fromEntries(Object.entries(item).map(([key, value]) => [key, Array.isArray(value) ? { ".": value } : value]))) };
 }
+
+/** A sample of the line for the perceptions that wait, and of the list of the old mind files not shown: what a layout is asked whether it shows (`shows`), since one that does not is given the view whole. */
+const WAITING_SAMPLE: JsonObject = { count: 1, one: true, tokens: 1, from: "a", to: "b" };
+const LISTED_SAMPLE: JsonObject = { count: 1, one: true, tokens: 1, files: { items: [{ file: "a", tokens: 1 }] }, minds: { tokens: 1 } };
 
 /**
  * The older minds pack's notes of a character (`carried.ts`) as the layout shows them: each note, commitment, witnessed thing and
@@ -176,7 +196,8 @@ export async function castViews(names: readonly string[], input: CastViewInput):
   if (asked.length === 0) return [];
   const { db } = input.store;
   const user = input.store.user(input.user);
-  const character = findCharacter(db, input.user, chatLine(user, input.chat), input.character);
+  const chats = chatLine(user, input.chat);
+  const character = findCharacter(db, input.user, chats, input.character);
   if (character === null) return asked.map((name) => ({ name, text: "" }));
   const record = CastRecord.read(input.store, input.user, castAt(user, input.chat, input.turn), input.job ?? null);
   const clock = castClock(input.store, input.user, input.chat, input.turn);
@@ -190,6 +211,31 @@ export async function castViews(names: readonly string[], input: CastViewInput):
       .filter((g) => g.fields.proposed !== true)
       .map((g) => ({ ...g.fields, ...datedAt(clock, g.at) })),
   );
+  // The agent given the views plays this character: they are its own start (plan 3.2 §6.4).
+  const own = input.own !== undefined && findCharacter(db, input.user, chats, input.own.plays)?.id === character.id ? input.own : null;
+  const reading: OwnReading = { store: input.store, user: input.user, chat: input.chat, chats, turn: input.turn, job: input.job ?? null, record, clock };
+  /** What the character perceived and has not taken in, as its layout takes it: those held whole, oldest first, and a line for those that wait. */
+  const perceivedFields = (whole: readonly OwnPerception[], waiting: readonly OwnPerception[]): ViewFields => ({
+    ...head,
+    ...(whole.length > 0 ? { perceptions: listed(whole.map((p) => p.view)) } : {}),
+    // `earlier` where newer ones are held whole beside them: with none held, those that wait are all there is.
+    ...(waiting.length > 0 ? { waiting: { count: waiting.length, one: waiting.length === 1, tokens: waiting.reduce((sum, p) => sum + p.tokens, 0), from: waiting[0]?.item.id ?? "", to: waiting.at(-1)?.item.id ?? "", ...(whole.length > 0 ? { earlier: true } : {}) } } : {}),
+  });
+  /**
+   * What this reading holds whole of what the character perceived and has not taken in, and what waits. Its own agent's start holds
+   * the newest within its size; anyone else's reading, a start with no size set, or a layout with no line for what waits, all of it.
+   * Where the view is not asked for here, or no part lays it out, nothing is held whole and all of it waits: the outline's to list.
+   */
+  let cut: { whole: OwnPerception[]; waiting: OwnPerception[] } | undefined;
+  const perceived = (): { whole: OwnPerception[]; waiting: OwnPerception[] } => {
+    if (cut !== undefined) return cut;
+    const all = untakenSized(reading, character.id, input.tokens);
+    const layout = asked.includes("unprocessed-perceptions") ? input.layouts["unprocessed-perceptions"] : undefined;
+    if (layout === undefined) return (cut = { whole: [], waiting: all });
+    const most = own === null || !shows(layout, head, "waiting", WAITING_SAMPLE) ? null : own.newlyPerceivedTokens;
+    const held = newestWithin(all.length, most, (k) => input.tokens(layout.render(perceivedFields(all.slice(all.length - k), all.slice(0, all.length - k))).text.trimEnd()));
+    return (cut = { whole: all.slice(all.length - held), waiting: all.slice(0, all.length - held) });
+  };
 
   const out: CastView[] = [];
   for (const name of asked) {
@@ -231,29 +277,48 @@ export async function castViews(names: readonly string[], input: CastViewInput):
       out.push({ name, text: layout === undefined ? "" : comesToMind(record, character, clock, head, cued, found, settings, input.tokens, layout) });
       continue;
     } else if (name === "unprocessed-perceptions") {
-      // In full, oldest first, each with its date in story time where the clock shows one.
-      const perceptions = listed(untakenPerceptions(record, character.id).map((p) => ({ ...perceptionView({ record }, p), ...datedAt(clock, p.at) })));
-      if (perceptions !== undefined) fields = { ...head, perceptions };
+      if (own === null) {
+        // In full, oldest first, each with its date in story time where the clock shows one.
+        const perceptions = listed(untakenPerceptions(record, character.id).map((p) => ({ ...perceptionView({ record }, p), ...datedAt(clock, p.at) })));
+        if (perceptions !== undefined) fields = { ...head, perceptions };
+      } else {
+        // For its own agent, from what the character may know alone: the newest whole, oldest first, within its size, and a line for those that wait.
+        const { whole, waiting } = perceived();
+        if (whole.length + waiting.length > 0) fields = perceivedFields(whole, waiting);
+      }
     } else if (name === "imported") {
-      // Whole, word for word, each under its name, outside every budget, until it is marked filed. The older minds pack's notes of the
-      // character are one more such file: laid out under their own heading, with the names and dates the world gives them now.
-      const waiting = importedFiles(record, character.id).filter((f) => !isFiled(f));
-      const files = listed(waiting.flatMap((f) => (isRecord(f.fields.minds) ? [] : [{ file: fileName(f), text: importedText(db, input.user, f) ?? "" }])));
-      const minds = waiting.find((f) => isRecord(f.fields.minds));
-      const notes = minds === undefined ? undefined : mindsShown(minds.fields.minds as JsonObject, worldAt(input.store, input.user, input.turn, input.job ?? null, input.chat), clock);
-      if (files !== undefined || notes !== undefined) fields = { ...head, ...(files !== undefined ? { files } : {}), ...(notes !== undefined ? { minds: notes } : {}) };
+      // Whole, word for word, each under its name, until it is marked filed. The older minds pack's notes of the character are one
+      // more such file: laid out under their own heading, with the names and dates the world gives them now. For its own agent they
+      // are whole as far as its size holds, in the order they were carried, and the others are listed by name and size (plan 3.2
+      // §6.4); for anyone else, with no size set, or by a layout with no line for what is listed, every one is whole.
+      const waiting = filesWaiting(reading, character.id, input.tokens);
+      const layout = input.layouts[name];
+      const laid = (whole: readonly OwnFile[]): ViewFields => {
+        const files = listed(whole.flatMap((f) => (f.text === null ? [] : [{ file: f.file, text: f.text }])));
+        const notes = whole.find((f) => f.text === null);
+        const rest = waiting.filter((f) => !whole.includes(f));
+        return {
+          ...head,
+          ...(files !== undefined ? { files } : {}),
+          ...(notes !== undefined ? { minds: mindsShown(notes.item.fields.minds as JsonObject, worldAt(input.store, input.user, input.turn, input.job ?? null, input.chat), clock) } : {}),
+          ...(rest.length > 0 ? { listed: { count: rest.length, one: rest.length === 1, tokens: rest.reduce((sum, f) => sum + f.tokens, 0), ...filesListed(rest) } } : {}),
+        };
+      };
+      let whole: readonly OwnFile[] = waiting;
+      if (own !== null && own.importedTokens !== null && layout !== undefined && shows(layout, head, "listed", LISTED_SAMPLE)) {
+        const most = own.importedTokens;
+        whole = waiting.reduce<OwnFile[]>((held, file) => (input.tokens(layout.render(laid([...held, file])).text.trimEnd()) <= most ? [...held, file] : held), []);
+      }
+      if (waiting.length > 0) fields = laid(whole);
     } else if (name === "imported-outline") {
       // The same files, listed: each by its name and its size, and the older minds pack's notes as one more. Their text is the `imported` view's.
-      const waiting = importedFiles(record, character.id).filter((f) => !isFiled(f));
-      const files = listed(waiting.flatMap((f) => (isRecord(f.fields.minds) ? [] : [{ file: fileName(f), tokens: input.tokens(importedText(db, input.user, f) ?? "") }])));
-      const minds = waiting.find((f) => isRecord(f.fields.minds));
-      if (files !== undefined || minds !== undefined) fields = { ...head, ...(files !== undefined ? { files } : {}), ...(minds !== undefined ? { minds: { tokens: input.tokens(JSON.stringify(minds.fields.minds)) } } : {}) };
+      const waiting = filesWaiting(reading, character.id, input.tokens);
+      if (waiting.length > 0) fields = { ...head, ...filesListed(waiting) };
     } else if (name === "relationships:present") {
       const here = new Set(input.present.map(nameKey));
       here.delete(nameKey(character.name));
       // Toward a person by reference: called by the name they have now, whatever the relationship was first written under.
       const ctx = worldAt(input.store, input.user, input.turn, input.job ?? null, input.chat);
-      const chats = chatLine(user, input.chat);
       // A dimension is given as words, so that a 0 shows as one.
       const shown = record
         .of(character.id, "relationship")
@@ -301,11 +366,42 @@ export async function castViews(names: readonly string[], input: CastViewInput):
         }
       }
     } else if (name === "game-side") {
-      const side = gameSide(input.store, input.user, input.chat, input.turn, character);
-      // A principal out of view: where it is and what it means to do, as the Author recorded them, shown beside where the state places it.
-      const gone = record.items.get(awayItemId(character.id));
-      const away = gone === undefined || gone.dropped ? undefined : Object.fromEntries(["whereabouts", "intention", "until"].flatMap((k) => (typeof gone.fields[k] === "string" ? [[k, gone.fields[k]]] : [])));
-      if (side !== null || (away !== undefined && Object.keys(away).length > 0)) fields = { ...head, ...(side ?? {}), ...(away !== undefined && Object.keys(away).length > 0 ? { away } : {}) };
+      // The world's person they are, as the world state holds them, and, for a principal out of view, where it is and what it means
+      // to do, as the Author recorded them. For its own agent, what is large of it is closed (plan 3.2 §6.4).
+      const side = sideFields(reading, character);
+      const layout = input.layouts[name];
+      if (side !== null) fields = { ...head, ...(own !== null && layout !== undefined ? foldedSide(side, layout, own.foldTokens, input.tokens) : side) };
+    } else if (name === "outline") {
+      // The rest of the record (plan 3.2 §6.4): what this reading does not hold whole, each part counted and sized, the perceptions that wait by day and scene.
+      const layout = input.layouts[name];
+      if (layout !== undefined) {
+        const here = new Set(input.present.map(nameKey));
+        here.delete(nameKey(character.name));
+        const ctx = worldAt(input.store, input.user, input.turn, input.job ?? null, input.chat);
+        const size = (value: JsonValue): number => input.tokens(JSON.stringify(value));
+        const absent = record.of(character.id, "relationship").flatMap((r) => {
+          const held = ownRelationship(reading, ctx, r);
+          const who = String(held.with);
+          return who === "" || here.has(nameKey(who)) ? [] : [{ who, tokens: size(held) }];
+        });
+        const { whole, waiting } = perceived();
+        fields = outlineFields({
+          head,
+          earlier: waiting,
+          held: whole,
+          clock,
+          sceneOf: input.scenes?.([...new Set(waiting.map((p) => perceivedTurn(p.item)))]) ?? new Map(),
+          memories: memoriesNow(record, character.id, clock?.now ?? null, settings).map((m) => ({ tier: m.tier, tokens: size(memoryView(m, clock)) })),
+          absent,
+          knowledge: ownKnowledge(reading, character.id).map(size),
+          history: ownHistory(reading, character.id).map(size),
+          // Its old mind files are the `imported` view's to show or list, where that is given beside the outline.
+          files: asked.includes("imported") && input.layouts.imported !== undefined ? [] : filesWaiting(reading, character.id, input.tokens),
+          layout,
+          most: settings.outlineTokens,
+          tokens: input.tokens,
+        });
+      }
     }
     const layout = input.layouts[name];
     out.push({ name, text: fields === null || layout === undefined ? "" : layout.render(fields).text.trimEnd(), ...(version !== undefined ? { version } : {}) });

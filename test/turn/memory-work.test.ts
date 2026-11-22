@@ -1,9 +1,10 @@
 // A principal's own memory work when the Author voiced it (plan §7.2, §7.3, §7.4, §10.9): the Author has the principal's own agent
 // take in what it perceived, right after the reply with `delegate`, or as a job with `job_start`, naming the character definition
 // and whom it plays; the agent is given what it has not taken in by its definition, writes its memories, a belief and how it feels
-// about someone, and what it named is taken in. The shipped reminders that read what waits (`memory-owed`, `memory-late`,
-// `memory-scene-end`, `dream-due`) fire when it waits, and not otherwise; following one clears it, and none fires twice in a turn.
-// Played through the stand-in Lumiverse on the scripted model. Every name is invented.
+// about someone, and what it named is taken in. Where more waits than its start holds whole (plan 3.2 §6.4), it is given the newest,
+// a line and an outline for the rest, and opens the rest with `self_read`. The shipped reminders that read what waits (`memory-owed`,
+// `memory-late`, `memory-scene-end`, `dream-due`) fire when it waits, and not otherwise; following one clears it, and none fires
+// twice in a turn. Played through the stand-in Lumiverse on the scripted model. Every name is invented.
 
 import { afterEach, expect, test } from "bun:test";
 import type { JsonObject } from "rp-harness/contract";
@@ -120,6 +121,65 @@ test("right after the reply, the Author delegates to the character definition fo
   });
   // Nothing waited when the run ended: no reminder fired.
   expect(fired(b, turn)).toEqual([]);
+});
+
+/** What the Author alone knows of each perception: words her own agent is never handed. */
+const MISSED = "MISSED-SENTINEL the boat went down off the point an hour ago";
+const WIND = "The wind came through the lamp room in long cold breaths and set the glass ringing in its frame. ".repeat(3).trim();
+
+/** The same turn with three moments perceived for Wren, each with what she missed of it. */
+const VOICED_THRICE: Answer[] = [
+  ...VOICED.slice(0, 2),
+  {
+    pieces: [
+      { text: '<reply>Wren looks past you at the sea. "The boat is late."</reply>' },
+      { call: "perceive", args: { perceptions: ["the stairs", "the lamp", "the door"].map((where, n) => ({ who: WREN, moment: `At ${where}`, reach: "part", content: `PERCEIVED-${n} ${WIND}`, missed: `${MISSED} (${n})`, knows: [`KNOWN-${n} someone has been at ${where}.`] })) } },
+    ],
+  },
+];
+
+test("a backlog: her agent is given the newest of what she perceived whole within the chat's size, a line for what waits and her outline of it by scene; it opens the rest with self_read, and nothing the Author alone knows of a perception reaches it", async () => {
+  // Her agent reads the call for what waits from the line it was given, opens those whole, then takes in all it has read.
+  const opening: Answer = (request) => {
+    const [, from, to] = /part perceptions, id (p-\d+), to (p-\d+)\./.exec(JSON.stringify(request.messages)) ?? [];
+    return { pieces: [{ call: "self_read", args: { part: "perceptions", id: from ?? "none", to: to ?? "none" } }] };
+  };
+  const takingAll: Answer = (request) => {
+    const ids = [...new Set([...JSON.stringify(request.messages).matchAll(/\[(p-\d+)\] At |\\"id\\":\\"(p-\d+)\\"/g)].map((m) => m[1] ?? m[2] ?? ""))];
+    return { pieces: [{ call: "remember", args: { memories: [{ text: "The wind had the glass ringing, and someone had been at the stairs, the lamp and the door.", gist: "Someone went through the light.", from: ids, source: "character" }] } }] };
+  };
+  const b = await openTurnBed({
+    off: ["rules/unsourced"],
+    // A size that holds one of her three perceptions whole beside the line for the others, and not two.
+    global: "cast:\n  newlyPerceivedTokens: 250\n",
+    answers: [...VOICED_THRICE, calling("delegate", { agent: "character", plays: WREN, brief: BRIEF }), opening, takingAll, { pieces: [{ text: "Taken in." }] }, { pieces: [{ text: "Done." }] }],
+  });
+  beds.push(b);
+  const turn = await play(b, "I ask whether the boat came.");
+  const wren = wrenAt(b, turn);
+  expect(wren.given).toHaveLength(3);
+  const [first, second, third] = wren.given;
+
+  const hers = b.model.requests.filter((r) => r.tools.some((t) => t.name === "remember"));
+  expect(hers.every((r) => r.tools.some((t) => t.name === "self_read"))).toBe(true);
+  const sent = hers.map((r) => JSON.stringify(r.messages));
+  // What she starts with: the newest whole, the two before it counted with the call that reads them, and her outline of them under their scene.
+  expect(sent[0]).toContain(`[${third}] At the door`);
+  expect(sent[0]).toContain(`PERCEIVED-2 ${WIND}`);
+  expect(sent[0]).not.toContain("PERCEIVED-0");
+  expect(sent[0]).not.toContain("PERCEIVED-1");
+  expect(sent[0]).toMatch(new RegExp(`Not shown here: 2 earlier perceptions, \\d+ tokens, still to be taken in\\. self_read reads them whole: part perceptions, id ${first}, to ${second}\\.`));
+  expect(sent[0]).toContain("### The rest of Wren Hale's record, in outline");
+  expect(sent[0]).toMatch(new RegExp(`Night watch \\[sc-\\d+\\]: 2 perceptions, \\d+ tokens\\. self_read reads them: part perceptions, (day [^,]+, )?scene sc-\\d+, to ${second}\\.`));
+  expect(sent[0]).toMatch(new RegExp(`- \\[${first}\\] \\d+ tokens, At the stairs: KNOWN-0 someone has been at the stairs\\.`));
+  // What self_read answered: the two that waited, whole, as they reached her.
+  expect(sent[1]).toContain(`PERCEIVED-0 ${WIND}`);
+  expect(sent[1]).toContain(`PERCEIVED-1 ${WIND}`);
+  // Nothing of what she missed is in anything her agent was sent; the Author's side holds it.
+  for (const one of sent) expect(one).not.toContain("MISSED-SENTINEL");
+  expect(b.model.requests.some((r) => JSON.stringify(r.messages).includes("MISSED-SENTINEL"))).toBe(true);
+  // All three are taken in.
+  expect(wren).toMatchObject({ memories: ["Someone went through the light."], untaken: [] });
 });
 
 test("as a job, the Author starts the character definition for the principal it voiced: what its agent writes is taken in from the first turn that begins after the job ended", async () => {

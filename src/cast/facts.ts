@@ -18,7 +18,7 @@ import type { JsonObject } from "../shared/json";
 import { baseOf, bindingsOf, type Character, castingInForce, CASTINGS, CastRecord, charactersOf, chatLine, findCharacter, nameKey } from "./record";
 import { personOfCharacter, worldAt } from "./secrets";
 import { type SourceReader, sourcesNow } from "./sources";
-import { perceptionWords } from "./take-in";
+import { perceptionTokens } from "./take-in";
 import { type InHand, turnsSince, type Untaken, type Waiting, waitingOf } from "./waiting";
 
 /** The groups a count breaks down into: each casting, and those on stage the cast has not cast on this path (or does not hold). */
@@ -211,13 +211,13 @@ function readsOf(hows: readonly StageHow[]): Record<StageHow, number> {
 }
 
 /**
- * One character's perceptions a count holds, as its `held` field says them: its casting, how many, how large they are by `tokens` (the
- * words its own agent is handed of them; left out where no count is given), the reply of the oldest's turn, and the turns RPE played since it.
+ * One character's perceptions a count holds, as its `held` field says them: its casting, how many, how large they are by `size` (each
+ * as its own agent is handed it; left out where no count is given), the reply of the oldest's turn, and the turns RPE played since it.
  */
-function heldOf(at: CastAt, played: ReadonlySet<string>, name: string, group: Group, untaken: readonly Untaken[], tokens: ((text: string) => number) | null): JsonObject {
+function heldOf(at: CastAt, played: ReadonlySet<string>, name: string, group: Group, untaken: readonly Untaken[], size: ((item: Untaken["item"]) => number) | null): JsonObject {
   const oldest = untaken[0] as Untaken;
-  const size: JsonObject = tokens === null ? {} : { tokens: untaken.reduce((n, u) => n + tokens(perceptionWords(u.item)), 0) };
-  return { name, casting: group, perceptions: untaken.length, ...size, since: at.order.has(oldest.turn) ? at.replyOf(oldest.turn) : null, turns: turnsSince(at, played, oldest.index) };
+  const sized: JsonObject = size === null ? {} : { tokens: untaken.reduce((n, u) => n + size(u.item), 0) };
+  return { name, casting: group, perceptions: untaken.length, ...sized, since: at.order.has(oldest.turn) ? at.replyOf(oldest.turn) : null, turns: turnsSince(at, played, oldest.index) };
 }
 
 /** A count of characters who hold what it counts: each with its group and what its field says of it. */
@@ -376,8 +376,11 @@ interface WaitingInput {
 async function waitingValues(input: WaitingInput): Promise<Record<string, FactValue>> {
   const { at, played, waiting, groupOf, waits, scope } = input;
   const out: Record<string, FactValue> = {};
-  const tokens = (await input.deps.tokens?.(scope)) ?? null;
-  const rowOf = (w: Waiting, untaken: readonly Untaken[], more: JsonObject = {}) => ({ name: w.character.name, group: groupOf(w.character), held: { ...heldOf(at, played, w.character.name, groupOf(w.character), untaken, tokens), ...more } });
+  // A perception's size as its character's own agent is handed it, which a take-in's batches are cut by: the same measure wherever a backlog is said.
+  const count = (await input.deps.tokens?.(scope)) ?? null;
+  const reading = { record: input.record, clock: castClock(input.deps.store, scope.user, scope.chat, scope.turn ?? null) };
+  const size = count === null ? null : (item: Untaken["item"]): number => perceptionTokens(reading, item, count);
+  const rowOf = (w: Waiting, untaken: readonly Untaken[], more: JsonObject = {}) => ({ name: w.character.name, group: groupOf(w.character), held: { ...heldOf(at, played, w.character.name, groupOf(w.character), untaken, size), ...more } });
 
   if (waits.has("stage.untaken")) {
     const here = new Set(input.onStage.map((c) => c.id));

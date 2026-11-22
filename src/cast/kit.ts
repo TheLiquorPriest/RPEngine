@@ -8,7 +8,7 @@ import type { JsonObject } from "rp-harness/contract";
 import type { ApprovalsPort } from "rp-harness/contract";
 import type { ConfigRead } from "../app/config-read";
 import type { NumberSettings, Setting } from "../app/setting-list";
-import { calendarOf, formatClock, placeOffset } from "../engine/calendar";
+import { calendarOf, formatClock, formatDay, placeOffset } from "../engine/calendar";
 import { placeOfEntity } from "../engine/scope";
 import { type AreaCall, type AreaSpec, type AreaWords, IFACE_DEFAULTS, type LastUseKeeper, type Reply, type Writes } from "../iface/kit";
 import type { ReceiptKeeper } from "../iface/receipt";
@@ -18,6 +18,7 @@ import { clockRecorded, JoinedTurnError, type Store, StoreInputError, type UserS
 import { castAt } from "./path";
 import { IMPORTED_KIND } from "./carried";
 import { importedText } from "./imported";
+import type { SceneNamed } from "./facts";
 import { type BaseVersion, type CastItem, CastRecord, type Character, chatLine } from "./record";
 import type { MemorySearch } from "./search";
 import type { BookReader, SecretFactOf } from "./secrets";
@@ -86,7 +87,7 @@ export const CAST_SETTING_DEFS = {
   weightMax: { key: "cast.maxMemoryWeight", default: CAST_DEFAULTS.weightMax, takes: { type: "whole", least: 1 }, perConnection: false, name: "Highest weight of a memory", about: "The highest weight a memory can have; weights run from 1.", effect: "turn" },
   takeInTokens: { key: "cast.takeInTokens", default: CAST_DEFAULTS.takeInTokens, takes: { type: "whole", least: 1 }, perConnection: false, name: "A batch of what a character takes in", about: "Tokens of perceptions in one batch, where a character's agent takes in what it perceived and has not yet made memories of: what waits is cut into batches of at most this, oldest first, and its agent hands each to an instance of itself. A perception larger than this is a batch alone.", effect: "turn" },
   comesToMindTokens: { key: "cast.comesToMindTokens", default: CAST_DEFAULTS.comesToMindTokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "What comes to mind", about: "Tokens of a character's memories that come to mind for a scene.", effect: "turn", row: "What comes to mind" },
-  outlineTokens: { key: "cast.outlineTokens", default: CAST_DEFAULTS.outlineTokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "An outline of a character's record", about: "Tokens an outline of a character's record may fill: in the briefing, a principal's history is given newest first up to it, and the earlier entries are counted with their size and the call that reads them.", effect: "turn" },
+  outlineTokens: { key: "cast.outlineTokens", default: CAST_DEFAULTS.outlineTokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "An outline of a character's record", about: "Tokens an outline of a character's record may fill. A character's own agent starts with an outline of the rest of its record: what it perceived earlier and has not taken in is listed by day and scene, the newest first, as far as this holds, and what is not listed is counted in the line above it. The one line for each part of the record, with its count, its size and the call that reads it, is given whatever this is. In the briefing, a principal's history is given newest first up to it, and the earlier entries are counted with their size and the call that reads them.", effect: "turn" },
   recallItems: { key: "cast.recallItems", default: CAST_DEFAULTS.recallItems, takes: { type: "whole", least: 1 }, perConnection: false, name: "Memories one recall brings back", about: "The most memories one recall brings back; the answer says how many more touch the cue.", effect: "turn" },
   dimensionScale: { key: "cast.dimensionScale", default: CAST_DEFAULTS.dimensionScale, takes: { type: "number", least: 1 }, perConnection: false, name: "Scale of a relationship's dimensions", about: "The scale a relationship's trust, warmth, respect and fear are read and reported against: from minus this to this. A value past it is kept as sent, and said to be past.", effect: "turn" },
   dreamAfterHours: { key: "cast.dreamAfterHours", default: CAST_DEFAULTS.dreamAfterHours, takes: { type: "number", least: 1 }, perConnection: false, name: "Story hours before a dream is due", about: "Story hours after a character last dreamt (or first perceived something, if it never has) from which the fact dream.due counts it, whether or not it slept; a sleep begun since its last dream counts it sooner. Only a rule that names the fact reads it.", effect: "turn" },
@@ -112,8 +113,54 @@ export function playerMindOf(read: Pick<ConfigRead, "value">): boolean {
   return read.value(CAST_PLAYER_MIND) === true;
 }
 
+/**
+ * What a character's own agent is handed whole of its record when it starts (plan 3.2 §6.4), each a size in tokens that takes `~`
+ * for all of it: the newest of what it has perceived and not taken in, and its old mind files. Nothing is cut to fit: what passes
+ * a size waits whole, counted in a line of its view and listed in the character's outline, one `self_read` call away.
+ */
+export interface CastStart {
+  /** Tokens of the newest perceptions not yet taken in that are handed over whole; null: all of them. */
+  newlyPerceivedTokens: number | null;
+  /** Tokens of the old mind files not yet filed that are handed over whole; null: every one. */
+  importedTokens: number | null;
+}
+
+/** The sizes of a character's start, as shipped: ordinary play hands every perception over whole, and a backlog waits in the outline; an old mind file is listed, never loaded. */
+export const CAST_START_DEFAULTS: Readonly<CastStart> = Object.freeze({ newlyPerceivedTokens: 6000, importedTokens: 0 });
+
+/** Each size of a character's start as a config file writes it, under `cast:`. */
+export const CAST_START_DEFS = {
+  newlyPerceivedTokens: {
+    key: "cast.newlyPerceivedTokens",
+    default: CAST_START_DEFAULTS.newlyPerceivedTokens,
+    takes: { type: "whole", least: 0 },
+    orNone: true,
+    none: "all of it, on every start",
+    perConnection: false,
+    name: "Newest perceptions a character starts with",
+    about: "Tokens of what a character has perceived and not yet taken in that its own agent is handed whole when it starts, the newest first. Nothing is cut to fit: what passes this waits whole, counted in a line with its size and listed in the character's outline, and the character opens it with self_read. None: all of it is handed over on every start, however much waits.",
+    effect: "turn",
+  },
+  importedTokens: {
+    key: "cast.importedTokens",
+    default: CAST_START_DEFAULTS.importedTokens,
+    takes: { type: "whole", least: 0 },
+    orNone: true,
+    none: "every one whole, on every start",
+    perConnection: false,
+    name: "Old mind files a character starts with",
+    about: "Tokens of a migrated character's old mind files, not yet filed, that its own agent is handed whole when it starts, in the order they were carried. As shipped none is: each is listed by its name and size, and the character opens one with self_read. None: every one is handed over whole on every start.",
+    effect: "turn",
+  },
+} as const satisfies Record<keyof CastStart, Setting>;
+
+/** The sizes of a character's start, as the levels set them. */
+export function castStartOf(read: Pick<ConfigRead, "value">): CastStart {
+  return { newlyPerceivedTokens: read.value(CAST_START_DEFS.newlyPerceivedTokens) as number | null, importedTokens: read.value(CAST_START_DEFS.importedTokens) as number | null };
+}
+
 /** Every setting the cast reads, as a config file writes it. */
-export const CAST_SETTINGS: readonly Setting[] = [...Object.values(CAST_SETTING_DEFS), CAST_PLAYER_MIND];
+export const CAST_SETTINGS: readonly Setting[] = [...Object.values(CAST_SETTING_DEFS), ...Object.values(CAST_START_DEFS), CAST_PLAYER_MIND];
 
 /** The prompt part every answer's sentences come from. */
 export const CAST_ANSWERS = "cast-answers";
@@ -142,6 +189,13 @@ export interface CastDeps {
   approvals?: Pick<ApprovalsPort, "permission">;
   /** Settings over `CAST_DEFAULTS`. */
   settings?: Partial<CastSettings>;
+  /** A text's tokens at the chat's characters to a token (RPH's `tokens.charsPerToken`): what an answer counts the size of what it names by (plan 3.2 §7.1). Absent: no size is said. */
+  tokens?: (text: string) => number;
+  /**
+   * The scene each of `turns` lies in as the story record stands at a reading of the chat (`at`: a turn, or its head for null); null
+   * for a turn in none. The story record is the host's to read (the cast may not), so the host says it. Absent: nothing is read by scene.
+   */
+  scenes?: (scope: { user: string; chat: string }, at: string | null, turns: readonly string[]) => ReadonlyMap<string, SceneNamed | null>;
   /** Milliseconds since 1970, for a row's time; `Date.now` when absent. */
   now?: () => number;
 }
@@ -188,6 +242,8 @@ export interface CastClock {
   now: number;
   /** A time as answers show it; null while play has not set the clock (the blank world's, until a change moves it): a date nobody set is shown to nobody. */
   text(at: number): string | null;
+  /** The day a time falls on as answers show it, which is how `text` opens (`Sat 1 Mar 2031`): what a long record is laid out and read by day under; null as `text` is. */
+  day(at: number): string | null;
 }
 
 /**
@@ -206,7 +262,8 @@ export function castClock(store: Store, user: string, chat: string, turn: string
   const world = store.env.registry.context(doc, state).world;
   const cal = calendarOf(world);
   const shown = clockRecorded(folded);
-  return { now: state.clock, text: (at) => (shown ? formatClock(cal, at, placeOffset(world, at, placeOfEntity(state, world.pov))) : null) };
+  const here = placeOfEntity(state, world.pov);
+  return { now: state.clock, text: (at) => (shown ? formatClock(cal, at, placeOffset(world, at, here)) : null), day: (at) => (shown ? formatDay(cal, at, placeOffset(world, at, here)) : null) };
 }
 
 /** A row's date in story time as answers and views show it (`{ date }`), or nothing: it has none, or the clock shows none yet. */

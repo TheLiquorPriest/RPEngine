@@ -71,7 +71,7 @@ import { afterTurns } from "../store/turn-reads";
 import { RunTimes } from "./spans";
 import { globalConfig, turnSettings, usageRowsKeptDays } from "./settings";
 import { SinceKept } from "./since";
-import { closedScenesAt, countedOn, scenesOf, stagesAt } from "./stage";
+import { closedScenesAt, countedOn, scenesAcross, scenesOf, stagesAt } from "./stage";
 import { guidanceTexts } from "./texts";
 import { type TurnTrace, turnTrace } from "./trace";
 import { agentNaming, characterName, type MigratedSource, NO_SESSION, tokenCount, turnErrorWords, TurnLane } from "./turns";
@@ -624,7 +624,8 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
     const tokens = tokenCount(settings.charsPerToken);
     const [engine, cast, story, indexing] = await Promise.all([
       engineTools({ store: store.user(scope.user), env: store.envOf(scope.user), writes: app.writes, files: texts, search: indexedSearch(stateIndex, { user: scope.user, chat: scope.chat }), grid: gridMoves(wording.lines, settings.map), map: mapView(wording, settings.map), mapSettings: settings.map, due, dueAhead: settings.worldState.dueAhead, settings: settings.engine, places: settings.places, quests: settings.quests, placeSources, questHolders, lastUse, tokens, ...receipts, ...(options.carried !== undefined ? { carried: options.carried } : {}), ...(options.worlds !== undefined ? { worlds: options.worlds } : {}), ...asked }),
-      castTools({ store, writes: app.writes, files: texts, sources, books: bookTexts(options.books), secretFact: (user, shown) => secretFacts.secretFactOf(user, shown), search: memorySearch, now: () => clock.now(), settings: settings.cast, lastUse, ...receipts, ...asked }),
+      // The cast counts sizes as the chat does, and reads by scene what the story record says of each turn (plan 3.2 §6.4): both are the turn's to hand it.
+      castTools({ store, writes: app.writes, files: texts, sources, books: bookTexts(options.books), secretFact: (user, shown) => secretFacts.secretFactOf(user, shown), search: memorySearch, now: () => clock.now(), settings: settings.cast, tokens, scenes: ({ user, chat }, at, turns) => scenesAcross(store, user, chat, at, turns), lastUse, ...receipts, ...asked }),
       storyTools({ store, writes: app.writes, files: texts, overlay, settings: settings.story, lastUse, tokens, ...receipts }),
       loreTools({ index: loreIndex, guidance: loadGuidance(files, scope), log: app.log }),
     ]);

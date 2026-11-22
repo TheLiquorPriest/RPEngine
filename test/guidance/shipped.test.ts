@@ -10,6 +10,7 @@ import { basename } from "node:path";
 import { changed, type LoaderGuidance, openSet, type OpenSet, shippedTexts, split } from "./set";
 import { DREAM, REFLECT, RECALL, REMEMBER } from "../../src/cast/memories";
 import { MIND_SET, RELATE } from "../../src/cast/own";
+import { SELF_READ } from "../../src/cast/self-read";
 import { LORE_INDEX_WRITE } from "../../src/lore/tools";
 import { HOME_FILES, REMINDERS } from "./homes";
 
@@ -320,7 +321,7 @@ test("the Author's fixed tools, as RPH's loader reads them, are §6.8's thirty w
 
 test("the Author's search finds no character's own tool, nor the mapper's or the indexer's writer", async () => {
   const author = await guidance.definition("author");
-  const kept = [RECALL, REMEMBER, REFLECT, DREAM, MIND_SET, RELATE, LORE_INDEX_WRITE].map((tool) => ({ name: tool.name, family: tool.family }));
+  const kept = [RECALL, REMEMBER, REFLECT, DREAM, MIND_SET, RELATE, SELF_READ, LORE_INDEX_WRITE].map((tool) => ({ name: tool.name, family: tool.family }));
   // The mapper's writer is RPH's, of its family `prompt`.
   kept.push({ name: "prompt_map_write", family: "prompt" });
   for (const tool of kept) expect({ tool: tool.name, held: author?.tools.includes(tool.name), kept: author?.outOfReach.includes(tool.family) }).toEqual({ tool: tool.name, held: false, kept: true });

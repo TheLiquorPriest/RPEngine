@@ -42,7 +42,7 @@ import type { TreeNotes, TreeSuggestions } from "../tree";
 import type { Writes } from "./kv";
 import { endedError, type Runs } from "./runs";
 import { turnSettings } from "./settings";
-import { namedIn, namedStretches, SCENE_WINDOW, stageAt, stageCues } from "./stage";
+import { namedIn, namedStretches, SCENE_WINDOW, scenesAcross, stageAt, stageCues } from "./stage";
 import { guidanceTexts } from "./texts";
 import { castLayouts, DRAWN_MAP, drawnLayer, PARTS, tokenCount } from "./turns";
 
@@ -314,6 +314,8 @@ function ownTo(character: string, ref: string): boolean {
  * force for the chat, one after another; with nothing in any of them (the cast holds no record of the character yet), each one's part
  * for nothing, as for an agent of nobody given `cast:self(…)`. Null when the ref is not the cast's, or no part lays out a view it names.
  * A name among them that is not the cast's is left out.
+ * Given to the agent that plays the character, they are its own start (plan 3.2 §6.4): sized by the chat's settings and laid out from
+ * what the character may know, with the scenes its outline lays what it perceived out by read here, from the story record.
  */
 async function castNamed(deps: EventsDeps, scope: Scope, agent: AgentRef, ref: string, moment: AttachMoment): Promise<string | null> {
   const said = CAST_NAMED.exec(ref);
@@ -342,6 +344,9 @@ async function castNamed(deps: EventsDeps, scope: Scope, agent: AgentRef, ref: s
     sources: deps.sources,
     ...(deps.search !== undefined ? { search: deps.search } : {}),
     layouts,
+    // Given to the agent that plays the character, the views are its own start: sized by the chat's settings and made from what the character may know.
+    ...(agent.plays !== undefined ? { own: { plays: agent.plays, ...settings.castStart, foldTokens: settings.worldState.foldTokens } } : {}),
+    scenes: (turns) => scenesAcross(deps.store, scope.user, scope.chat, turn, turns),
   });
   // What waits to be taken in, as work, and the views that take an argument (`src/cast/take-in.ts`): each in its place among the names.
   const waiting = takeInViews(names, read, { ...(plan?.format === "template" ? { plan } : {}), ...(layouts["unprocessed-perceptions"] !== undefined ? { perceptions: layouts["unprocessed-perceptions"] } : {}), ...(layouts.imported !== undefined ? { imported: layouts.imported } : {}) });
