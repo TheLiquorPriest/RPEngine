@@ -1,8 +1,10 @@
 // Where the tokens went (plan §4 "The pages show"): the turn's model calls from the rows RPE keeps of them, agent by agent, call by
 // call, part by part. What each agent was handed as it started; each call's tokens and what they weigh; a call whose request went
 // out after the reply was released, marked so; a call that read nothing from the provider's cache and wrote it again, marked with
-// why; and the jobs the turn's runs started, each with its own use. It names the agents, so it sits behind the spoiler gate, and
-// is read from the turn's use route once the gate is open. Tokens, and tokens weighed: never money, and no figure is called good or bad.
+// why; what an agent did to its own window (plan 3.2 §7.2), between the calls it fell between, with what it spares each later call
+// and what it took once; and the jobs the turn's runs started, each with its own use. It names the agents, so it sits behind the
+// spoiler gate, and is read from the turn's use route once the gate is open. Tokens, and tokens weighed: never money, and no figure
+// is called good or bad.
 
 import type { AgentUse, CallShown, JobUse, TurnReply, TurnUseReply } from "../../../../shared/api";
 import { Badge, Disclosure, Row } from "../../../../frontend/components";
@@ -81,10 +83,34 @@ function CallLine(props: { call: CallShown; released: number | null }) {
   );
 }
 
+/** What an agent did to its own window, in the words its line begins with. */
+const WINDOW_WORDS: Readonly<Record<AgentUse["window"][number]["action"], string>> = { let_go: "Let go of", note: "Put a note of its own in place of", restore: "Brought back", handoff: "Went on in a fresh window, keeping" };
+
+function WindowLine(props: { change: AgentUse["window"][number] }) {
+  const { change } = props;
+  const things = change.items.map((item) => `${item.id} (${num(item.tokens)})`).join(", ");
+  return (
+    <li class="rpe-use-call" data-window={change.action}>
+      <span class="rpe-use-call-head">
+        <strong>Its window</strong>
+        <span>
+          {WINDOW_WORDS[change.action]} {things === "" ? "nothing by name" : things}
+        </span>
+        <span class="lre-num">{clock(change.at)}</span>
+      </span>
+      <span class="rpe-meta lre-num">
+        spares {num(change.spared)} tokens on each later call · took {num(change.once)} once, on its next call (by RPH's own estimate)
+      </span>
+    </li>
+  );
+}
+
 function AgentCalls(props: { agent: AgentUse; released: number | null }) {
   const { agent, released } = props;
   const after = agent.calls.filter((call) => afterReply(call, released)).length;
   const cold = agent.calls.filter((call) => call.cache?.cold === true).length;
+  // Its calls and what it did to its window between them, in the order they happened.
+  const steps = [...agent.calls.map((call) => ({ at: call.started, call, change: null })), ...agent.window.map((change) => ({ at: change.at, call: null, change }))].sort((a, b) => a.at - b.at);
   return (
     <Disclosure
       class="rpe-use-agent"
@@ -94,6 +120,7 @@ function AgentCalls(props: { agent: AgentUse; released: number | null }) {
           <span class="rpe-meta lre-num">{spentLine(agent.spent)}</span>
           {after === 0 ? null : <Badge>{counted(after, "call")} after the reply</Badge>}
           {cold === 0 ? null : <Badge tone="warn">{counted(cold, "cold write")}</Badge>}
+          {agent.window.length === 0 ? null : <Badge>{counted(agent.window.length, "change")} to its window</Badge>}
         </span>
       }
     >
@@ -106,13 +133,13 @@ function AgentCalls(props: { agent: AgentUse; released: number | null }) {
           ))}
         </ul>
       )}
-      {agent.calls.length === 0 ? (
+      {steps.length === 0 ? (
         <p class="lre-muted rpe-line">No call of its is kept.</p>
       ) : (
         <ul class="rpe-use-calls">
-          {agent.calls.map((call) => (
-            <CallLine key={`${call.n}:${call.started}`} call={call} released={released} />
-          ))}
+          {steps.map((step) =>
+            step.call !== null ? <CallLine key={`c${step.call.n}:${step.call.started}`} call={step.call} released={released} /> : step.change !== null ? <WindowLine key={`w${step.change.at}:${step.change.action}`} change={step.change} /> : null,
+          )}
         </ul>
       )}
     </Disclosure>
