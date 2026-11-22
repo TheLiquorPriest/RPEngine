@@ -4,7 +4,7 @@
   "devDependencies": {
     "@earendil-works/pi-ai": "1.5.2",
     "bun-types": "^1.4.2",
-    "lumiverse-spindle-types": "0.6.80",
+    "lumiverse-spindle-types": "0.6.81",
     "preact": "11.0.1",
     "rp-harness": "git+https://github.com/TheLiquorPriest/RPHarness.git#fb61c0fcab7e7c147414719349825915341e4812",
     "typescript": "7.0.2"
