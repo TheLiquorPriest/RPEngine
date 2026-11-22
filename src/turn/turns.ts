@@ -50,7 +50,7 @@ import { type StorySoFar, storySoFar } from "../story/sofar";
 import { type ChatFolders, mergeTurnRecord, type Pruned, RPE_GUIDANCE, type TreeChats, type TreeFiles, type TreeNotes, turnFolderName, type TurnRecordMessage, type TurnRecordTokens } from "../tree";
 import { changeSaid } from "./card-words";
 import { type Attempt, type AttemptFeedback, type CastFolder, type FolderAsk, type FolderLore, writeAlongside } from "./folder";
-import { ACTIVATED_LORE_FILE, ACTIVATED_LORE_PART, type HeldLore, type LeadChoice, leadChoices, loreHash, type SceneBefore, sceneFields, type SceneKept, sceneOf, sceneRead, SESSION_CACHE, standingLetGo } from "./lore-kept";
+import { ACTIVATED_LORE_FILE, ACTIVATED_LORE_PART, goneSince, type HeldLore, type LeadChoice, leadChoices, loreHash, type SceneBefore, sceneFields, type SceneKept, sceneOf, sceneRead, SESSION_CACHE, standingLetGo } from "./lore-kept";
 import { jobsEndedBetween } from "./jobs";
 import { ownerEditsBefore } from "./owner-changes";
 import type { OffstageSettings } from "../shared/offstage";
@@ -855,9 +855,9 @@ export class TurnLane implements TurnPlayer, ChatChanges {
         // The turn's lore file names, for each entry that activated, the file of the session's cache that holds its text as the lead reads it
         // in full: the text itself is written once, there, by RPH. An entry with no such file (it could not be read) is listed without one.
         const here = new Map((scene?.entries ?? []).flatMap((e) => (e.here ? [[e.id, e] as const] : [])));
-        const lore = activated.map(({ id, title, source, how }): FolderLore => {
+        const lore = activated.map(({ id, title, source, how, text }): FolderLore => {
           const e = here.get(id);
-          return { id, title, source, ...(how !== undefined ? { how } : {}), ...(e !== undefined && e.hash !== null ? { tokens: Math.ceil(e.chars / settings.charsPerToken) } : {}), ...(e !== undefined && e.file !== null && cache !== null ? { file: `${cache.folder}${e.file}` } : {}) };
+          return { id, title, source, ...(how !== undefined ? { how } : {}), ...(text !== undefined ? { text } : {}), ...(e !== undefined && e.hash !== null ? { tokens: Math.ceil(e.chars / settings.charsPerToken) } : {}), ...(e !== undefined && e.file !== null && cache !== null ? { file: `${cache.folder}${e.file}` } : {}) };
         });
         ask = { scope, guidance, tagged, messages, request, loreMap, lore, ...(cache !== null && cache.path !== null ? { sceneList: cache.path } : {}), attempts: replaced === null ? [] : this.#attempts(user, chat, replaced, begun.id), cast, received };
         lap("kept");
@@ -1754,7 +1754,9 @@ export class TurnLane implements TurnPlayer, ChatChanges {
     if (kept !== null && parent !== null) {
       let did: Map<string, LeadChoice> | null = null;
       try {
-        did = leadChoices(await this.#d.kept({ user: scope.user, chat: scope.chat, session: kept.session, turn: parent }), kept.entries.flatMap((e) => (e.here ? [e.id] : [])));
+        // A Settle now run of the turn before held none of the lore: what its lead did stands from the run before it.
+        const settles = new Set(this.#d.runs.ofTurn(scope.user, parent).flatMap((r) => (r.kind === "settle" && r.traceRun !== null ? [r.traceRun] : [])));
+        did = leadChoices(await this.#d.kept({ user: scope.user, chat: scope.chat, session: kept.session, turn: parent }), kept.entries.flatMap((e) => (e.here ? [e.id] : [])), settles);
       } catch (error) {
         this.#d.log.warn("The trace of the turn before could not be read for what its lead did with the lore, so the lore map says nothing of it.", { chat: scope.chat, turn: parent, error: words(error) });
       }
@@ -1769,7 +1771,8 @@ export class TurnLane implements TurnPlayer, ChatChanges {
       const letGo = settings.choiceStands && e.status === "same" && e.lead === "let_go";
       return { ...line, ...(e.hash !== null ? { tokens: tokens(e.chars) } : {}), ...(e.status !== null && e.status !== "gone" ? { status: e.status } : {}), ...(stood && e.lead !== null ? { before: e.lead } : {}), ...(letGo ? { letGo: true } : {}) };
     });
-    const gone = scene.entries.flatMap((e) => (e.status === "gone" ? [{ id: e.id, title: e.title, ...(e.hash !== null ? { tokens: tokens(e.chars) } : {}) }] : []));
+    // What the turn before's prompt held and this one's does not, whatever scene it was in: the map says it left.
+    const gone = goneSince(now, before).map((e) => ({ id: e.id, title: e.title, ...(e.hash !== null ? { tokens: tokens(e.chars) } : {}) }));
     return { map: { ...map, inPrompt, ...(gone.length > 0 ? { gone } : {}) }, scene };
   }
 

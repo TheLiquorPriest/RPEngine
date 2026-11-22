@@ -104,16 +104,19 @@ export function sceneRead(value: unknown): SceneKept | null {
 const LORE_THING = "lore:";
 
 /**
- * What the lead of a turn did with each of `held`, the entries its prompt held, by the end of its last run: read from the records the
- * turn's folder keeps. Every entry stands whole until the lead lets it go (`let_go`, or `note`, its own note in its place), comes back
- * with `restore`, and after a `handoff` stands whole only where the handoff kept it. Only the lead's own records count: an agent it
- * started has a window of its own. Null where the folder keeps no record of a turn's run, so nothing is known.
+ * What the lead of a turn did with each of `held`, the entries its prompt held, by the end of its last run that held them: read from the
+ * records the turn's folder keeps. Every entry stands whole until the lead lets it go (`let_go`, or `note`, its own note in its place),
+ * comes back with `restore`, and after a `handoff` stands whole only where the handoff kept it. Only the lead's own records count: an
+ * agent it started has a window of its own. A Settle now run (its trace run among `settles`) is given no prompt, so its lead holds none
+ * of the lore and its records leave what the run before it did standing. Null where the folder keeps no record of a turn's run that held
+ * them, so nothing is known.
  */
-export function leadChoices(records: readonly TraceRecord[], held: readonly string[]): Map<string, LeadChoice> | null {
+export function leadChoices(records: readonly TraceRecord[], held: readonly string[], settles: ReadonlySet<string> = new Set()): Map<string, LeadChoice> | null {
   let known = false;
   let out = new Map<string, LeadChoice>();
   const whole = (): Map<string, LeadChoice> => new Map(held.map((id) => [id, "kept"] as const));
   for (const record of records) {
+    if (settles.has(record.run)) continue;
     const { event } = record;
     if (event.kind === "run_started" && event.run === "turn") {
       // A run of the turn begins with a window of its own.
@@ -138,35 +141,44 @@ export interface SceneBefore {
 }
 
 /**
- * The scene's list as a turn finds it: `now`, what its prompt holds, in the prompt's order, each against the turn before; then what
- * the turn before held and this one does not (`gone`); then, where the turn before was played in the same session, what had left
- * before it. A turn with nothing to compare with (the chat's first, or one whose parent kept no list) says of no entry how it stands.
- * What the lead did with an entry is what it did on the turn before where that turn held it, else what the list said already.
+ * The scene's list as a turn finds it: `now`, what its prompt holds, in the prompt's order, each against the turn before; then, where
+ * the turn before was played in the same session (the same scene), what it held and this one does not (`gone`), and what had left
+ * before it. An entry of another scene's prompts is none of this scene's: its text is kept in that scene's cache, not this one's, and
+ * the lore map says it left with `goneSince`. A turn with nothing to compare with (the chat's first, or one whose parent kept no list)
+ * says of no entry how it stands. What the lead did with an entry is what it did on the turn before where that turn held it, else what
+ * the list said already.
  */
 export function sceneOf(session: string, now: readonly HeldLore[], before: SceneBefore | null): SceneKept {
   const earlier = new Map((before?.kept.entries ?? []).map((e) => [e.id, e] as const));
   const entries: SceneLore[] = [];
   const seen = new Set<string>();
-  const choice = (id: string, was: SceneLore | undefined): LeadChoice | null => {
-    const did = was?.here === true ? before?.did?.get(id) : undefined;
-    return did ?? was?.lead ?? null;
-  };
   for (const e of now) {
     if (seen.has(e.id)) continue;
     seen.add(e.id);
     const was = earlier.get(e.id);
     const status: LoreStatus | null = before === null ? null : was?.here !== true ? "new" : was.hash === e.hash ? "same" : "changed";
-    entries.push({ ...e, here: true, status, lead: choice(e.id, was) });
+    entries.push({ ...e, here: true, status, lead: choiceOf(before, e.id, was) });
   }
-  if (before === null) return { session, entries };
-  const same = before.kept.session === session;
+  if (before === null || before.kept.session !== session) return { session, entries };
   for (const was of before.kept.entries) {
     if (seen.has(was.id)) continue;
-    // What the turn before held has gone; what had left before it is listed only while the scene is the same.
-    if (was.here) entries.push({ ...was, here: false, status: "gone", lead: choice(was.id, was) });
-    else if (same) entries.push({ ...was, here: false, status: null });
+    // What the turn before held has gone; what had left before it stays listed with nothing said of this turn.
+    entries.push(was.here ? { ...was, here: false, status: "gone", lead: choiceOf(before, was.id, was) } : { ...was, here: false, status: null });
   }
   return { session, entries };
+}
+
+/** What the lead did with an entry: what it did on the turn before where that turn held it, else what the list said already. */
+function choiceOf(before: SceneBefore | null, id: string, was: SceneLore | undefined): LeadChoice | null {
+  const did = was?.here === true ? before?.did?.get(id) : undefined;
+  return did ?? was?.lead ?? null;
+}
+
+/** What the turn before's prompt held and this turn's does not, in that turn's order, whatever scene each was played in: what the lore map says has left. */
+export function goneSince(now: readonly HeldLore[], before: SceneBefore | null): SceneLore[] {
+  if (before === null) return [];
+  const here = new Set(now.map((e) => e.id));
+  return before.kept.entries.flatMap((was) => (was.here && !here.has(was.id) ? [{ ...was, here: false, status: "gone" as const, lead: choiceOf(before, was.id, was) }] : []));
 }
 
 /**

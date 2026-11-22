@@ -802,7 +802,9 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
       const settings = await turnSettings(files, scope, app.log);
       let did: Map<string, LeadChoice> | null = null;
       try {
-        did = leadChoices(await trace.kept(scope), here.map((e) => e.id));
+        // A Settle now run of the turn held none of the lore: what its lead did stands from the run before it.
+        const settles = new Set(runs.ofTurn(user, turn).flatMap((r) => (r.kind === "settle" && r.traceRun !== null ? [r.traceRun] : [])));
+        did = leadChoices(await trace.kept(scope), here.map((e) => e.id), settles);
       } catch (error) {
         app.log.warn("A turn's trace could not be read for what its lead did with the lore.", { chat, turn, error: error instanceof Error ? error.message : String(error) });
       }

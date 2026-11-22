@@ -11,7 +11,7 @@ import type { Answer } from "rp-harness/testing/rig";
 import type { TurnLoreReply } from "../../src/shared/api";
 import type { TurnRow } from "../../src/store";
 import { TURN_FILES } from "../../src/turn/folder";
-import { ACTIVATED_LORE_FILE, type HeldLore, leadChoices, type SceneKept, sceneOf, sceneRead, standingLetGo } from "../../src/turn/lore-kept";
+import { ACTIVATED_LORE_FILE, goneSince, type HeldLore, leadChoices, type SceneKept, sceneOf, sceneRead, standingLetGo } from "../../src/turn/lore-kept";
 import { CHAT, CONNECTION, openTurnBed, PRESET, replying, settledTurn, type TurnBed, type TurnBedOptions, USER } from "./bed";
 
 const beds: TurnBed[] = [];
@@ -237,6 +237,10 @@ describe("the comparison", () => {
     expect(leadChoices([...records, window(6, "handoff", ["lore:e-4", "call:c2"]), window(7, "restore", ["lore:e-3"])], ids)).toEqual(new Map([["e-1", "let_go"], ["e-2", "let_go"], ["e-3", "kept"], ["e-4", "kept"]]));
     // A run of the turn after the first (a continue) begins with a window of its own.
     expect(leadChoices([...records, { ...started, seq: 8, at: 8, run: "run-2" }], ids)?.get("e-2")).toBe("kept");
+    // A Settle now run is given no prompt and holds none of the lore: what the run before it did stands through it.
+    const settle = [{ ...started, seq: 8, at: 8, run: "run-settle", event: { ...started.event, turn: "continue" as const } }, { ...window(9, "restore", ["lore:e-2"]), run: "run-settle" }];
+    expect(leadChoices([...records, ...settle], ids, new Set(["run-settle"]))?.get("e-2")).toBe("let_go");
+    expect(leadChoices([...settle], ids, new Set(["run-settle"]))).toBeNull();
   });
 
   test("a turn with nothing before it says of no entry how it stands; the next says new, changed, as it was and gone, and carries what is known of each", () => {
@@ -267,9 +271,12 @@ describe("the comparison", () => {
     expect(back.entries.find((e) => e.id === "e-2")).toMatchObject({ here: true, status: "new", lead: "kept" });
     expect(back.entries.find((e) => e.id === "e-1")).toMatchObject({ here: false, status: "gone", lead: "kept" });
 
-    // A new scene's list starts over: the turn before is still what it is compared with, and what had left before it is not carried in.
+    // A new scene's list starts over: an entry of the scene before is none of this scene's list, though the map still says what left since the turn before.
     const next = sceneOf("s2", [held("e-1", "aa")], { kept: second, did });
-    expect(next.entries.map((e) => [e.id, e.here, e.status])).toEqual([["e-1", true, "same"], ["e-3", false, "gone"], ["e-4", false, "gone"]]);
+    expect(next.entries.map((e) => [e.id, e.here, e.status])).toEqual([["e-1", true, "same"]]);
+    expect(goneSince([held("e-1", "aa")], { kept: second, did }).map((e) => [e.id, e.status, e.lead])).toEqual([["e-3", "gone", "let_go"], ["e-4", "gone", null]]);
+    // The next turn of the new scene carries nothing of the scene before.
+    expect(sceneOf("s2", [held("e-1", "aa")], { kept: next, did: null }).entries.map((e) => e.id)).toEqual(["e-1"]);
     expect(sceneOf("s2", [held("e-1", "aa")], { kept: third, did: null }).entries.map((e) => e.id)).toEqual(["e-1"]);
   });
 

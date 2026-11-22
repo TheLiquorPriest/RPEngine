@@ -99,6 +99,8 @@ export interface AlongsideDeps extends FolderDeps {
  * the lead reads it in full, by its path as agents read it (none where it could not be read).
  */
 export interface FolderLore extends ActivatedLore {
+  /** Its text as any reader may read it, where the lore map read it: a field each entry still gives, for a layout that prints it. */
+  text?: string;
   tokens?: number;
   file?: string;
 }
@@ -122,9 +124,9 @@ export interface FolderAsk {
   received: number;
 }
 
-/** The lore map as the briefing holds it, then each entry that activated for the prompt with its size and the file that holds its text (`FolderAsk.lore`), and the scene's list. */
+/** The lore map as the briefing holds it, then each entry that activated for the prompt with its size and the file that holds its text (`FolderAsk.lore`), and the scene's list. Each entry still gives its `text`, which the shipped layout does not print, for a layout of the user's that does. */
 function loreFields(ask: FolderAsk, loreMap: string | undefined): Fields {
-  const entries = ask.lore.map((e) => ({ id: e.id, title: e.title, ...(e.source !== "" ? { source: e.source } : {}), ...(e.how !== undefined ? { how: e.how } : {}), ...(e.tokens !== undefined ? { tokens: e.tokens } : {}), ...(e.file !== undefined ? { file: e.file } : {}) }));
+  const entries = ask.lore.map((e) => ({ id: e.id, title: e.title, ...(e.source !== "" ? { source: e.source } : {}), ...(e.how !== undefined ? { how: e.how } : {}), ...(e.text !== undefined ? { text: e.text } : {}), ...(e.tokens !== undefined ? { tokens: e.tokens } : {}), ...(e.file !== undefined ? { file: e.file } : {}) }));
   return { ...(loreMap !== undefined ? { lore_map: loreMap } : {}), entries, ...(entries.length > 0 ? { listed: true } : {}), ...(ask.sceneList !== undefined ? { scene_list: ask.sceneList } : {}) };
 }
 
