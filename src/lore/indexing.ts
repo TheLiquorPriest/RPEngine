@@ -247,6 +247,11 @@ export interface LoreIndexDeps {
 export interface ActivatedRead extends ActivatedLore {
   /** Its text as any reader may read it (`LoreCatalogEntry.text`); absent where the map's reading of the chat's lore holds no entry of this id. */
   text?: string;
+  /**
+   * Its text as the lead reads it in full (`LoreIndex.read`: secrets marked, the story's notes after it): what RPH keeps of it in the
+   * session's cache, so the name of that file is told from this (plan 3.2 §6.2). Absent where it could not be read.
+   */
+  whole?: string;
 }
 
 /** The lore map in full for a turn, with the entries that activated for its prompt as the map read them, in the tag's order. */
@@ -376,11 +381,15 @@ export class LoreIndex {
     });
     // The story's notes travel with the entry: every part that shows an entry shows what the story has moved past in it, each note with the turn it was written on. So do its secrets, each by id with who holds it.
     const notes = overlayNoted(this.deps.path.overlays(ask.user, ask.chat, ask.turn), [...first1, ...first3, ...bound4].map((l) => l.id));
-    const secrets = new Map((await this.deps.lore.read(ask, [...new Set([...first1, ...first3, ...bound4].map((l) => l.id))])).flatMap((e) => (e.secrets === undefined || e.secrets.length === 0 ? [] : [[e.id, e.secrets.map((s) => ({ id: s.id, holders: s.heldBy }))] as const])));
+    // Each entry the map shows, read once as the lead reads it in full: its secrets, and its size where the asker counts (`ask.tokens`).
+    const read = await this.noted(ask, await this.deps.lore.read(ask, [...new Set([...first1, ...first3, ...bound4].map((l) => l.id))]));
+    const whole = new Map(read.map((e) => [e.id, e.text] as const));
+    const secrets = new Map(read.flatMap((e) => (e.secrets === undefined || e.secrets.length === 0 ? [] : [[e.id, e.secrets.map((s) => ({ id: s.id, holders: s.heldBy }))] as const])));
     const noted = (l: LoreMapLine): LoreMapLine => {
       const n = notes.get(l.id);
       const s = secrets.get(l.id);
-      return n === undefined && s === undefined ? l : { ...l, ...(n === undefined ? {} : { notes: n }), ...(s === undefined ? {} : { secrets: s }) };
+      const text = ask.tokens === undefined ? undefined : whole.get(l.id);
+      return n === undefined && s === undefined && text === undefined ? l : { ...l, ...(n === undefined ? {} : { notes: n }), ...(s === undefined ? {} : { secrets: s }), ...(text === undefined || ask.tokens === undefined ? {} : { tokens: ask.tokens(text) }) };
     };
     const inPrompt = first1.map(noted);
     const world = first3.map(noted);
@@ -389,7 +398,8 @@ export class LoreIndex {
     const changed = inPrompt.filter((l) => l.notes !== undefined);
     const activated = first.inPrompt.map(({ id, title, source, how }): ActivatedRead => {
       const text = byId.get(id)?.text;
-      return { id, title, source: source ?? "", ...(how !== undefined ? { how } : {}), ...(text !== undefined ? { text } : {}) };
+      const full = whole.get(id);
+      return { id, title, source: source ?? "", ...(how !== undefined ? { how } : {}), ...(text !== undefined ? { text } : {}), ...(full !== undefined ? { whole: full } : {}) };
     });
     return { inPrompt, world, changed, bound, leftOut: Math.max(0, order.length - set.bound), notIndexed: entries.filter((e) => !e.indexed).length, activated };
   }

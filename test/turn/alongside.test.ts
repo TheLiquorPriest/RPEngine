@@ -174,11 +174,12 @@ describe("the Author starts at once; the turn's folder follows it", () => {
     const reads = recordReads(b);
     const turn = await settledTurn(b, await play(b, "normal", "I ask where the oil is kept."));
 
-    // The entry in full, with its lore-map id, its book and how it activated.
+    // The entry by its lore-map id, its book and how it activated, with its size and the file of the session's cache that holds its text.
     const lore = await folderText(b, turn, TURN_FILES.lore);
     const id = /^- \[(e-\d+)\] The oil store/m.exec(lore)?.[1];
     expect(id).toBeDefined();
-    expect(lore).toContain(`## [${id}] The oil store, from Keeper's Book, activated by keyword\n\n${content}\n`);
+    expect(lore).toMatch(new RegExp(`^- \\[${id}\\] The oil store, from Keeper's Book, activated by keyword, \\d+ tokens: \\S+/cache/lore-${id}-[0-9a-f]+\\.md$`, "m"));
+    expect(lore).not.toContain(content);
     // The folder reads no entry of its own: its text is what the lore map and the check of the lore on receipt read.
     expect(reads.filter((r) => r.stack.includes("/src/turn/folder.ts"))).toEqual([]);
   });

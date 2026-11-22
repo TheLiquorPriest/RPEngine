@@ -30,6 +30,7 @@ export const HOMES: readonly Row[] = [
   { behaviour: "Starting the mapping, indexing and summarizing jobs", home: "TURN.md", off: "Started only by you", test: "off" },
   { behaviour: "Writing a turn's steps down with `todo` when there are several", home: "TURN.md", off: "No list is kept", test: "off" },
   { behaviour: "Keeping what the turn needs in its window and letting go of the rest; composing what an agent it starts is sent; giving heavy reading to an agent of its own", home: "TURN.md", off: "The Author carries everything it was given and every answer through every call", test: "off" },
+  { behaviour: "Saying which activated lore entries it keeps once its intent is written, and letting the others go by name", home: "TURN.md", off: "Every activated entry is carried whole through every call of the turn", test: "off" },
   { behaviour: "Settling the turn once the reply is out as it is, from a fresh window by a handoff, or handed on to the keeper, by its own call", home: "TURN.md", off: "The Author settles in the window the reply was written in", test: "edit" },
   { behaviour: "Handing the prose to the narrator when the threshold is met", home: "WRITING.md", off: "The Author writes every reply itself", test: "edit" },
   { behaviour: "Reading a narrator's draft before release; sending it back with what to change, or cutting it", home: "WRITING.md", off: "Drafts go out unread", test: "edit: the hand-off is kept and the paragraph on the draft is changed" },

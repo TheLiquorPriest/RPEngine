@@ -16,8 +16,8 @@ const SHIPPED = shippedTexts();
 /** Words that ask an agent to do something: a part that lays things out holds none of them. */
 const ASKS = /\b(must|should|always|never|please|make sure|remember to)\b/i;
 
-/** The names the briefing's template may put in or test at its top level: what RPH fills (`harness/turn.ts` `#briefing`), the blocks RPE's turn hands it by name (`BLOCKS`, `-` as `_`) and the facts it names (`story`, `previous`, `lore`, `cast` and `history`, read by their dotted names); `path`, `id`, `title`, `who`, `kind`, `gone` and `defines` are the fields of the items of the cache's lists and of a base's older sources. */
-const BRIEFING_FILLED = ["turn", "turn_facts", "asked", "prefill", "since", "files_changed", "files_added", "rules_due", "hooks", "world_state", "on_stage", "lore_map", "prompt_notices", "prompt_cut", "not_given", "story_so_far", "story_brief", "turn_files", "intent_path", "reply_contract", "cache", "session_unreadable", "reason", "lines", "path", "id", "title", "story", "previous", "lore", "cast", "history", "who", "kind", "gone", "defines"];
+/** The names the briefing's template may put in or test at its top level: what RPH fills (`harness/turn.ts` `#briefing`), the blocks RPE's turn hands it by name (`BLOCKS`, `-` as `_`) and the facts it names (`story`, `previous`, `lore`, `cast` and `history`, read by their dotted names); `path`, `id`, `title`, `tokens`, `who`, `kind`, `gone` and `defines` are the fields of the items of the cache's lists and of a base's older sources. */
+const BRIEFING_FILLED = ["turn", "turn_facts", "asked", "prefill", "since", "files_changed", "files_added", "rules_due", "hooks", "world_state", "on_stage", "lore_map", "prompt_notices", "prompt_cut", "not_given", "story_so_far", "story_brief", "turn_files", "intent_path", "reply_contract", "cache", "session_unreadable", "reason", "lines", "path", "id", "title", "tokens", "story", "previous", "lore", "cast", "history", "who", "kind", "gone", "defines"];
 
 /** The notices of `notices.md`, by name, and the fields a use of each fills. Each is a fact; none asks. */
 const NOTICES: Record<string, Record<string, unknown>> = {
@@ -164,14 +164,19 @@ describe("a row each of E.6: present, laid out as its row says, asking for nothi
     expect(text).not.toContain("COUNT LINE");
     expect(text).not.toContain("How what you write now is marked");
     expect(text).not.toContain("Counts");
-    // What the scene has already looked up and where it is kept, only when the session's cache holds something.
+    // What the scene has kept that this turn's prompt does not hold, and where it is kept, only when the session's cache holds something; each with its size where it is given one.
     const cached = part.render({ ...full, cache: { folder: "sessions/s-1/cache/", carried: [{ path: "sessions/s-1/turns/t-3/scratch/scene.md" }], lore: [{ id: "e-12", title: "The Gilded Hart", path: "sessions/s-1/cache/lore/e-12.md" }], prompt_map: "sessions/s-1/cache/prompt-map.md", host: [{ path: "sessions/s-1/cache/base/wren.md" }] } }).text;
-    expect(cached).toContain("## What this scene has already looked up\n\nIt is kept in the session's cache folder, sessions/s-1/cache/, to be read from there; nothing writes in it.");
+    expect(cached).toContain("## What this scene has kept that this turn's prompt does not hold\n\nIt is kept in the session's cache folder, sessions/s-1/cache/, to be read from there; nothing writes in it.");
     expect(cached).toContain("- Carried into this turn as it stood: sessions/s-1/turns/t-3/scratch/scene.md");
-    expect(cached).toContain("- Lore entry [e-12] The Gilded Hart, read in full: sessions/s-1/cache/lore/e-12.md");
+    expect(cached).toContain("- Lore entry [e-12] The Gilded Hart, whole: sessions/s-1/cache/lore/e-12.md");
     expect(cached).toContain("- The prompt map as this scene has it: sessions/s-1/cache/prompt-map.md");
     expect(cached).toContain("- From the host: sessions/s-1/cache/base/wren.md");
-    expect(text).not.toContain("already looked up");
+    const sized = part.render({ ...full, cache: { folder: "sessions/s-1/cache/", carried: [{ path: "sessions/s-1/turns/t-3/scratch/scene.md", tokens: 310 }], lore: [{ id: "e-12", title: "The Gilded Hart", path: "sessions/s-1/cache/lore/e-12.md", tokens: 1200 }], prompt_map: "sessions/s-1/cache/prompt-map.md", prompt_map_tokens: 95, host: [{ path: "sessions/s-1/cache/ACTIVATED-LORE.md", tokens: 267 }] } }).text;
+    expect(sized).toContain("- Carried into this turn as it stood: sessions/s-1/turns/t-3/scratch/scene.md, 310 tokens");
+    expect(sized).toContain("- Lore entry [e-12] The Gilded Hart, whole, 1200 tokens: sessions/s-1/cache/lore/e-12.md");
+    expect(sized).toContain("- The prompt map as this scene has it: sessions/s-1/cache/prompt-map.md, 95 tokens");
+    expect(sized).toContain("- From the host: sessions/s-1/cache/ACTIVATED-LORE.md, 267 tokens");
+    expect(text).not.toContain("this turn's prompt does not hold");
     // A session file that could not be read, whole or in lines, is told with what is so, and only then.
     const whole = part.render({ ...full, session_unreadable: { reason: "The host refused it." } }).text;
     expect(whole).toContain("## This session's file\n\nIt could not be read: The host refused it. You hold nothing of this scene's earlier turns this turn.");

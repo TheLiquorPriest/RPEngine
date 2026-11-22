@@ -275,7 +275,7 @@ export function compose(options: ComposeOptions = {}): Composition {
     storeArea(),
     loreArea(() => ({
       store: made().store,
-      turns: made().prompts.lore,
+      turns: made().loreTurns,
       indexing: { index: made().loreIndex, jobs: made().harness.jobs, definitions: made().harness.definitions, scope: (user, chat) => scope(user, chat) },
       secrecy: { settingsFor: made().secretSettings, wording: made().secretMarks, log: (message) => made().env.log.warn(message) },
       proposals: proposals(),

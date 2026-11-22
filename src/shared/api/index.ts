@@ -4045,7 +4045,7 @@ export interface TurnLoreReply {
   entries: TurnLoreRow[];
 }
 
-/** An entry Lumiverse activated for a turn's prompt: its lore map id, its id and its book's id in Lumiverse, its title, how it activated where the turn's tag says, and what RPE's check of the lore on receipt did to it. */
+/** An entry Lumiverse activated for a turn's prompt: its lore map id, its id and its book's id in Lumiverse, its title, how it activated where the turn's tag says, what RPE's check of the lore on receipt did to it, its size, how it stood against the turn before, and what the turn's lead did with it. */
 export interface TurnLoreRow {
   /** The id the Author's lore map gives the entry: `e-` and its number. */
   id: string;
@@ -4059,6 +4059,12 @@ export interface TurnLoreRow {
   how: LoreActivation | null;
   /** Where the extension applied its own verdict on the secrets and RPE checked the lore on receipt: kept out of the prompt, worded otherwise, or its text not found in the prompt (so RPE's verdict was not applied to it); null where the check left it as it was, or nothing was checked. */
   receipt: "kept-out" | "reworded" | "not-found" | null;
+  /** The size of its text as the prompt carried it, in tokens as the chat counts them; null where its text was not found in the prompt, or the turn kept no list of what its prompt held. */
+  tokens: number | null;
+  /** Against the prompt of the turn before it on its path: new to the prompt, its text changed, or as it was; null where that turn kept nothing to compare with (the chat's first turn, or one played before RPE kept any). */
+  status: "new" | "changed" | "same" | null;
+  /** What the turn's lead did with it by the end of its run: kept it whole in its window, or let it go to one line; null where the turn's trace is not kept. */
+  lead: "kept" | "let_go" | null;
 }
 
 /** A mark a turn carries apart from its run's status: interrupted (RPE restarted while a run of it went on), saved otherwise (what Lumiverse saved is not what was released, beyond the prefill in front and a continue's join), edited (its own reply was edited in the chat after it was saved, the Author told the text before and after at the next turn), or standing on a message of the player's he edited, or inserted before it, since it was played; with that message, and when the mark was set. */

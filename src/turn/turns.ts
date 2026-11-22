@@ -21,7 +21,8 @@
 
 import type { Database } from "bun:sqlite";
 import { type Fields, type Guidance, type LinesPart, loadGuidance, type TemplatePart } from "../app/guidance";
-import type { AgentRef, Clock, ContextBlock, DefinitionsApi, FilesPort, Harness, JobState, JsonObject, LimitHit, Log, ModelLimits, ReplyError, ReplySink, Scope, SinceItem, ThinkingPiece, TurnRequest, Usage } from "rp-harness/contract";
+import type { AgentRef, Clock, ContextBlock, DefinitionsApi, FilesPort, Harness, JobState, JsonObject, LimitHit, Log, ModelLimits, ReplyError, ReplySink, RunScope, Scope, SinceItem, ThinkingPiece, TraceRecord, TurnRequest, Usage } from "rp-harness/contract";
+import { keptLoreFile } from "rp-harness/helpers";
 import { reconcile, type ChatChange, type ChatChanges, type ShownSwipe } from "../adapter/lumiverse/events";
 import type { Feedback } from "../adapter/lumiverse/feedback";
 import type { TaggedTurn, TurnPlayer } from "../adapter/lumiverse/provider";
@@ -38,7 +39,7 @@ import { mapView, mapWording, timelapseOperation } from "../iface";
 import { knowledgeChange, type Lore, type LoreIndex, loreLines, loreMapFields, type LoreProjection, scanMark, type SecretSettingsFor } from "../lore";
 import { placeLinesAt } from "../places";
 import { tidyHolds } from "../play/path-events";
-import type { ActivatedRead } from "../lore/indexing";
+import type { ActivatedRead, TurnLoreMap } from "../lore/indexing";
 import { isRecord, type JsonValue } from "../shared/json";
 import { playAnswers } from "../play/service";
 import { type ChangeRow, clockRecorded, type DueSource, type MapText, type PathReport, type Report, type ShownMessage, type Store, type TreeView, type TurnRow, type UserStore, worldState, worldStateFolds } from "../store";
@@ -48,7 +49,8 @@ import { storyAt } from "../story/path";
 import { type StorySoFar, storySoFar } from "../story/sofar";
 import { type ChatFolders, mergeTurnRecord, type Pruned, RPE_GUIDANCE, type TreeChats, type TreeFiles, type TreeNotes, turnFolderName, type TurnRecordMessage, type TurnRecordTokens } from "../tree";
 import { changeSaid } from "./card-words";
-import { type Attempt, type AttemptFeedback, type CastFolder, type FolderAsk, writeAlongside } from "./folder";
+import { type Attempt, type AttemptFeedback, type CastFolder, type FolderAsk, type FolderLore, writeAlongside } from "./folder";
+import { ACTIVATED_LORE_FILE, ACTIVATED_LORE_PART, type HeldLore, type LeadChoice, leadChoices, loreHash, type SceneBefore, sceneFields, type SceneKept, sceneOf, sceneRead, SESSION_CACHE, standingLetGo } from "./lore-kept";
 import { jobsEndedBetween } from "./jobs";
 import { ownerEditsBefore } from "./owner-changes";
 import type { OffstageSettings } from "../shared/offstage";
@@ -267,6 +269,8 @@ export interface TurnLaneDeps {
   writes: Writes;
   files: TreeFiles;
   chats: TreeChats;
+  /** The records a turn's folder keeps of what ran in it, without what the transcripts hold (`TurnTrace.kept`): read at a turn's start for what the lead of the turn before did to its own window (plan 3.2 §6.2). */
+  kept(scope: RunScope): Promise<TraceRecord[]>;
   /** The one way a chat is taken on (`chatTaker`): its row in the store and its folders, made by its first turn unless a page, a job or a write named it first. */
   place(user: string, chat: string): Promise<ChatFolders>;
   prompts: TurnPrompts;
@@ -466,6 +470,12 @@ interface BriefingFor {
   notGiven: NotGiven[];
   /** What the receipt found of the prompt that is not as the chat application listed it (R-103), and what Lumiverse's own clipping left out; none for a run given no prompt. */
   cut: Pick<Cut, "notices" | "clipped">;
+  /**
+   * For a turn's own first run: what its prompt carried of each entry that activated, in the tag's order (`TagLore.text`; none for one not
+   * found in it), and the turn before it on the path. With it the lore map says how each entry stands against that turn, and the scene's
+   * list is made (`#sceneLore`). Null for a run given no prompt.
+   */
+  held: { texts: readonly (string | undefined)[]; parent: string | null } | null;
 }
 
 /** What a Settle now gives back: the turn its run is on and the run's id, or the words it was refused in. */
@@ -766,9 +776,9 @@ export class TurnLane implements TurnPlayer, ChatChanges {
         // The briefing's blocks, and what has happened since the last turn.
         const found = { steps, notices: lines(notices), guidance, last, again: named !== null, replaced, hiddenReadable: settings.hiddenReadable, editedBudget: settings.editedBudget, deleted: { budget: settings.deletedBudget, words: settings.deletedWords }, notAppliedBudget: settings.notAppliedBudget, jobBudget: settings.jobBudget, jobReport: settings.jobReport, tokens: tokenCount(settings.charsPerToken), tell: settings.taps.tell };
         const writes = tag.target.message !== null && (tag.kind === "new" || tag.kind === "swipe" || tag.kind === "regenerate");
-        const at: BriefingFor = { kind: tag.kind, speaker: tag.speaker.name, message: target, writing: writes ? tag.target.message : null, keep: tagged.cut.keep?.id ?? null, limits, notGiven: left, cut: tagged.cut };
+        const at: BriefingFor = { kind: tag.kind, speaker: tag.speaker.name, message: target, writing: writes ? tag.target.message : null, keep: tagged.cut.keep?.id ?? null, limits, notGiven: left, cut: tagged.cut, held: { texts: tagged.lore.map((l) => l.text), parent: begun.parent } };
         // A continue whose tag names a turn's message is told what is new since that turn's runs were told, as a continue of it.
-        const [{ blocks: briefing, loreMap, activated, storyTime, notGiven }, { items: since, told }] = await Promise.all([this.#briefing(reads, guidance, scope, at, steps, settings), this.#since(reads, user, named ?? begun, found)]);
+        const [{ blocks: briefing, loreMap, activated, scene, storyTime, notGiven }, { items: since, told }] = await Promise.all([this.#briefing(reads, guidance, scope, at, steps, settings), this.#since(reads, user, named ?? begun, found)]);
         run.notGiven = notGiven;
         // What he asked for beside his words (`requests.ts`): a turn that answers a new message is told what waits; a swipe or a regenerate,
         // what the earlier attempts at its message were told and the swipe's mode that waits; a continue is told nothing again. Each is one
@@ -811,6 +821,8 @@ export class TurnLane implements TurnPlayer, ChatChanges {
           carry: settings.carry,
           since,
           ...(asked.length > 0 ? { asked } : {}),
+          // The entries the lead itself let go last turn, whose text stands, start this turn as their lines where the user lets its choice stand (`lore.choiceStands`).
+          ...(settings.choiceStands && scene !== null && standingLetGo(scene).length > 0 ? { letGo: standingLetGo(scene) } : {}),
           ...(prefill !== undefined ? { prefill } : {}),
           ...(sampling !== undefined ? { presetSampling: sampling } : {}),
           ...(maxTokens !== undefined ? { replyMaxTokens: maxTokens } : {}),
@@ -822,25 +834,30 @@ export class TurnLane implements TurnPlayer, ChatChanges {
         const timed = storyTime !== null;
         // The feedback is kept with this attempt, so the attempts after it carry it with the one it replaced.
         const kept = typed !== undefined && typed.found !== "none";
-        if (told.length > 0 || asking.length > 0 || timed || kept) {
+        if (told.length > 0 || asking.length > 0 || timed || kept || scene !== null) {
           await this.#d.writes.run((db) => {
             if (told.length > 0) this.#d.since.told(db, user, (named ?? begun).id, told);
             this.#d.requests.tell(db, user, asking.map((r) => r.id), begun.id);
             if (timed) store.updateTurn(begun.id, { storyTime });
             if (kept) db.run("INSERT INTO turn_told (user, turn, kind, body, at) VALUES (?, ?, ?, ?, ?)", [user, begun.id, FEEDBACK_TOLD, JSON.stringify(typed), this.#d.clock.now()]);
+            // The lore the scene's prompts have held, as this turn found it: the turn after it is compared with it.
+            if (scene !== null) this.#d.prompts.keepScene(db, user, begun.id, scene);
           }, "keeping what a turn was told and its story time");
           if (asking.length > 0) this.#d.requests.changed(user, chat);
         }
         // The cast's views for the folder are read now, at the turn's start, beside the Author's first call; the folder awaits them.
         const cast = this.#castFolder(scope, guidance, settings);
         cast.catch(() => undefined);
-        // Each activated entry's text in the lore file is the text the prompt carried, as the door found it there (`TagLore.text`), never
-        // the entry read again: the lore map lists the tag's entries first, in its order. One the check took out, or not found, has none.
-        const lore = activated.map(({ text: _read, ...entry }, i) => {
-          const sent = tagged.lore[i]?.text;
-          return sent === undefined ? entry : { ...entry, text: sent };
+        // The scene's list of activated lore is in the session's cache before the lead's first call, so the briefing names it among the host's files.
+        const cache = scene === null ? null : await this.#sceneFile(scope, guidance, scene, settings);
+        // The turn's lore file names, for each entry that activated, the file of the session's cache that holds its text as the lead reads it
+        // in full: the text itself is written once, there, by RPH. An entry with no such file (it could not be read) is listed without one.
+        const here = new Map((scene?.entries ?? []).flatMap((e) => (e.here ? [[e.id, e] as const] : [])));
+        const lore = activated.map(({ id, title, source, how }): FolderLore => {
+          const e = here.get(id);
+          return { id, title, source, ...(how !== undefined ? { how } : {}), ...(e !== undefined && e.hash !== null ? { tokens: Math.ceil(e.chars / settings.charsPerToken) } : {}), ...(e !== undefined && e.file !== null && cache !== null ? { file: `${cache.folder}${e.file}` } : {}) };
         });
-        ask = { scope, guidance, tagged, messages, request, loreMap, lore, attempts: replaced === null ? [] : this.#attempts(user, chat, replaced, begun.id), cast, received };
+        ask = { scope, guidance, tagged, messages, request, loreMap, lore, ...(cache !== null && cache.path !== null ? { sceneList: cache.path } : {}), attempts: replaced === null ? [] : this.#attempts(user, chat, replaced, begun.id), cast, received };
         lap("kept");
       } catch (error) {
         // The run never began: it ends here, failed, so the turn after it does not wait for it. The throw tells Lumiverse.
@@ -1238,7 +1255,7 @@ export class TurnLane implements TurnPlayer, ChatChanges {
         if (settings.lead === null) throw new Error(await turnErrorWords(this.#d.files, { user, chat }, "no_lead"));
         const found = { steps, notices: lines(notices), guidance, last, again: true, replaced: null, hiddenReadable: settings.hiddenReadable, editedBudget: settings.editedBudget, deleted: { budget: settings.deletedBudget, words: settings.deletedWords }, notAppliedBudget: settings.notAppliedBudget, jobBudget: settings.jobBudget, jobReport: settings.jobReport, tokens: tokenCount(settings.charsPerToken), tell: settings.taps.tell };
         const limits = (): Promise<ModelLimits | null> => this.#leadLimits(scope, settings.lead);
-        const at: BriefingFor = { kind: run.kind, speaker: null, message: null, writing: null, keep: this.#d.prompts.keptFrom(user, turn.id), limits, notGiven: [], cut: { notices: [], clipped: null } };
+        const at: BriefingFor = { kind: run.kind, speaker: null, message: null, writing: null, keep: this.#d.prompts.keptFrom(user, turn.id), limits, notGiven: [], cut: { notices: [], clipped: null }, held: null };
         const [{ blocks: briefing, notGiven }, { items, told }] = await Promise.all([this.#briefing(reads, guidance, scope, at, steps, settings), this.#since(reads, user, turn, found)]);
         run.notGiven = notGiven;
         const asked = lines(notices)?.line("settle_asked");
@@ -1596,8 +1613,9 @@ export class TurnLane implements TurnPlayer, ChatChanges {
    * The briefing's blocks (plan §10.2 block 4): the turn's facts, the lore map, the world state, the cast's views of those on stage,
    * the story so far and the story brief, each laid out by its part and measured by the chat's settings; and what the lead is not given,
    * of its prompt (`at.notGiven`) and of these blocks, told by the notices part. For the turn's folder and its row, the ids of the
-   * entries the lore map names, the entries that activated as the lore map read them, and the story time the turn's facts give, as the
-   * world's clock reads (null where the chat keeps none); and for the run, what the lead was not given.
+   * entries the lore map names, the entries that activated as the lore map read them, the lore the scene's prompts have held as this
+   * turn finds it (null for a run given no prompt), and the story time the turn's facts give, as the world's clock reads (null where
+   * the chat keeps none); and for the run, what the lead was not given.
    */
   async #briefing(
     reads: LumiverseReads,
@@ -1606,7 +1624,7 @@ export class TurnLane implements TurnPlayer, ChatChanges {
     at: BriefingFor,
     steps: readonly LvStep[],
     settings: TurnSettings,
-  ): Promise<{ blocks: ContextBlock[]; loreMap: string[]; activated: ActivatedRead[]; storyTime: number | null; notGiven: NotGiven[] }> {
+  ): Promise<{ blocks: ContextBlock[]; loreMap: string[]; activated: ActivatedRead[]; scene: SceneKept | null; storyTime: number | null; notGiven: NotGiven[] }> {
     const blocks: ContextBlock[] = [];
     const failed: NotGiven[] = [];
     const [factsPart, mapPart] = await Promise.all([guidance.part(PARTS.turnFacts), guidance.part(PARTS.loreMap)]);
@@ -1623,14 +1641,18 @@ export class TurnLane implements TurnPlayer, ChatChanges {
     const scan = world === null ? null : scanSettingsOf((await reads.setting(SCAN_SETTING))?.value);
     const writing = new Set(at.writing === null ? [] : [at.writing]);
     const scanned = scan === null ? [] : scannedSteps(steps, writing, scan.depth);
-    const map = await this.#d.loreIndex.loreMap({
+    const read = await this.#d.loreIndex.loreMap({
       user: scope.user,
       chat: scope.chat,
       turn: scope.turn,
       messages: scanned.map((s) => ({ id: s.id, mark: scanMark(s) })),
       texts: async (ids) => new Map((await reads.messagesById(scope.chat, ids)).map((m) => [m.id, maskWorldInfoScanExclusions(m.text)] as const)),
       ...(scan !== null ? { matching: scan.matching } : {}),
+      // Every line of the map says the size of what it names (plan 3.2 §7.1), counted as every budget of the turn is.
+      tokens: tokenCount(settings.charsPerToken),
     });
+    // How each entry stands against the turn before, and what its lead did with it (plan 3.2 §6.1): the map's lines say it, and the scene's list keeps it.
+    const { map, scene } = at.held === null ? { map: read, scene: null } : await this.#sceneLore(scope, at.held, read, settings);
     if (mapPart?.format === "template") {
       const laid = mapPart.render({ ...loreMapFields(map, await loreLines(guidance)) }).text;
       if (laid.trim() !== "") blocks.push({ name: BLOCKS.loreMap, text: laid.trimEnd() });
@@ -1708,7 +1730,68 @@ export class TurnLane implements TurnPlayer, ChatChanges {
     // What the receipt found of the prompt that is not as the chat application listed it (R-103), each told by its line.
     const cut = cutText(at.cut, notices);
     if (cut !== "") blocks.push({ name: BLOCKS.promptCut, text: cut });
-    return { blocks, loreMap: [...new Set([...map.inPrompt, ...map.world, ...(map.bound ?? [])].map((line) => line.id))], activated: map.activated, storyTime: time?.clock ?? null, notGiven };
+    return { blocks, loreMap: [...new Set([...map.inPrompt, ...map.world, ...(map.bound ?? [])].map((line) => line.id))], activated: map.activated, scene, storyTime: time?.clock ?? null, notGiven };
+  }
+
+  /**
+   * The lore the scene's prompts have held, as this turn finds it (`lore-kept.ts`), and the lore map with it told: each entry of the
+   * prompt with the size of its text as the prompt carried it, how it stands against the turn before on the path, and what that turn's
+   * lead did with it; and the entries that turn's prompt held that this one does not. The turn before is the turn's parent, so a swipe
+   * is compared with what its attempts were. What its lead did is read from the trace its folder keeps: a trace that cannot be read
+   * leaves that unsaid, and the log says which.
+   */
+  async #sceneLore(scope: Scope & { turn: string }, held: NonNullable<BriefingFor["held"]>, map: TurnLoreMap, settings: TurnSettings): Promise<{ map: TurnLoreMap; scene: SceneKept }> {
+    const tokens = (chars: number): number => Math.ceil(chars / settings.charsPerToken);
+    const now = map.activated.map((e, i): HeldLore => {
+      const sent = held.texts[i];
+      return { id: e.id, title: e.title, source: e.source, how: e.how ?? null, hash: sent === undefined ? null : loreHash(sent), chars: sent?.length ?? 0, file: e.whole === undefined ? null : keptLoreFile(e.id, e.whole) };
+    });
+    let before: SceneBefore | null = null;
+    const parent = held.parent;
+    const kept = parent === null ? null : sceneRead(this.#d.prompts.scene(scope.user, scope.chat, parent));
+    if (kept !== null && parent !== null) {
+      let did: Map<string, LeadChoice> | null = null;
+      try {
+        did = leadChoices(await this.#d.kept({ user: scope.user, chat: scope.chat, session: kept.session, turn: parent }), kept.entries.flatMap((e) => (e.here ? [e.id] : [])));
+      } catch (error) {
+        this.#d.log.warn("The trace of the turn before could not be read for what its lead did with the lore, so the lore map says nothing of it.", { chat: scope.chat, turn: parent, error: words(error) });
+      }
+      before = { kept, did };
+    }
+    const scene = sceneOf(scope.session, now, before);
+    const found = new Map(scene.entries.map((e) => [e.id, e] as const));
+    const inPrompt = map.inPrompt.map((line) => {
+      const e = found.get(line.id);
+      if (e === undefined || !e.here) return line;
+      const stood = e.status === "same" || e.status === "changed";
+      const letGo = settings.choiceStands && e.status === "same" && e.lead === "let_go";
+      return { ...line, ...(e.hash !== null ? { tokens: tokens(e.chars) } : {}), ...(e.status !== null && e.status !== "gone" ? { status: e.status } : {}), ...(stood && e.lead !== null ? { before: e.lead } : {}), ...(letGo ? { letGo: true } : {}) };
+    });
+    const gone = scene.entries.flatMap((e) => (e.status === "gone" ? [{ id: e.id, title: e.title, ...(e.hash !== null ? { tokens: tokens(e.chars) } : {}) }] : []));
+    return { map: { ...map, inPrompt, ...(gone.length > 0 ? { gone } : {}) }, scene };
+  }
+
+  /**
+   * Writes the scene's list of activated lore, `ACTIVATED-LORE.md`, in the session's cache folder (plan 3.2 §6.2), laid out by its part
+   * in force for the chat, as RPH's own writer: a file of the host's there, which RPH lists to the lead with the files it keeps itself.
+   * Gives the cache folder as agents read it and the file's path; no path where the part is off or lays out nothing, or the file could
+   * not be written, which the log says: the turn goes on, since the lore map carries the same.
+   */
+  async #sceneFile(scope: Scope & { turn: string }, guidance: Guidance, scene: SceneKept, settings: TurnSettings): Promise<{ folder: string; path: string | null }> {
+    const places = await this.#d.files.places(scope);
+    const folder = `${places.session}${SESSION_CACHE}`;
+    const part = await guidance.part(ACTIVATED_LORE_PART);
+    const text = part?.format === "template" ? part.render(sceneFields(scene, (chars) => Math.ceil(chars / settings.charsPerToken), folder)).text : "";
+    if (text.trim() === "") return { folder, path: null };
+    const path = `${folder}${ACTIVATED_LORE_FILE}`;
+    try {
+      const written = await this.#d.files.write(scope, path, { op: "write", text: `${text.trimEnd()}\n` }, "harness");
+      if (written.status === "written") return { folder, path };
+      this.#d.log.warn("The scene's list of activated lore could not be written in the session's cache.", { chat: scope.chat, turn: scope.turn, status: written.status });
+    } catch (error) {
+      this.#d.log.warn("The scene's list of activated lore could not be written in the session's cache.", { chat: scope.chat, turn: scope.turn, error: words(error) });
+    }
+    return { folder, path: null };
   }
 
   /**

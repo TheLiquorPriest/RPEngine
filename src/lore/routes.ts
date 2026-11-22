@@ -8,7 +8,7 @@ import { type Exactly, type Holds, type Infer, route, shape } from "../app";
 import { JoinedTurnError, type Store } from "../store";
 import { type ActivatedLoreDeps, type ActivatedLoreEntry, activatedLore } from "./activated";
 import { HOWS } from "./lore";
-import { LORE_RECEIPTS, type LoreReceipt } from "./sources";
+import { LORE_RECEIPTS, type LoreHeld, type LoreReceipt } from "./sources";
 
 export const TURN_LORE_PATH = "/api/v1/chats/:chat/turns/:turn/lore";
 
@@ -20,7 +20,7 @@ type HowMirrored = Holds<Exactly<Infer<typeof how>, NonNullable<ActivatedLore["h
 
 const activatedRow = shape.named(
   "TurnLoreRow",
-  "An entry Lumiverse activated for a turn's prompt: its lore map id, its id and its book's id in Lumiverse, its title, how it activated where the turn's tag says, and what RPE's check of the lore on receipt did to it.",
+  "An entry Lumiverse activated for a turn's prompt: its lore map id, its id and its book's id in Lumiverse, its title, how it activated where the turn's tag says, what RPE's check of the lore on receipt did to it, its size, how it stood against the turn before, and what the turn's lead did with it.",
   shape.object({
     id: field(T, "The id the Author's lore map gives the entry: `e-` and its number."),
     entry: field(T, "Lumiverse's id of the entry."),
@@ -31,9 +31,16 @@ const activatedRow = shape.named(
       shape.nullable(shape.oneOf(...LORE_RECEIPTS)),
       "Where the extension applied its own verdict on the secrets and RPE checked the lore on receipt: kept out of the prompt, worded otherwise, or its text not found in the prompt (so RPE's verdict was not applied to it); null where the check left it as it was, or nothing was checked.",
     ),
+    tokens: field(shape.nullable(shape.whole({ least: 0 })), "The size of its text as the prompt carried it, in tokens as the chat counts them; null where its text was not found in the prompt, or the turn kept no list of what its prompt held."),
+    status: field(
+      shape.nullable(shape.oneOf("new", "changed", "same")),
+      "Against the prompt of the turn before it on its path: new to the prompt, its text changed, or as it was; null where that turn kept nothing to compare with (the chat's first turn, or one played before RPE kept any).",
+    ),
+    lead: field(shape.nullable(shape.oneOf("kept", "let_go")), "What the turn's lead did with it by the end of its run: kept it whole in its window, or let it go to one line; null where the turn's trace is not kept."),
   }),
 );
-type RowMirrored = Holds<Exactly<Omit<Infer<typeof activatedRow>, "receipt">, ActivatedLoreEntry>>;
+type RowMirrored = Holds<Exactly<Omit<Infer<typeof activatedRow>, "receipt" | keyof LoreHeld>, ActivatedLoreEntry>>;
+type HeldMirrored = Holds<Exactly<Pick<Infer<typeof activatedRow>, keyof LoreHeld>, LoreHeld>>;
 type ReceiptMirrored = Holds<Exactly<NonNullable<Infer<typeof activatedRow>["receipt"]>, LoreReceipt>>;
 
 export const turnLoreReply = shape.named(
@@ -44,7 +51,7 @@ export const turnLoreReply = shape.named(
 export type TurnLore = Infer<typeof turnLoreReply>;
 
 /** The checks above hold, and are read by no one. */
-export type Mirrors = [HowMirrored, RowMirrored, ReceiptMirrored];
+export type Mirrors = [HowMirrored, RowMirrored, ReceiptMirrored, HeldMirrored];
 
 export interface LoreRoutesDeps extends ActivatedLoreDeps {
   /** RPE's store: whether a turn was joined to another. */
@@ -66,7 +73,10 @@ export function loreRoutes(deps: LoreRoutesDeps) {
         const row = deps.store.user(user).turn(params.turn);
         if (row !== null && row.chat === params.chat && row.joined !== null) throw new JoinedTurnError(params.turn, row.joined);
         const receipt = (await deps.turns.receipt?.(user, params.chat, params.turn)) ?? null;
-        return { entries: (await activatedLore(deps, user, params.chat, params.turn)).map((e) => ({ ...e, receipt: receipt?.get(e.entry) ?? null })) };
+        const held = (await deps.turns.held?.(user, params.chat, params.turn)) ?? null;
+        return {
+          entries: (await activatedLore(deps, user, params.chat, params.turn)).map((e) => ({ ...e, receipt: receipt?.get(e.entry) ?? null, tokens: null, status: null, lead: null, ...held?.get(e.id) })),
+        };
       },
     }),
   ] as const;

@@ -81,8 +81,8 @@ test("an indexing run is given the next batch by name and answered with the batc
 
   await play(b, "I ask where the oil is kept.");
   const [author, indexer, answered] = b.model.requests;
-  // Nothing was indexed yet: the Author's map shows the oil store by its keys, and counts what no run has indexed.
-  expect(textsOf(author)).toContain(`- [${ids.oil}] The oil store (by a key) (not indexed yet; keys: oil)`);
+  // Nothing was indexed yet: the Author's map shows the oil store by its size and its keys, and counts what no run has indexed.
+  expect(textsOf(author)).toMatch(new RegExp(`- \\[${ids.oil}\\] The oil store, \\d+ tokens \\(by a key\\) \\(not indexed yet; keys: oil\\)`));
   expect(textsOf(author)).toContain("3 attached entries are not indexed yet.");
   // The indexer is given every entry with its revision, Lumiverse's own (a new entry's is 1), and its text; the tool answers with what it kept, then the one entry left, with its text.
   expect(textsOf(indexer)).toContain(`### [${ids.oil}] The oil store (from Keeper's Book; revision 1; keys: oil)\n${OIL.content}`);
@@ -96,9 +96,10 @@ test("an indexing run is given the next batch by name and answered with the batc
 
   await play(b, "I go down to see the oil for myself.");
   const map = textsOf(b.model.requests.at(-1));
-  expect(map).toContain(`### In the prompt, each in full, as its text alone with no title or id\n\n- [${ids.oil}] The oil store (place): Where the lamp oil is kept. Defines the oil store (layout).`);
+  // Each line says the size of what it names; the oil store stood in the turn before's prompt too, and the Author kept it whole then.
+  expect(map).toMatch(new RegExp(`### In the prompt, each in full, as its text alone with no title or id\\n\\n- \\[${ids.oil}\\] The oil store \\(place\\), \\d+ tokens: Where the lamp oil is kept\\. Defines the oil store \\(layout\\)\\.[^\\n]*\\(by a key\\) \\(as last turn\\) \\(you kept it whole last turn\\)`));
   expect(map).toContain(`### Changed by the story\n\n- [${ids.oil}] The oil store: The flood moved the barrels to the boathouse.`);
-  expect(map).toContain(`### Not in the prompt, but bound to who and what is at hand\n\n- [${ids.oath}] The courier's oath (rule): What every courier swears. Bound to Wren.`);
+  expect(map).toMatch(new RegExp(`### Not in the prompt, but bound to who and what is at hand\\n\\n- \\[${ids.oath}\\] The courier's oath \\(rule\\), \\d+ tokens: What every courier swears\\. Bound to Wren\\.`));
   expect(map).toContain("1 attached entries are not indexed yet.");
 });
 
