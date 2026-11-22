@@ -101,6 +101,22 @@ describe("the scene digest", () => {
     await t.play([{ part: "scene", item: null, value: { title: "The ford" } }]);
     const digest = sceneDigest({ store: t.store, user: USER, chat: CHAT, turn: null, layout, shownFrom: null });
     expect(digest).toEqual({ text: "", fields: {} });
-    expect(layout.render({ none: true }).text.trim()).toBe("No scene stands before this one in the story record, and nothing of this scene lies before the messages you were handed.");
+    expect(layout.render({ none: true }).text.trim()).toBe("No scene stands before this one in the story record, and the record places none of this scene's messages before the ones you were handed.");
+  });
+
+  test("the messages of this scene before the ones handed over are named where no beat is recorded for them", async () => {
+    const t = await openTable();
+    // A scene that opens with no beat, then two exchanges with none either, then one with a beat.
+    await t.play([{ part: "scene", item: null, value: { title: "The mill" } }]);
+    await t.play([]);
+    await t.play([]);
+    await t.play([{ part: "beat", item: null, value: { text: "The wheel turns once, by itself." } }]);
+    const start = t.record().startOf(t.record().of("scene")[0]!);
+    expect(start).not.toBeNull();
+    const digest = sceneDigest({ store: t.store, user: USER, chat: CHAT, turn: null, layout, shownFrom: start! + 3 });
+    expect(digest.fields.earlier).toEqual({ from: start!, to: start! + 2, items: [] });
+    expect(digest.text).toContain(`### Earlier in this scene, messages ${start} to ${start! + 2}`);
+    expect(digest.text).toContain("These came before the messages you were handed, and no beat is recorded for them. chat_read reads them.");
+    expect(digest.text).not.toContain("No scene stands before this one");
   });
 });

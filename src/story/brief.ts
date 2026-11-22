@@ -90,15 +90,19 @@ export function storyBrief(point: StoryPoint & { layout: StorySoFarInput["layout
 export type SceneDigestFields = {
   /** The scene before the open one, by what the record holds of it: its id, its title, the messages it spans (`span`, where the record places both ends) and its summary where one is written. */
   before?: JsonObject;
-  /** The beats of the open scene that lie before the messages the agent is handed, oldest first, with the messages they span. */
-  earlier?: { from: number; to: number; items: JsonObject[] };
+  /**
+   * The messages of the open scene that lie before the ones the agent is handed, named whether or not a beat is recorded for them,
+   * with the beats that lie there, oldest first; `recorded` where there is any.
+   */
+  earlier?: { from: number; to: number; items: JsonObject[]; recorded?: true };
 };
 
 /**
  * The scene digest (plan 3.2 §6.6): what stands in for the messages of the scene an agent is not handed. The scene before the open
- * one by its title and the summary the record holds, and the open scene's own beats that lie before `shownFrom`, the first message
- * the agent is handed (null: it is handed the whole scene, and no beat is listed). Code writes no summary: a scene with none
- * recorded is given by its title alone, and the layout says so. Empty text when the record holds neither.
+ * one by its title and the summary the record holds, and the messages of the open scene that lie before `shownFrom`, the first
+ * message the agent is handed (null: it is handed the whole scene), with the beats recorded for them: the stretch is named even where
+ * no beat is, so that an agent is never told nothing lies there. Code writes no summary: a scene with none recorded is given by its
+ * title alone, and the layout says so. Empty text when the record holds neither.
  */
 export function sceneDigest(point: StoryPoint & { layout: StorySoFarInput["layout"]; shownFrom: number | null }): { text: string; fields: SceneDigestFields } {
   const record = readAt(point);
@@ -119,7 +123,7 @@ export function sceneDigest(point: StoryPoint & { layout: StorySoFarInput["layou
       const at = record.beatAt(beat);
       return at !== null && at >= start && at < point.shownFrom! && typeof beat.fields.text === "string" ? [{ id: beat.id, text: beat.fields.text, message: at }] : [];
     });
-    if (items.length > 0) fields.earlier = { from: start, to: point.shownFrom - 1, items };
+    fields.earlier = { from: start, to: point.shownFrom - 1, items, ...(items.length > 0 ? { recorded: true as const } : {}) };
   }
   if (Object.keys(fields).length === 0) return { text: "", fields };
   return { text: point.layout.render(fields).text.trimEnd(), fields };

@@ -81,7 +81,7 @@ test("a delegated GM's first request holds the scene in full with its map, what 
   expect(gm).toMatch(/- actions: \d+ entries, \d+ tokens/);
   expect(gm).not.toContain('{\\"ruleset\\":');
   // The digest: no scene stands before this one, and the whole of it is in the messages handed over.
-  expect(gm).toContain("No scene stands before this one in the story record, and nothing of this scene lies before the messages you were handed.");
+  expect(gm).toContain("No scene stands before this one in the story record, and the record places none of this scene's messages before the ones you were handed.");
   // One call reads a part of the ruleset whole: its answer is in the GM's next request.
   const read = b.model.requests.map((r) => JSON.stringify(r.messages)).find((sent) => sent.includes("You are the GM, at this table") && sent.includes('{\\"ruleset\\":{\\"actions\\":['));
   expect(read).toBeDefined();
