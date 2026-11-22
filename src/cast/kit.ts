@@ -137,7 +137,7 @@ export const CAST_START_DEFS = {
     none: "all of it, on every start",
     perConnection: false,
     name: "Newest perceptions a character starts with",
-    about: "Tokens of what a character has perceived and not yet taken in that its own agent is handed whole when it starts, the newest first. Nothing is cut to fit: what passes this waits whole, counted in a line with its size and listed in the character's outline, and the character opens it with self_read. None: all of it is handed over on every start, however much waits.",
+    about: "Tokens of what a character has perceived and not yet taken in that its own agent is handed whole when it starts, the newest first. Nothing is cut to fit: what passes this waits whole, counted in a line with its size and listed in the character's outline, and the character opens it with self_read. An agent whose definition holds no self_read is handed all of it, since it could not open what waits. None: all of it is handed over on every start, however much waits.",
     effect: "turn",
   },
   importedTokens: {
@@ -148,7 +148,7 @@ export const CAST_START_DEFS = {
     none: "every one whole, on every start",
     perConnection: false,
     name: "Old mind files a character starts with",
-    about: "Tokens of a migrated character's old mind files, not yet filed, that its own agent is handed whole when it starts, in the order they were carried. As shipped none is: each is listed by its name and size, and the character opens one with self_read. None: every one is handed over whole on every start.",
+    about: "Tokens of a migrated character's old mind files, not yet filed, that its own agent is handed whole when it starts, in the order they were carried. As shipped none is: each is listed by its name and size, and the character opens one with self_read. An agent whose definition holds no self_read is handed every one whole, since it could not open them. None: every one is handed over whole on every start.",
     effect: "turn",
   },
 } as const satisfies Record<keyof CastStart, Setting>;

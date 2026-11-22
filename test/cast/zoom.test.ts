@@ -341,11 +341,12 @@ describe("what a character's own agent starts with", () => {
     expect(folded).toEndWith("self_read reads all of it: part game-side.");
     expect(folded).not.toContain("- tier: Leads");
     expect(folded).toContain("Where: The Common Room, ");
-    // For anyone else it is whole whatever the size, and so it is by a layout that has no folded part.
+    // For anyone else it is whole whatever the size, and so it is by a layout that has no folded part, and for her own agent where its start sets no size (an agent with no self_read to open it).
     expect(await side({ own: own({ foldTokens: 20 }) })).toBe(whole);
     const part = layouts["game-side"];
     const older: Layout = { render: (fields) => part?.render({ ...fields, folded: undefined }) ?? { text: "" } };
     expect(await side({ own: { ...own({ foldTokens: 20 }), plays: "Wren" }, layouts: { "game-side": older } })).toBe(whole);
+    expect(await side({ own: { ...own({ foldTokens: null }), plays: "Wren" } })).toBe(whole);
 
     // Her own reading opens all of it, and by gist gives it by name and count.
     const all = dataOf(await b.call("self_read", { part: "game-side" }, null, WREN))["game-side"] as JsonObject;
