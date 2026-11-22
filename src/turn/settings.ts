@@ -53,7 +53,7 @@ import { WORLD_STATE_DEFAULTS, WORLD_STATE_SETTING_DEFS, type WorldStateSettings
 import { TAP_DEFAULTS, TAP_SETTINGS, type TapSettings, tapSettingsRead } from "../play/settings";
 import { PLACES_DEFAULTS, PLACES_SETTING_DEFS, type PlacesSettings } from "../places";
 import { QUESTS_DEFAULTS, QUESTS_SETTING_DEFS, type QuestsSettings } from "../quests/settings";
-import { STORY_DEFAULTS, STORY_SETTING_DEFS, STORY_SO_FAR_SETTING_DEFS, type StorySettings } from "../story";
+import { STORY_DEFAULTS, STORY_SETTING_DEFS, STORY_SETTINGS_RETIRED, STORY_SO_FAR_SETTING_DEFS, type StorySettings } from "../story";
 import { STORY_SO_FAR_DEFAULTS, type StorySoFarSettings } from "../story/sofar";
 import { WINDOW_DEFAULTS, type WindowSettings } from "../story/window";
 import { sharedLevels } from "../tree";
@@ -490,6 +490,7 @@ export function jobsPage(read: ConfigRead): { default: number; most: number } {
 /** The turn's settings for a scope, as its levels' config files set them over the defaults. */
 export async function turnSettings(files: FilesPort, scope: Scope, log: Log): Promise<TurnSettings> {
   const read = readConfig(await portTexts(files, scope), log, [...TURN_SETTINGS, LEAD]);
+  read.retired(STORY_SETTINGS_RETIRED);
   const previousRun = read.value(DEFS.previousRun) as number | null;
   // Each value is one its setting takes, so it is of the type the setting's `takes` says.
   return {

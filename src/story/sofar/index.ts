@@ -1,7 +1,7 @@
 // The story so far (plan §8.1): what the briefing shows for the history the window leaves out of the
 // prompt, drawn from the story record. It prints what the Author wrote, in the chat's order, each
 // part with the messages it stands for: scene summaries, and the beats themselves wherever no scene
-// summary covers them yet. Its size is a share of the Author's window with a floor. The newest
+// summary covers them yet. Its size is a setting (`story.soFar.tokens`), the same on every model. The newest
 // stretches are given whole; when the rest does not fit, what is furthest back goes by its
 // chapter's summary, and where there is none, by a line that counts what was not shown. Code picks
 // nothing by meaning and writes no words: the layout and every word around the record's own text
@@ -41,21 +41,17 @@ export interface StoryRecordParts {
 }
 
 export interface StorySoFarSettings {
-  /** The share of the Author's window it may fill. */
-  share: number;
-  /** The fewest tokens it may fill, however small the window. */
-  floor: number;
+  /** The most tokens it may fill. */
+  tokens: number;
 }
 
-/** Appendix D.1: one twentieth of the Author's window, and not less than 6,000 tokens. */
-export const STORY_SO_FAR_DEFAULTS: StorySoFarSettings = { share: 1 / 20, floor: 6000 };
+/** 16,000 tokens, whatever the Author's window: what is left out is counted in the block and opened with `story_query`. */
+export const STORY_SO_FAR_DEFAULTS: StorySoFarSettings = { tokens: 16000 };
 
 export interface StorySoFarInput {
   record: StoryRecordParts;
   /** The place in the chat of the first message the window keeps; null when it keeps every message, so there is nothing to show. */
   keptFrom: number | null;
-  /** The Author's window in tokens, as the model layer reports it. */
-  contextWindow: number;
   settings: StorySoFarSettings;
   /** Counts a text's tokens the way the caller measures the briefing. */
   tokens: (text: string) => number;
@@ -102,10 +98,6 @@ interface Unit {
 
 /** How a unit is shown: whole, by its chapter's summary, or counted in a line of what was left out. */
 type Level = 2 | 1 | 0;
-
-export function storySoFarBudget(contextWindow: number, settings: StorySoFarSettings): number {
-  return Math.max(settings.floor, Math.floor(contextWindow * settings.share));
-}
 
 function unitsOf(record: StoryRecordParts, keptFrom: number): Unit[] {
   const scenes = record.scenes.filter((s) => s.from < keptFrom);
@@ -215,7 +207,7 @@ function furthest(low: number, high: number, holds: (n: number) => boolean): num
  * halving: the block is laid out and counted a few times however long the chat, never once per unit.
  */
 export function storySoFar(input: StorySoFarInput): StorySoFar {
-  const budget = storySoFarBudget(input.contextWindow, input.settings);
+  const budget = input.settings.tokens;
   if (input.keptFrom === null) return { text: "", tokens: 0, budget, leftOut: [] };
   const units = unitsOf(input.record, input.keptFrom);
   if (units.length === 0) return { text: "", tokens: 0, budget, leftOut: [] };

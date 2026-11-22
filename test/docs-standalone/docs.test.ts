@@ -242,8 +242,8 @@ describe("the standalone docs", () => {
       "history.step": ["The window's step", null],
       "history.hold.on": ["Hold a message in the prompt until the record covers it", false],
       "history.hold.maxMessages": ["Hold a message in the prompt until the record covers it", 40],
-      "story.soFar.share": ["The story so far, in the briefing", 0.05],
-      "story.soFar.minTokens": ["The story so far, in the briefing", 6000],
+      // Plan 3.2 section 6.7 gave the row one size in tokens, in place of D.1's share of the window and its floor.
+      "story.soFar.tokens": ["The story so far, in the briefing", 16000],
       "worldState.tokens": ["World state: everything else", 4000],
       "map.laidFeet": ["A grid laid in play", 5],
       "map.roundSeconds": ["A grid laid in play", 6],

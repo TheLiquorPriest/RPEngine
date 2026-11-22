@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadGuidance, type TemplatePart } from "../../../src/app/guidance";
 import { createFolderHost } from "rp-harness/hosts/folder";
-import { STORY_SO_FAR_DEFAULTS, storySoFar, storySoFarBudget, type StoryBeat, type StoryRecordParts } from "../../../src/story/sofar/index";
+import { STORY_SO_FAR_DEFAULTS, storySoFar, type StoryBeat, type StoryRecordParts } from "../../../src/story/sofar/index";
 
 const SHIPPED_PART = resolve(import.meta.dir, "../../../guidance/.prompts/story-so-far.md");
 
@@ -39,8 +39,8 @@ function beats(from: number, to: number): StoryBeat[] {
 }
 
 const record = (over: Partial<StoryRecordParts>): StoryRecordParts => ({ chapters: [], scenes: [], beats: [], ...over });
-const roomy = { contextWindow: 1_000_000, settings: STORY_SO_FAR_DEFAULTS, tokens };
-const tight = (floor: number) => ({ contextWindow: 0, settings: { share: STORY_SO_FAR_DEFAULTS.share, floor }, tokens });
+const roomy = { settings: { tokens: 50_000 }, tokens };
+const tight = (most: number) => ({ settings: { tokens: most }, tokens });
 
 describe("the story so far", () => {
   test("prints the beats themselves where there is no summary, each with its message, and only for what the window leaves out", () => {
@@ -136,7 +136,7 @@ describe("the story so far", () => {
 
     // A chat carried over from today's build: beats and no scenes, far more than fit.
     const all = beats(0, 3999);
-    const out = storySoFar({ record: record({ beats: all }), keptFrom: 4000, layout, contextWindow: 1_000_000, settings: STORY_SO_FAR_DEFAULTS, tokens: counting });
+    const out = storySoFar({ record: record({ beats: all }), keptFrom: 4000, layout, settings: roomy.settings, tokens: counting });
     expect(counted).toBeLessThanOrEqual(few(all.length));
     expect(out.tokens).toBeLessThanOrEqual(out.budget);
     const shown = all.filter((b) => out.text.includes(`- Message ${b.at}:`)).map((b) => b.at);
@@ -153,9 +153,14 @@ describe("the story so far", () => {
     expect(summed.leftOut).toEqual([expect.objectContaining({ from: 0, chapters: expect.any(Number) })]);
   });
 
-  test("its size is a share of the Author's window, never below the floor", () => {
-    expect(storySoFarBudget(200_000, STORY_SO_FAR_DEFAULTS)).toBe(10_000);
-    expect(storySoFarBudget(32_000, STORY_SO_FAR_DEFAULTS)).toBe(6_000);
+  test("its size is its setting's, whatever the model: as shipped a long chat's block stays within 16,000 tokens and counts what it left out", () => {
+    const out = storySoFar({ record: record({ beats: beats(0, 3999) }), keptFrom: 4000, layout, settings: STORY_SO_FAR_DEFAULTS, tokens });
+    expect(out.budget).toBe(16_000);
+    expect(out.tokens).toBeLessThanOrEqual(16_000);
+    expect(out.tokens).toBeGreaterThan(12_000);
+    expect(out.text).toContain("- Message 3999: Beat 3999:");
+    expect(out.leftOut).toEqual([expect.objectContaining({ from: 0, beats: expect.any(Number) })]);
+    expect(out.text).toContain("Not shown");
   });
 
   test("a beat that stands for a stretch is printed with its range, and a summary whose messages were deleted says so where its turn stands", () => {

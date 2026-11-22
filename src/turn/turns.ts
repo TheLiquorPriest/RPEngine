@@ -45,7 +45,7 @@ import { type ChangeRow, clockRecorded, type DueSource, type MapText, type PathR
 import { aboutOf } from "../store/fold";
 import { type SceneSession, sceneSession, storyBrief, storyCoverage, storyRecordParts } from "../story";
 import { storyAt } from "../story/path";
-import { type StorySoFar, storySoFar, storySoFarBudget } from "../story/sofar";
+import { type StorySoFar, storySoFar } from "../story/sofar";
 import { type ChatFolders, mergeTurnRecord, type Pruned, RPE_GUIDANCE, type TreeChats, type TreeFiles, type TreeNotes, turnFolderName, type TurnRecordMessage, type TurnRecordTokens } from "../tree";
 import { changeSaid } from "./card-words";
 import { type Attempt, type AttemptFeedback, type CastFolder, type FolderAsk, writeAlongside } from "./folder";
@@ -1085,18 +1085,17 @@ export class TurnLane implements TurnPlayer, ChatChanges {
 
   /**
    * The story so far at the chat's head, as the next briefing lays it out (the Story page's route): for the history the latest prompt's
-   * window left out, by the part `story-so-far` in force for the chat, within its share of the lead's window. Empty where the window left
+   * window left out, by the part `story-so-far` in force for the chat, within the size its setting gives it. Empty where the window left
    * nothing out, the part is off, or RPE is not set up for a Lumiverse to read the chat's path from.
    */
   async soFarAt(user: string, chat: string): Promise<StorySoFar> {
     const scope = { user, chat, session: NO_SESSION };
     const [settings, part, { edge }] = await Promise.all([turnSettings(this.#d.files, scope, this.#d.log), loadGuidance(this.#d.files, scope).part(PARTS.storySoFar), this.windowOf(user, chat)]);
-    const window = this.#leadWindow(await this.#leadLimits(scope, settings.lead), settings.lead, null);
     const reads = this.#d.reads();
     const steps = edge === null || reads === null ? null : await reads.path(chat);
     const kept = steps === null ? -1 : steps.findIndex((s) => s.id === edge);
-    if (part?.format !== "template" || kept <= 0) return { text: "", tokens: 0, budget: storySoFarBudget(window, settings.storySoFar), leftOut: [] };
-    return storySoFar({ record: storyRecordParts({ store: this.#d.store, user, chat, turn: null }), keptFrom: kept, contextWindow: window, settings: settings.storySoFar, tokens: tokenCount(settings.charsPerToken), layout: part });
+    if (part?.format !== "template" || kept <= 0) return { text: "", tokens: 0, budget: settings.storySoFar.tokens, leftOut: [] };
+    return storySoFar({ record: storyRecordParts({ store: this.#d.store, user, chat, turn: null }), keptFrom: kept, settings: settings.storySoFar, tokens: tokenCount(settings.charsPerToken), layout: part });
   }
 
   /**
@@ -1687,7 +1686,7 @@ export class TurnLane implements TurnPlayer, ChatChanges {
       const soFar =
         keptFrom === null
           ? null
-          : storySoFar({ record: storyRecordParts(point), keptFrom, contextWindow: this.#leadWindow(await at.limits(), settings.lead, scope.turn), settings: settings.storySoFar, tokens: tokenCount(settings.charsPerToken), layout: soFarPart });
+          : storySoFar({ record: storyRecordParts(point), keptFrom, settings: settings.storySoFar, tokens: tokenCount(settings.charsPerToken), layout: soFarPart });
       if (soFar !== null && soFar.text.trim() !== "") blocks.push({ name: BLOCKS.storySoFar, text: soFar.text.trimEnd() });
     }
     if (briefPart?.format === "template") {
@@ -1757,14 +1756,6 @@ export class TurnLane implements TurnPlayer, ChatChanges {
       this.#d.log.info("The lead's model's limits could not be read: its window is taken as unknown, and it is given no pictures.", { chat: scope.chat, turn: scope.turn ?? null, lead, error: words(error) });
       return null;
     }
-  }
-
-  /** The lead's window in tokens, from its model's limits; where nobody can tell it, 0, so the story so far is given its floor, and the log says so. */
-  #leadWindow(limits: ModelLimits | null, lead: string | null, turn: string | null): number {
-    const window = limits?.contextWindow ?? null;
-    if (window !== null) return window.tokens;
-    this.#d.log.info("The lead's window is not known, so the story so far is given its floor.", { turn, lead });
-    return 0;
   }
 
   /**

@@ -342,8 +342,7 @@ The story record, the characters' memories, places, quests and the world state t
 | `story.nearMatches` | `5` | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Near ids listed: How many near ids an answer about an id the story record does not hold lists. |
 | `story.nearDistance` | `0.25` | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Spelling distance of a near id: How far off in spelling an id may be and still be listed as a near one, as a part of its length: 0.25 lets a quarter of its letters differ. |
 | `story.ahead` | `2` | RPE-global.yml | from RPE's next start | beyond Appendix D.1, for the owner's approval | Messages ahead of a turn: Messages the chat is taken to grow by before the next turn's prompt (this turn's reply and your next message), where the story record is measured. |
-| `story.soFar.share` | `0.05` | RPE-global.yml or a chat's RPE.yml | from the next turn | Appendix D.1: The story so far, in the briefing | The story so far: share of the window: The share of the Author's window the briefing's story so far may fill. |
-| `story.soFar.minTokens` | `6000` tokens | RPE-global.yml or a chat's RPE.yml | from the next turn | Appendix D.1: The story so far, in the briefing | The story so far: fewest tokens: The fewest tokens the briefing's story so far may fill, however small the window. |
+| `story.soFar.tokens` | `16000` tokens | RPE-global.yml or a chat's RPE.yml | from the next turn | Appendix D.1: The story so far, in the briefing | The story so far: tokens: The most tokens the briefing's story so far may fill, on every model. What does not fit is counted in the block, and the Author opens it with story_query. |
 
 ### Characters and their memories
 

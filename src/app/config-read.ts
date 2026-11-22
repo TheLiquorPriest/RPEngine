@@ -229,6 +229,18 @@ export class ConfigRead {
     }
   }
 
+  /**
+   * Keys RPE read once and reads no longer (`gone`: each with what took its place). A file that still
+   * sets one is read as before: the value there is passed over, and the log names the key, the file
+   * and what to set now.
+   */
+  retired(gone: Readonly<Record<string, string>>): void {
+    for (const [key, now] of Object.entries(gone))
+      for (const l of this.levels)
+        for (const set of valueAtPattern(l.config, key.split(".")))
+          this.#pass(`${set.key}\n${l.file}`, "A config file sets a key RPE reads no longer; the value there is passed over.", { setting: set.key, value: set.value, file: l.file, why: now });
+  }
+
   #pass(once: string, message: string, fields: Record<string, JsonValue>): void {
     if (this.#log === null || this.#logged.has(once)) return;
     this.#logged.add(once);
