@@ -32,6 +32,8 @@ import { bootstrapSettings } from "./settings";
 export const BOOTSTRAP_SKILL = "bootstrap";
 /** What the player chose when starting the job, and its token limit, by the name its agents are given it. */
 export const BOOTSTRAP_JOB = "bootstrap:job";
+/** The purpose the bootstrap's job is started for (plan 3.2 §6.3): what its use is counted under, and the list of the lead's definition for it, where it has one. */
+export const BOOTSTRAP_PURPOSE = "bootstrap";
 /** The six facts of "done enough", by the name its agents are given them. */
 export const BOOTSTRAP_FACTS = "bootstrap:facts";
 
@@ -303,6 +305,7 @@ export class BootstrapJobs {
           agent: lead,
           brief: skill?.body ?? "",
           attach: [BOOTSTRAP_JOB, BOOTSTRAP_FACTS],
+          for: BOOTSTRAP_PURPOSE,
           limits: { askAt: given.tokenLimit, ...(settings.runCalls === null ? {} : { calls: settings.runCalls }), ...(settings.runTime === null ? {} : { time: settings.runTime }) },
         });
       } catch (error) {

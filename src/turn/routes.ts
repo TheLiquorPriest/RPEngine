@@ -278,7 +278,12 @@ export function turnRoutes(deps: TurnRoutesDeps) {
       gapChecks: toldRows(db, user, "gap-check", of).map((r) => ({ check: r.body, at: r.at })),
       consents: toldRows(db, user, "consent", of).map((r) => ({ grant: r.body, at: r.at })),
       rules: toldRows(db, user, "rule", of).map((r) => ({ firing: r.body, at: r.at })),
-      attachments: other.flatMap((t) => (t.kind === "attachments" && isRecord(t.body) ? [{ agent: t.body.agent as AgentRef, refs: (t.body.refs ?? []) as JsonValue, at: t.at }] : [])),
+      attachments: other.flatMap((t) => {
+        if (t.kind !== "attachments" || !isRecord(t.body)) return [];
+        // The purpose its start named is kept in the moment RPH told; a record from before purposes has none.
+        const purpose = isRecord(t.body.moment) && typeof t.body.moment.purpose === "string" ? t.body.moment.purpose : undefined;
+        return [{ agent: t.body.agent as AgentRef, refs: (t.body.refs ?? []) as JsonValue, ...(purpose !== undefined ? { purpose } : {}), at: t.at }];
+      }),
       dropped: other.flatMap((t) => (t.kind === "dropped" && isRecord(t.body) ? [{ agent: t.body.agent as AgentRef, at: t.at }] : [])),
     };
   };

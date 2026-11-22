@@ -147,6 +147,7 @@ export function TurnTold(props: { told: Told }) {
             {told.attachments.map((a, i) => (
               <li key={`a${i}`}>
                 {agentWords(a.agent)} was given {valueWords(a.refs)}
+                {a.purpose === undefined ? null : <span data-purpose={a.purpose}>, for {a.purpose}</span>}
               </li>
             ))}
             {told.dropped.map((d, i) => (

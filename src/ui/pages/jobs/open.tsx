@@ -104,6 +104,12 @@ function JobShown(props: Omit<JobOpenProps, "id"> & { job: JobView }) {
           {job.agent}
         </Button>{" "}
         <span class="rpe-meta">{chat === "~jobs" ? "no chat" : `chat ${chat}`}</span>
+        {job.for === undefined ? null : (
+          <span class="rpe-meta" data-job-for={job.for}>
+            {` · started for ${job.for}`}
+            {job.leave === undefined || job.leave.length === 0 ? "" : `, leaving out ${job.leave.join(", ")}`}
+          </span>
+        )}
       </p>
       {bootstrap ? <BootstrapBrief job={job} /> : <p class="rpe-line" data-brief>{job.brief}</p>}
       <p class="rpe-meta">

@@ -1,15 +1,17 @@
-// The Agents page's route of what each agent is given by name (plan §14, the Agents row: "what each is given"; §5.4 `given:`): for a
-// chat, every definition in force with each name its `given:` lists, the kind of thing the name is (RPH's own: a file, a stretch of the
-// chat, a lore entry, a slice of the prompt; or one of RPE's views: of the world, the story, the cast, the turn, the lore index, the
-// ruleset, the map, or a view another area adds), and whether RPE gives it at the chat's newest turn, read through the resolver the
-// turn uses (`givenViews`), so a name nothing provides is listed as missing. RPH's own kinds are found by RPH at the run: they are
-// shown as its, never read here.
+// The Agents page's route of what each agent is given by name (plan §14, the Agents row: "what each is given"; §5.4 `given:`; plan 3.2
+// §6.3, purposes): for a chat, every definition in force with each name its `given:` lists and each name of each purpose it has
+// (`purposes:`), the kind of thing the name is (RPH's own: a file, a stretch of the chat, a lore entry, a slice of the prompt; or one of
+// RPE's views: of the world, the story, the cast, the turn, the lore index, the ruleset, the map, or a view another area adds), and
+// whether RPE gives it at the chat's newest turn and how large it is there, read through the resolver the turn uses (`givenViews`) as
+// a preview, so nothing is kept of the reading and a name nothing provides is listed as missing. RPH's own kinds are found by RPH at
+// the run: they are shown as its, never read or measured here.
 
 import type { AgentRef } from "rp-harness/contract";
 import { route, RouteError, shape } from "../app";
 import type { Turns } from "./lane";
 import { CARRIED_SESSION, type RunRecord } from "./runs";
-import { NO_SESSION } from "./turns";
+import { turnSettings } from "./settings";
+import { NO_SESSION, tokenCount } from "./turns";
 
 const T = shape.text();
 
@@ -29,17 +31,25 @@ function kindOf(ref: string): GivenKind {
 
 const givenName = shape.named(
   "GivenName",
-  "A name a definition's `given:` lists: what kind of thing it is, who finds it (RPH its own kinds, RPE its views), and whether RPE gives it at the chat's newest turn (null for RPH's, found at the run).",
-  shape.object({ name: T, kind: shape.oneOf(...GIVEN_KINDS), by: shape.oneOf("rph", "rpe"), found: shape.nullable(shape.yesNo()) }),
+  "A name a definition's `given:`, or one of its purposes, lists: what kind of thing it is, who finds it (RPH its own kinds, RPE its views), whether RPE gives it at the chat's newest turn (null for RPH's, found at the run), and its size there in tokens, at the chat's characters to a token (null for RPH's and for a name nothing provides).",
+  shape.object({ name: T, kind: shape.oneOf(...GIVEN_KINDS), by: shape.oneOf("rph", "rpe"), found: shape.nullable(shape.yesNo()), tokens: shape.nullable(shape.number()) }),
 );
 
 const givenReply = shape.named(
   "GivenReply",
-  "What each agent definition in force for a chat is given by name, read at the chat's newest turn (null: it has none yet), and the names of RPE's that nothing provides.",
+  "What each agent definition in force for a chat is given by name, for a start that names no purpose (`given`) and for each purpose a start may name (`purposes`: each with what the definition hands a start for it in place of `given`), read at the chat's newest turn (null: it has none yet) with each name's size there, and the names of RPE's that nothing provides.",
   shape.object({
     chat: T,
     turn: shape.nullable(T),
-    definitions: shape.list(shape.object({ name: T, off: shape.yesNo(), given: shape.list(givenName), missing: shape.list(T) })),
+    definitions: shape.list(
+      shape.object({
+        name: T,
+        off: shape.yesNo(),
+        given: shape.list(givenName),
+        purposes: shape.list(shape.object({ name: T, given: shape.list(givenName) })),
+        missing: shape.list(T),
+      }),
+    ),
   }),
 );
 
@@ -65,20 +75,28 @@ export function givenRoutes(turns: Turns) {
         const turn = run?.turn ?? null;
         const scope = run === null ? { user, chat: params.chat, session: NO_SESSION } : { user, chat: params.chat, session: run.session, turn: run.turn };
         const definitions = await turns.harness.definitions.list(scope);
+        const tokens = tokenCount((await turnSettings(turns.files, scope, turns.env.log)).charsPerToken);
         return {
           chat: params.chat,
           turn,
           definitions: await Promise.all(
             definitions.map(async (d) => {
               const agent: AgentRef = { id: d.name, definition: d.name };
-              const ours = d.given.filter((name) => RPH_KINDS[kindOf(name)] !== true);
-              const read = new Map((await turns.given(scope, agent, ours, { task: "" })).map((g) => [g.ref, g.text]));
-              const given = d.given.map((name) => {
+              const purposes = Object.entries(d.purposes ?? {});
+              const named = [...new Set([...d.given, ...purposes.flatMap(([, names]) => names)])];
+              const ours = named.filter((name) => RPH_KINDS[kindOf(name)] !== true);
+              // Read as a preview: nobody is started, so nothing is kept of it (the indexer's batch is held for no one).
+              const read = new Map((await turns.given(scope, agent, ours, { task: "", preview: true })).map((g) => [g.ref, g.text]));
+              const shown = (name: string) => {
                 const kind = kindOf(name);
                 const rph = RPH_KINDS[kind] === true;
-                return { name, kind, by: rph ? ("rph" as const) : ("rpe" as const), found: rph ? null : (read.get(name) ?? null) !== null };
-              });
-              return { name: d.name, off: d.off, given, missing: given.flatMap((g) => (g.found === false ? [g.name] : [])) };
+                const text = rph ? null : (read.get(name) ?? null);
+                return { name, kind, by: rph ? ("rph" as const) : ("rpe" as const), found: rph ? null : text !== null, tokens: text === null ? null : tokens(text) };
+              };
+              const given = d.given.map(shown);
+              const byPurpose = purposes.map(([name, names]) => ({ name, given: names.map(shown) }));
+              const missing = [...new Set([...given, ...byPurpose.flatMap((p) => p.given)].flatMap((g) => (g.found === false ? [g.name] : [])))];
+              return { name: d.name, off: d.off, given, purposes: byPurpose, missing };
             }),
           ),
         };
