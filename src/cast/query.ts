@@ -49,7 +49,8 @@ function castList(call: CastCall, reading: CastReading, reply: Reply): Reply {
 
 async function query(args: JsonObject, call: CastCall): Promise<Reply> {
   const reply = call.reply();
-  const unreadable = (field: string, value: JsonValue | undefined, choices: readonly JsonValue[] = []): Reply => reply.line("unreadable", { field, value: JSON.stringify(value), choices }).fail();
+  // The choices go in as one list in words: a list of values would say the sentence once for each.
+  const unreadable = (field: string, value: JsonValue | undefined, choices: readonly JsonValue[] = []): Reply => reply.line("unreadable", { field, value: JSON.stringify(value), choices: textOf(choices) }).fail();
   const part = args.part;
   if (part !== undefined && !(QUERY_PARTS as readonly JsonValue[]).includes(part)) return unreadable("part", part, QUERY_PARTS);
   for (const field of ["who", "with", "words"]) if (args[field] !== undefined && typeof args[field] !== "string") return unreadable(field, args[field]);

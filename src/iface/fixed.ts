@@ -58,11 +58,14 @@ export function foundOr(reading: Reading, reply: Reply, field: string, said: Jso
 /** The tree's own name for the world's ruleset part, which `world_query` also reads. */
 export const RULESET_POINT = "ruleset";
 
+/** How `world_query` gives a point where no depth is said (plan 3.2 §7.1): by its gist, the point with one line on what is beneath it, or whole, everything beneath it. */
+const WORLD_HOWS = ["gist", "whole"] as const;
+
 export const WORLD_QUERY: ToolSpec = {
   name: "world_query",
   family: "state",
   tier: "read",
-  properties: { at: TEXT, depth: { anyOf: [WHOLE, oneOf(["full"])] }, due: TEXT, map: YES_NO, part: oneOf(PLACE_FACT_PARTS) },
+  properties: { at: TEXT, depth: { anyOf: [WHOLE, oneOf(["full"])] }, due: TEXT, map: YES_NO, part: oneOf(PLACE_FACT_PARTS), how: oneOf(WORLD_HOWS) },
   required: ["at"],
   example: { at: "thornbury", depth: 2, due: "six hours" },
   async run(args, call) {
@@ -81,7 +84,9 @@ export const WORLD_QUERY: ToolSpec = {
     if (args.depth !== undefined && args.depth !== null && (saidDepth === undefined || (saidDepth !== "full" && !(Number.isInteger(saidDepth) && saidDepth >= 0)))) {
       return reply.line("unreadable", { field: "depth", value: JSON.stringify(args.depth), wants: reading.lines.line("wants_depth") ?? "" }).fail();
     }
-    const depth = saidDepth ?? call.settings.queryDepth;
+    if (args.how !== undefined && args.how !== null && !(WORLD_HOWS as readonly JsonValue[]).includes(args.how)) return reply.line("unreadable", { field: "how", value: JSON.stringify(args.how), choices: textOf(WORLD_HOWS) }).fail();
+    // A depth said holds; with none, `how` names one end of it, and with neither the setting's depth is shown.
+    const depth = saidDepth ?? (args.how === "gist" ? 0 : args.how === "whole" ? "full" : call.settings.queryDepth);
     // (S17Story, places) A place's record: what the story changed there, its features and its access and state, as lines of their own, or one part whole.
     const part = typeof args.part === "string" && isPlaceFactPart(args.part) ? args.part : undefined;
     if (args.part !== undefined && args.part !== null && part === undefined) return reply.line("unreadable", { field: "part", value: JSON.stringify(args.part), choices: textOf(PLACE_FACT_PARTS) }).fail();
@@ -100,8 +105,16 @@ export const WORLD_QUERY: ToolSpec = {
             ...(sources !== undefined ? { sources } : {}),
           })
       : undefined;
-    const printed = reading.view().print(at.ref, depth, call.tree, { due: call.deps.due, ahead: call.deps.dueAhead ?? WORLD_STATE_DEFAULTS.dueAhead }, placeRecord);
+    const view = reading.view();
+    const horizon = { due: call.deps.due, ahead: call.deps.dueAhead ?? WORLD_STATE_DEFAULTS.dueAhead };
+    const printed = view.print(at.ref, depth, call.tree, horizon, placeRecord);
     if (printed !== null) reply.tree(printed);
+    // An answer that is not the whole says how much it shows of how much, and the call that reads the rest (plan 3.2 §7.1).
+    const { tokens } = call.deps;
+    if (printed !== null && depth !== "full" && tokens !== undefined) {
+      const whole = view.print(at.ref, "full", call.tree, horizon, placeRecord);
+      if (whole !== null && whole.length > printed.length) reply.line("shown_of", { at: `${at.name} [${at.id}]`, id: at.id, shown: tokens(printed), whole: tokens(whole) });
+    }
     if (typeof args.due === "string") {
       const to = timeFrom(reading, reading.state.world, args.due);
       if (to === null) return reply.line("unreadable", { field: "due", value: JSON.stringify(args.due), wants: reading.lines.line("wants_time") ?? "" }).fail();

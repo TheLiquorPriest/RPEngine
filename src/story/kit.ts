@@ -67,6 +67,8 @@ export interface StoryDeps {
   lastUse?: LastUseKeeper;
   /** Where the whole of a write's answer is kept when its caller reads a receipt (plan §5.2), and a receipt's size; none: every answer is given whole. */
   receipts?: ReceiptKeeper;
+  /** A text's tokens at the chat's characters to a token (RPH's `tokens.charsPerToken`): what an answer counts the size of what it names by (plan 3.2 §7.1). Absent: no size is said. */
+  tokens?: (text: string) => number;
   /** Milliseconds since 1970, for a row's time; `Date.now` when absent. */
   now?: () => number;
 }
