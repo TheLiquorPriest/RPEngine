@@ -110,7 +110,8 @@ test("what a chat's own RPE.yml sets holds at its next turn: the world state is 
 
   expect((before.story_query?.data.beat as JsonObject[]).map((h) => h.text)).toEqual(["The lamp is lit.", "A gull lands on the rail."]);
   expect((after.story_query?.data.beat as JsonObject[]).map((h) => h.text)).toEqual(["The lamp is lit."]);
-  expect(after.story_query?.lines[0]).toStartWith("1 more match.");
+  // What is left out is counted, and sized by the chat's characters to a token (plan 3.2 §7.1).
+  expect(after.story_query?.lines[0]).toMatch(/^1 more match, \d+ tokens whole\. /);
 });
 
 const BOOK = { id: "wb-keep", name: "Keeper's Book" };
