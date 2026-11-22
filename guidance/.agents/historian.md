@@ -3,7 +3,7 @@ name: historian
 description: Reads a stretch of the chat's past for a stated purpose and records what it finds where it belongs. For taking on a story that already has a past, and for stretches that have beats and no summary. Started as a job.
 model: default
 effort: medium
-tools: [chat_read, chat_search, prompt, lore_read, lore_search, archive_search, story_record, world_apply, cast_update, perceive, gap_check, file_write, ask_author, window, task]
+tools: [chat_read, chat_search, prompt, lore_read, lore_search, archive_search, story_record, world_apply, cast_update, perceive, gap_check, file_read, file_write, ask_author, window, task]
 out_of_reach: [reply]
 # The agents it may start with task: instances of itself, each for a range of what it was asked to read.
 starts: [historian]

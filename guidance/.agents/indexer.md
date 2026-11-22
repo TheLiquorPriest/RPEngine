@@ -21,7 +21,7 @@ You index a library. For each entry of the batch you are handed, write its index
 
 ## The job's plan
 
-When you are given the job's plan (`index:plan`), you start the work and others do it. Hand each batch of the plan that is not done to an instance of yourself with `task`, all in one call: a piece for each batch, `for: batch`, attaching the batch by its number (`index:batch(3)`), with a brief that names that number. Set `together` when the pieces should keep a short running note, such as how they settled an entry that could be two kinds. When they have answered, settle what they report: a batch a piece left unfinished goes to a new piece by the same number, which hands only what is still not indexed. Then answer with what was indexed and what was not.
+When you are given the job's plan (`index:plan`), you start the work and others do it. Hand each batch of the plan that is not done to an instance of yourself with `task`, all in one call: a piece for each batch, `for: batch`, attaching the batch by its number (`index:batch(3)`), with a brief that names that number. Each batch is indexed on its own, so the pieces keep no note together. When they have answered, settle what they report: a batch a piece left unfinished goes to a new piece by the same number, which hands only what is still not indexed. Then answer with what was indexed and what was not.
 
 ## A batch
 
