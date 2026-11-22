@@ -109,8 +109,9 @@ function AgentCalls(props: { agent: AgentUse; released: number | null }) {
   const { agent, released } = props;
   const after = agent.calls.filter((call) => afterReply(call, released)).length;
   const cold = agent.calls.filter((call) => call.cache?.cold === true).length;
-  // Its calls and what it did to its window between them, in the order they happened.
-  const steps = [...agent.calls.map((call) => ({ at: call.started, call, change: null })), ...agent.window.map((change) => ({ at: change.at, call: null, change }))].sort((a, b) => a.at - b.at);
+  // Its calls and what it did to its window between them, in the order they happened. A window change is known by its place in the
+  // agent's list: one call can change several things at the same moment, each its own change.
+  const steps = [...agent.calls.map((call) => ({ at: call.started, call, change: null, nth: 0 })), ...agent.window.map((change, nth) => ({ at: change.at, call: null, change, nth }))].sort((a, b) => a.at - b.at);
   return (
     <Disclosure
       class="rpe-use-agent"
@@ -138,7 +139,7 @@ function AgentCalls(props: { agent: AgentUse; released: number | null }) {
       ) : (
         <ul class="rpe-use-calls">
           {steps.map((step) =>
-            step.call !== null ? <CallLine key={`c${step.call.n}:${step.call.started}`} call={step.call} released={released} /> : step.change !== null ? <WindowLine key={`w${step.change.at}:${step.change.action}`} change={step.change} /> : null,
+            step.call !== null ? <CallLine key={`c${step.call.n}:${step.call.started}`} call={step.call} released={released} /> : step.change !== null ? <WindowLine key={`w${step.nth}`} change={step.change} /> : null,
           )}
         </ul>
       )}
