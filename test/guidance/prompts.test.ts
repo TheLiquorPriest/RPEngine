@@ -265,6 +265,11 @@ describe("a row each of E.6: present, laid out as its row says, asking for nothi
     const bare = brief.render({ task: "Map the harbour." }).text;
     expect(bare).toContain("Nothing was attached.");
     expect(bare).not.toContain("What to send back");
+    // The frame says whose work it is: the Author's turn, or a job's, which is no turn and owes the player no reply.
+    expect(bare.startsWith("You are working for the Author on one turn of a roleplay.")).toBe(true);
+    const inJob = brief.render({ task: "Index the batch.", job: true }).text;
+    expect(inJob.startsWith("You are working on a job, for the agent that started you.")).toBe(true);
+    expect(inJob).not.toContain("one turn of a roleplay");
     const question = await template("question");
     expect(question.render({ agent: "mapper", question: "Which quay?", searched: "Two quays." }).text.trim()).toBe("mapper stopped to ask before going on:\n\nWhich quay?\n\nWhat it looked up before asking:\n\nTwo quays.");
     expect(question.render({ agent: "mapper", question: "Which quay?" }).text).not.toContain("What it looked up");
