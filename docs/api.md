@@ -473,7 +473,7 @@ Stops a turn going on now; says whether it was running.
 
 ### `GET /api/v1/chats/:chat/turns/:turn/use`
 
-Where a turn's tokens went: the agents of its runs, each with what it was handed and its model calls in order (what each was for, its tokens and what they weigh, its request by part, what it asked of the provider's cache), and the jobs its runs started, each with its own use; with the weights the weighted figures were worked out by. The rows stay when the turn is swiped away.
+Where a turn's tokens went: the agents of its runs, each with what it was handed, its model calls in order (what each was for, its tokens and what they weigh, its request by part, what it asked of the provider's cache) and what it did to its own window (read from the trace the turn's folder keeps), and the jobs its runs started, each with its own use; with the weights the weighted figures were worked out by. The rows stay when the turn is swiped away.
 
 | | |
 |---|---|
@@ -4218,7 +4218,7 @@ export interface AgentToolsReply {
 
 ### `AgentUse`
 
-One agent of a run and what it used: what its calls add up to, what it was handed each time it was started, and its calls in the order their requests went out.
+One agent of a run and what it used: what its calls add up to, what it was handed each time it was started, its calls in the order their requests went out, and what it did to its own window.
 
 ```ts
 export interface AgentUse {
@@ -4233,6 +4233,8 @@ export interface AgentUse {
   /** What it was handed, each time it was started (its own work, a message that continues it): when, and each item with its size and who chose it. None for an agent of a turn played before RPH told them. */
   sent: { at: number; items: SentItem[] }[];
   calls: CallShown[];
+  /** What it did to its own window, in order, read from the trace its folder keeps: none where it did nothing to it, or the folder no longer keeps its trace. */
+  window: WindowChange[];
 }
 ```
 
@@ -10708,6 +10710,24 @@ The web search provider he set, as the Connections page shows it: its address (n
 export interface WebProviderShown {
   address: string | null;
   key: boolean;
+}
+```
+
+### `WindowChange`
+
+What an agent did to its own window once (plan 3.2 §7.2), as the trace its folder keeps tells it: when; whether it let things go, put a note of its own in their place, brought them back whole, or went on in a fresh window with what it kept; each thing by its name in the window with its size; and what the change spares on each later call and takes once, in tokens by RPH's own estimate.
+
+```ts
+export interface WindowChange {
+  /** When, in milliseconds since 1970. */
+  at: number;
+  action: "let_go" | "note" | "restore" | "handoff";
+  /** Each thing by its name in the window's ledger, with its size in tokens. */
+  items: { id: string; tokens: number }[];
+  /** The tokens the change spares on each later call. */
+  spared: number;
+  /** The tokens it takes once, on the next call. */
+  once: number;
 }
 ```
 

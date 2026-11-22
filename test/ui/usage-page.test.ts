@@ -282,8 +282,10 @@ function turnView(turn: TurnReply, over: Partial<TurnViewProps>): { text: string
 }
 
 describe("where a turn's tokens went, on the Turn page", () => {
-  test("its calls by agent and by part, with what each agent was handed, a call after the reply and a cold write marked, and its job with its own use", async () => {
+  test("its calls by agent and by part, with what each agent was handed, a call after the reply and a cold write marked, what an agent did to its window between its calls, and its job with its own use", async () => {
     const p = await played();
+    // The Author let a lore entry go between its two calls: the turn's folder keeps the record.
+    p.keeps([recorder(RUN, SCOPE, T0)({ id: "agent-author", definition: "author" }, 4_500, { kind: "window", action: "let_go", items: [{ id: "lore:e-12", tokens: 1_840 }], sparedTokens: 1_820, costTokens: 2_300 })]);
     const use = await p.use(TURN);
     const turn = ferryTurn(use);
     expect(TURN_SECTIONS.find((section) => section.id === "where-tokens")).toMatchObject({ title: "Where the tokens went", spoiler: true });
@@ -293,7 +295,7 @@ describe("where a turn's tokens went, on the Turn page", () => {
     // Each agent with what its calls add up to and what they weigh.
     const agents = elements(tree).filter((e) => e.props["data-agent"] !== undefined);
     expect(agents.map((e) => textOf(e.props.children).replace(/\s+/g, " "))).toEqual([
-      `author${tokensWeighed(2, { input: 18_800, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 9_100, output: 750, reasoning: 120 }, 24_270)}1 call after the reply1 cold write`,
+      `author${tokensWeighed(2, { input: 18_800, cacheRead: 8_200, cacheWrite: 9_100, cacheWriteLong: 9_100, output: 750, reasoning: 120 }, 24_270)}1 call after the reply1 cold write1 change to its window`,
       `gm${tokensWeighed(1, { input: 4_000, cacheRead: 0, cacheWrite: 0, output: 600 }, 7_000)}`,
       `historian${tokensWeighed(1, { input: 2_500, cacheRead: 0, cacheWrite: 0, output: 800 }, 6_500)}`,
     ]);
@@ -322,6 +324,13 @@ describe("where a turn's tokens went, on the Turn page", () => {
     expect(second).toContain("2.2 s after its last request ended");
     expect(second).toContain("tool results: delegate 600");
     expect(textOf(calls[2]?.props.children)).toContain("for Can the ferry cross tonight?");
+    // What the Author did to its window stands between its two calls, with what it spares and what it took once.
+    const steps = elements(tree).filter((e) => e.type === "li" && (e.props["data-call"] !== undefined || e.props["data-window"] !== undefined));
+    expect(steps.slice(0, 3).map((e) => e.props["data-window"] ?? `call ${e.props["data-call"]}`)).toEqual(["call 1", "let_go", "call 2"]);
+    const change = textOf(steps[1]?.props.children).replace(/\s+/g, " ");
+    expect(change).toContain("Its window");
+    expect(change).toContain("Let go of lore:e-12 (1,840)");
+    expect(change).toContain("spares 1,820 tokens on each later call · took 2,300 once, on its next call");
     // The job it started, beside the turn, with its own use.
     expect(text).toContain("The jobs it started, each with its own use");
     expect(text).toContain("Job: historian");

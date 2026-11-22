@@ -1,15 +1,16 @@
 // The routes of the use of the models (`src/turn/usage-routes.ts`), called as the server calls them, each reply held to its
 // declaration: a turn's use, agent by agent with what each was handed and its calls by part, and the job its run started beside it
-// with its own use; a continue that joined a turn counted with it, and its held turn answered as joined; a span of turns or of time
-// summed by operation and by part; the weighted figure beside every sum and every call, by the weights the settings hold as the
-// route answers; and what was played before the rows were kept read in from the kept traces on a press, each call with its totals
-// and no parts. Every name and every figure is invented.
+// with its own use; what an agent did to its own window, read from the trace its folder keeps; a continue that joined a turn
+// counted with it, and its held turn answered as joined; a span of turns or of time summed by operation and by part; the weighted
+// figure beside every sum and every call, by the weights the settings hold as the route answers; and what was played before the
+// rows were kept read in from the kept traces on a press, each call with its totals and no parts. Every name and every figure is
+// invented.
 
 import { afterEach, expect, test } from "bun:test";
 import { RouteError } from "../../src/app";
 import { JoinedTurnError } from "../../src/store";
 import { kvStore } from "../../src/turn";
-import { AUTHOR, before, CHAT, CLERK_1, GM, JOB, jobRecord, jobScope, RUN, SCOPE, SESSION, T0, TURN, turnRecords, USER, type UsagePages, usagePages } from "./usage-rig";
+import { AUTHOR, before, CHAT, CLERK_1, GM, JOB, jobRecord, jobScope, recorder, RUN, SCOPE, SESSION, T0, TURN, turnRecords, USER, type UsagePages, usagePages } from "./usage-rig";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -231,8 +232,35 @@ test("what was played before the rows were kept is read in from the kept traces 
   // Over every turn he played (the carried one is none of them), the sums by part are of the calls that carry parts alone.
   expect(await p.span({ turns: 10 })).toMatchObject({ turns: 4, total: { calls: 8 }, withParts: 4 });
 
-  // A second press reads only what still has no row, and adds nothing twice.
+  // A second press reads only what still has no row, and adds nothing twice. (A turn's use reads its folder too, for what its agents did to their windows.)
+  const readBefore = p.read.length;
   expect(await p.readIn()).toEqual({ turns: 0, jobs: 0, unread: 1, calls: 0, sent: 0, withoutParts: 0 });
-  expect(p.read.slice(3)).toEqual([`${SESSION}/turn-torn`]);
+  expect(p.read.slice(readBefore)).toEqual([`${SESSION}/turn-torn`]);
   expect((await p.use("turn-old")).spent.calls).toBe(3);
+});
+
+test("what an agent did to its own window is read from the trace its turn's folder keeps, and set with the agent whose it is; a folder that cannot be read gives none", async () => {
+  const p = await page();
+  await p.played({ id: "r-ferry", turn: TURN, received: T0 - 500, traceRun: RUN });
+  for (const record of turnRecords()) p.b.calls.record(record);
+  // The Author let two things go between its two calls, and brought one back after the second; the trace keeps both.
+  const turn = recorder(RUN, SCOPE, T0);
+  p.keeps([
+    turn(AUTHOR, 4_500, { kind: "window", action: "let_go", items: [{ id: "lore:e-12", tokens: 1_840 }, { id: "briefing:world-state", tokens: 1_900 }], sparedTokens: 3_700, costTokens: 4_800 }),
+    turn(AUTHOR, 9_190, { kind: "window", action: "restore", items: [{ id: "lore:e-12", tokens: 1_840 }], sparedTokens: -1_820, costTokens: 2_300 }),
+  ]);
+  const use = await p.use(TURN);
+  const [author, gm] = use.agents;
+  expect(author?.window).toEqual([
+    { at: T0 + 4_500, action: "let_go", items: [{ id: "lore:e-12", tokens: 1_840 }, { id: "briefing:world-state", tokens: 1_900 }], spared: 3_700, once: 4_800 },
+    { at: T0 + 9_190, action: "restore", items: [{ id: "lore:e-12", tokens: 1_840 }], spared: -1_820, once: 2_300 },
+  ]);
+  expect(gm?.window).toEqual([]);
+
+  // The folder gone unreadable: the use is still answered from the rows, with no change to any window, and the log says which folder.
+  p.unreadable.add(`${SESSION}/${TURN}`);
+  const without = await p.use(TURN);
+  expect(without.spent).toEqual(use.spent);
+  expect(without.agents.map((a) => a.window)).toEqual([[], []]);
+  expect(p.b.logged.map((l) => [l.message, l.fields?.turn])).toEqual([["A kept trace could not be read for what its agents did to their windows.", TURN]]);
 });

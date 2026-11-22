@@ -78,9 +78,21 @@ const callShown = shape.named(
   }),
 );
 
+const windowChange = shape.named(
+  "WindowChange",
+  "What an agent did to its own window once (plan 3.2 §7.2), as the trace its folder keeps tells it: when; whether it let things go, put a note of its own in their place, brought them back whole, or went on in a fresh window with what it kept; each thing by its name in the window with its size; and what the change spares on each later call and takes once, in tokens by RPH's own estimate.",
+  shape.object({
+    at: field(N, "When, in milliseconds since 1970."),
+    action: shape.oneOf("let_go", "note", "restore", "handoff"),
+    items: field(shape.list(shape.object({ id: T, tokens: N })), "Each thing by its name in the window's ledger, with its size in tokens."),
+    spared: field(N, "The tokens the change spares on each later call."),
+    once: field(N, "The tokens it takes once, on the next call."),
+  }),
+);
+
 const agentUse = shape.named(
   "AgentUse",
-  "One agent of a run and what it used: what its calls add up to, what it was handed each time it was started, and its calls in the order their requests went out.",
+  "One agent of a run and what it used: what its calls add up to, what it was handed each time it was started, its calls in the order their requests went out, and what it did to its own window.",
   shape.object({
     run: field(T, "RPH's own id for the run it worked in; a job's run is the job's id."),
     agent: field(T, "Its handle."),
@@ -89,6 +101,7 @@ const agentUse = shape.named(
     spent,
     sent: field(shape.list(shape.object({ at: N, items: shape.list(sentItem) })), "What it was handed, each time it was started (its own work, a message that continues it): when, and each item with its size and who chose it. None for an agent of a turn played before RPH told them."),
     calls: shape.list(callShown),
+    window: field(shape.list(windowChange), "What it did to its own window, in order, read from the trace its folder keeps: none where it did nothing to it, or the folder no longer keeps its trace."),
   }),
 );
 type AgentUse = Infer<typeof agentUse>;
@@ -166,13 +179,31 @@ function weightsView(of: UsageWeights): Infer<typeof weightsShown> {
   return { ...four(of.general), connections: [...of.connections].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([connection, w]) => ({ connection, ...four(w) })) };
 }
 
-/** The agents among these rows, in the order each first worked or was handed something, each with what it was handed and its calls, each sum and each call weighed by `weights`. */
-function agentsOf(calls: readonly CallRow[], sent: readonly SentRow[], weights: UsageWeights): AgentUse[] {
+/** What an agent did to its own window once, as its trace record tells it. */
+type WindowChange = Infer<typeof windowChange>;
+
+/** An agent of a run, as the rows and the trace name it together. */
+const agentKey = (run: string, agent: string): string => `${run}\u0000${agent}`;
+
+/** What each agent did to its own window, in order, from the records a folder keeps: by its run and its handle. Nothing else of the trace is read here. */
+function windowChanges(records: readonly TraceRecord[]): Map<string, WindowChange[]> {
+  const out = new Map<string, WindowChange[]>();
+  for (const record of records) {
+    if (record.event.kind !== "window" || record.agent === undefined) continue;
+    const key = agentKey(record.run, record.agent.id);
+    const change: WindowChange = { at: record.at, action: record.event.action, items: record.event.items.map((item) => ({ id: item.id, tokens: item.tokens })), spared: record.event.sparedTokens, once: record.event.costTokens };
+    out.set(key, [...(out.get(key) ?? []), change]);
+  }
+  return out;
+}
+
+/** The agents among these rows, in the order each first worked or was handed something, each with what it was handed, its calls and what it did to its own window (`changes`), each sum and each call weighed by `weights`. */
+function agentsOf(calls: readonly CallRow[], sent: readonly SentRow[], weights: UsageWeights, changes: ReadonlyMap<string, WindowChange[]>): AgentUse[] {
   const agents = new Map<string, { first: number; use: AgentUse; rows: CallRow[] }>();
   const of = (row: Pick<CallRow, "run" | "agent" | "definition">, at: number, plays: string | null) => {
-    const key = `${row.run}\u0000${row.agent}`;
+    const key = agentKey(row.run, row.agent);
     let held = agents.get(key);
-    if (held === undefined) agents.set(key, (held = { first: at, use: { run: row.run, agent: row.agent, definition: row.definition, plays, spent: spentBy([], weights), sent: [], calls: [] }, rows: [] }));
+    if (held === undefined) agents.set(key, (held = { first: at, use: { run: row.run, agent: row.agent, definition: row.definition, plays, spent: spentBy([], weights), sent: [], calls: [], window: changes.get(key) ?? [] }, rows: [] }));
     held.first = Math.min(held.first, at);
     return held;
   };
@@ -201,7 +232,7 @@ export function usageRoutes(deps: UsageRoutesDeps) {
       path: "/api/v1/chats/:chat/turns/:turn/use",
       access: "page",
       group: "turns",
-      does: "Where a turn's tokens went: the agents of its runs, each with what it was handed and its model calls in order (what each was for, its tokens and what they weigh, its request by part, what it asked of the provider's cache), and the jobs its runs started, each with its own use; with the weights the weighted figures were worked out by. The rows stay when the turn is swiped away.",
+      does: "Where a turn's tokens went: the agents of its runs, each with what it was handed, its model calls in order (what each was for, its tokens and what they weigh, its request by part, what it asked of the provider's cache) and what it did to its own window (read from the trace the turn's folder keeps), and the jobs its runs started, each with its own use; with the weights the weighted figures were worked out by. The rows stay when the turn is swiped away.",
       reply: turnUseReply,
       joined: true,
       handle: async ({ user, params }) => {
@@ -220,6 +251,18 @@ export function usageRoutes(deps: UsageRoutesDeps) {
         const records = new Map<string, JobView>(jobsOfTurns(deps.db, user, under).map((job) => [job.id, job]));
         const ids = [...new Set([...records.keys(), ...rows.flatMap((c) => (c.job === null ? [] : [c.job])), ...sent.flatMap((s) => (s.job === null ? [] : [s.job]))])];
         const shared = deps.shared();
+        // What an agent did to its own window has no row: it is read from the trace each folder keeps (plan 3.2 §7.2). A trace that cannot be read gives none, and the log says which.
+        const traced = async (of: Record<string, string>, read: () => Promise<TraceRecord[]>): Promise<Map<string, WindowChange[]>> => {
+          try {
+            return windowChanges(await read());
+          } catch (error) {
+            deps.log.warn("A kept trace could not be read for what its agents did to their windows.", { ...of, error: error instanceof Error ? error.message : String(error) });
+            return new Map();
+          }
+        };
+        const folders = new Map(ofTurn.map((r) => [`${r.turn}\u0000${r.session}`, r]));
+        const changes = new Map<string, WindowChange[]>();
+        for (const r of folders.values()) for (const [key, list] of await traced({ chat: r.chat, turn: r.turn }, () => deps.kept({ user, chat: r.chat, session: r.session, turn: r.turn }))) changes.set(key, [...(changes.get(key) ?? []), ...list]);
         return {
           turn: params.turn,
           spent: spentBy(own, weights),
@@ -227,21 +270,27 @@ export function usageRoutes(deps: UsageRoutesDeps) {
             own,
             sent.filter((s) => s.job === null),
             weights,
+            changes,
           ),
-          jobs: ids.map((id) => {
-            const of = rows.filter((c) => c.job === id);
-            const record = records.get(id);
-            return {
-              id,
-              job: record === undefined ? null : jobRowOf(record, shared),
-              spent: spentBy(of, weights),
-              agents: agentsOf(
-                of,
-                sent.filter((s) => s.job === id),
-                weights,
-              ),
-            };
-          }),
+          jobs: await Promise.all(
+            ids.map(async (id) => {
+              const of = rows.filter((c) => c.job === id);
+              const record = records.get(id);
+              // A job's own trace is under its own session: its run's records are those that name it.
+              const jobChanges = record === undefined ? new Map<string, WindowChange[]>() : await traced({ job: id }, async () => (await deps.kept(record.scope)).filter((r) => r.run === id));
+              return {
+                id,
+                job: record === undefined ? null : jobRowOf(record, shared),
+                spent: spentBy(of, weights),
+                agents: agentsOf(
+                  of,
+                  sent.filter((s) => s.job === id),
+                  weights,
+                  jobChanges,
+                ),
+              };
+            }),
+          ),
           weights: weightsView(weights),
         };
       },

@@ -77,6 +77,8 @@ function agentsOf(records: readonly TraceRecord[]): AgentUse[] {
         spent: NOTHING,
         sent: [{ at: record.at, items: lead ? [{ name: "briefing", tokens: 2_570, from: "definition" }, { name: "prompt:*", tokens: 6_930, from: "definition" }] : [{ name: "world:scene(full, map)", tokens: 980, from: "definition" }, { name: "story:brief", tokens: 310, from: "caller" }] }],
         calls: [],
+        // The lead let two things of its window go once it had begun (invented); nobody else touched theirs.
+        window: lead ? [{ at: record.at + 30, action: "let_go", items: [{ id: "lore:e-12", tokens: 1_840 }, { id: "briefing:world-state", tokens: 2_310 }], spared: 4_100, once: 5_300 }] : [],
       });
     }
     if (event.kind === "call_started") began.set(`${agent.id}:${event.call}`, { at: record.at, connection: event.connection, model: event.model });
@@ -161,7 +163,7 @@ function jobOf(turn: TurnReply): { row: JobRow; agent: AgentUse } | null {
       ended: second.ended + 5,
       usage: { calls: spent.calls, input: spent.input, cacheRead: spent.cacheRead, cacheWrite: spent.cacheWrite, output: spent.output },
     },
-    agent: { run: id, agent: "j1", definition: "historian", plays: null, spent, sent: [{ at: released + 45, items: [{ name: "story:record", tokens: 1_240, from: "definition" }] }], calls },
+    agent: { run: id, agent: "j1", definition: "historian", plays: null, spent, sent: [{ at: released + 45, items: [{ name: "story:record", tokens: 1_240, from: "definition" }] }], calls, window: [] },
   };
 }
 
