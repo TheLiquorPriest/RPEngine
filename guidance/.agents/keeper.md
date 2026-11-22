@@ -3,7 +3,7 @@ name: keeper
 description: Bookkeeping after the reply. Give it a turn whose reply has gone out, and it brings the record in line with what the reply says happened. For when you want that work on a cheaper model than the Author's.
 model: default
 effort: low
-tools: [world_query, world_apply, story_query, story_record, cast_query, chat_read, file_read, tool_search, tool_use, ask_author]
+tools: [world_query, world_apply, story_query, story_record, cast_query, chat_read, file_read, tool_search, tool_use, ask_author, window]
 out_of_reach: [reply, agents]
 reads: [ALL-AGENTS, rules, AGENTS, SIMULATION]
 given:

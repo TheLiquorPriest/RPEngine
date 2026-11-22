@@ -63,7 +63,7 @@ const APPENDIX_E: readonly string[] = [
 ];
 
 /** The rules in force at the shipped level (E.1, E.2, E.3): the two for the agents, and the reminders. */
-const IN_FORCE = ["consent", "perceptions", "perceptions-owed", "perceptions-missing", "memory-owed", "memory-late", "memory-scene-end", "dream-due", "unsourced", "engine-silent", "intent-owed", "intent-owed-end", "press-owed", "growth-waiting", "reply-missing", "history-leaving", "save-before-compaction"];
+const IN_FORCE = ["consent", "perceptions", "perceptions-owed", "perceptions-missing", "memory-owed", "memory-late", "memory-scene-end", "dream-due", "unsourced", "engine-silent", "intent-owed", "intent-owed-end", "press-owed", "growth-waiting", "reply-missing", "history-leaving", "window-heavy", "save-before-compaction"];
 
 /** The examples the build added beyond E.3's four, for the owner's approval: two on the Author's record of a turn, one on what is left of its limits. */
 const BUILD_EXAMPLES = [".rules/examples/intent-missing.md", ".rules/examples/turn-unrecorded.md", ".rules/examples/limits-left.md"];
@@ -293,13 +293,15 @@ test("the shipped definitions are App. C's nine and Build's five, and no other: 
   expect([...SHIPPED.keys()].filter((path) => path.startsWith(".agents/")).map((path) => basename(path, ".md")).sort()).toEqual([...AGENTS, ...BUILD_JOBS].sort());
 });
 
-test("the Author's fixed tools, as RPH's loader reads them, are §6.8's thirty, name for name", async () => {
+test("the Author's fixed tools, as RPH's loader reads them, are §6.8's thirty and `window`, name for name", async () => {
   const fixed = [
     "prompt", "chat_read", "chat_search", "lore_read", "lore_search", "archive_search", "web_search", "gap_check", "delegate", "agent_message",
     "write_reply", "reply_release", "file_read", "file_find", "file_write", "skill_load", "job_start", "suggest", "todo", "tool_search", "tool_use",
     "world_query", "world_search", "world_apply", "roll", "story_query", "story_record", "cast_query", "cast_update", "perceive",
+    // Plan 3.2 §7.2: every agent's means over its own window.
+    "window",
   ];
-  expect(fixed).toHaveLength(30);
+  expect(fixed).toHaveLength(31);
   expect([...((await guidance.definition("author"))?.tools ?? [])].sort()).toEqual([...fixed].sort());
 });
 
