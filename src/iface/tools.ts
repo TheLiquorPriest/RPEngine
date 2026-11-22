@@ -50,6 +50,7 @@ export async function engineTools(deps: EngineDeps): Promise<HostTool[]> {
     part: ANSWERS_PART,
     lines: words.lines,
     ...(deps.lastUse !== undefined ? { lastUse: deps.lastUse } : {}),
+    ...(deps.receipts !== undefined ? { receipts: deps.receipts } : {}),
     failed: (fault) => deps.env.failed?.(fault),
     call: (base) => ({ ...base, deps, settings, tree: words.tree }),
     // A scope found unreadable while the call ran (a turn joined to another in between) is told as the fact.

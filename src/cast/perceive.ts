@@ -301,25 +301,26 @@ async function perceiveAs(args: JsonObject, call: CastCall, player: boolean): Pr
   if (after === null) return reply;
   for (const x of reads) leftOut(reply, x, READS.reads);
   if (!player) sourceLines(reply, reads);
-  return reply.data({
-    perceptions: planned.map((p, i) => {
-      const done = written[i];
-      const item = done === undefined ? undefined : after.record.items.get(done.perception);
-      return {
-        n: p.n,
-        ...(p.prov !== undefined ? provenanceData(p.prov) : {}),
-        who: whoView({ id: done?.character ?? p.character, name: p.name }),
-        id: done?.perception ?? null,
-        now: item === undefined ? null : perceptionView(after, item),
-        knowledge: done?.knowledge ?? [],
-        ...(p.secrets.length > 0 ? { holds: p.secrets.map((s) => s.fact) } : {}),
-        ...(p.struck.length > 0 ? { struck: p.struck } : {}),
-        ...(p.stands.length > 0 ? { stands: p.stands } : {}),
-        ...(p.forgets.some((f) => f.events.length > 0) ? { lets_go: p.forgets.flatMap((f) => (f.events.length > 0 ? [f.fact] : [])) } : {}),
-        ...(p.holdsAgain.some((h) => h.events.length > 0) ? { holds_again: p.holdsAgain.flatMap((h) => (h.events.length > 0 ? [h.fact] : [])) } : {}),
-      };
-    }),
-  });
+  const perceptions: JsonObject[] = [];
+  const receipt: JsonObject[] = [];
+  for (const [i, p] of planned.entries()) {
+    const done = written[i];
+    const item = done === undefined ? undefined : after.record.items.get(done.perception);
+    const who = whoView({ id: done?.character ?? p.character, name: p.name });
+    const id = done?.perception ?? null;
+    // What the write made of the perception that the call did not send: the knowledge it added, and the secrets it gave, struck, stood again and let go.
+    const made: JsonObject = {
+      knowledge: done?.knowledge ?? [],
+      ...(p.secrets.length > 0 ? { holds: p.secrets.map((s) => s.fact) } : {}),
+      ...(p.struck.length > 0 ? { struck: p.struck } : {}),
+      ...(p.stands.length > 0 ? { stands: p.stands } : {}),
+      ...(p.forgets.some((f) => f.events.length > 0) ? { lets_go: p.forgets.flatMap((f) => (f.events.length > 0 ? [f.fact] : [])) } : {}),
+      ...(p.holdsAgain.some((h) => h.events.length > 0) ? { holds_again: p.holdsAgain.flatMap((h) => (h.events.length > 0 ? [h.fact] : [])) } : {}),
+    };
+    perceptions.push({ n: p.n, ...(p.prov !== undefined ? provenanceData(p.prov) : {}), who, id, now: item === undefined ? null : perceptionView(after, item), ...made });
+    receipt.push({ n: p.n, who, id, ...made });
+  }
+  return reply.data({ perceptions }).receipt({ perceptions: receipt });
 }
 
 export const PERCEIVE: CastToolSpec = {

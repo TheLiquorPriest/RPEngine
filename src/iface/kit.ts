@@ -8,7 +8,7 @@ import type { QuestHolder } from "../quests/holders";
 import type { QuestsSettings } from "../quests/settings";
 import type { PlaceSourcesReader } from "../places/sources";
 import type { Database } from "bun:sqlite";
-import type { AgentRef, ApprovalsPort, HostTool, JsonObject, JsonSchema, JsonValue, Scope, ToolContent, ToolCtx, ToolResult, ToolTier } from "rp-harness/contract";
+import type { AgentRef, ApprovalsPort, HostTool, JsonObject, JsonSchema, JsonValue, RunScope, Scope, ToolContent, ToolCtx, ToolResult, ToolTier } from "rp-harness/contract";
 import type { NumberSettings, Setting } from "../app/setting-list";
 import type { MapConfig } from "../shared/map-config";
 import type { GridMoves, MapView } from "./map/ports";
@@ -17,6 +17,7 @@ import type { FoldEnv } from "../store/fold";
 import type { ChangeInput, Lane, StoreState } from "../store/types";
 import type { Part } from "../store/words";
 import type { WorldService } from "../worlds/service";
+import { type ReceiptKeeper, receiptOf } from "./receipt";
 import { type Fields, type GuidanceFiles, type Lines, type ToolText, toolText } from "./texts";
 
 /** Every fixed value of the engine's tools, each a setting with this default. */
@@ -210,6 +211,8 @@ export interface EngineDeps {
   worlds?: Pick<WorldService, "list" | "read" | "draft" | "commit" | "lint" | "chats">;
   /** Keeps the values each line the call said was filled with, as the answers part's last use in the call's chat (the Prompts preview reads them). Absent: none is kept. */
   lastUse?: LastUseKeeper;
+  /** Where the whole of a write's answer is kept when its caller reads a receipt (plan §5.2), and a receipt's size: the user's `tools.receiptTokens` for the chat. Absent: every answer is given whole. */
+  receipts?: ReceiptKeeper;
   /** Milliseconds since 1970, for an approval's question; `Date.now` when absent. */
   now?: () => number;
 }
@@ -228,6 +231,17 @@ export interface KeptReport {
 }
 
 /**
+ * What a receipt says of a write in place of its answer's data (plan §5.2): `lists` of what was written, each entry the id it was
+ * written under, with its number and operation in the call and whatever the engine made of it that the call did not send; `rest`,
+ * what else of that kind belongs to the whole call. A receipt too long for its size gives up entries from the end of the last list
+ * first, so the list named first is the one it keeps longest.
+ */
+export interface Wrote {
+  lists: Readonly<Record<string, readonly JsonValue[]>>;
+  rest: JsonObject;
+}
+
+/**
  * An answer being made: parts the model reads (data as JSON, the store's tree as it prints it, and
  * lines of the answers' file), reports (lines too), marks a rule can name, and details for the live
  * view. Nothing here holds a word of its own.
@@ -241,6 +255,8 @@ export class Reply {
   readonly marks = new Set<string>();
   details: JsonObject = {};
   failed = false;
+  /** What a receipt holds in place of this answer's data; none where the tool names none, and its answer is its own receipt. */
+  wrote: Wrote | null = null;
 
   constructor(private readonly lines: Lines) {}
 
@@ -298,6 +314,15 @@ export class Reply {
   /** The call did not do what it was asked: the answer says why, in lines. */
   fail(): this {
     this.failed = true;
+    return this;
+  }
+
+  /**
+   * What a receipt says in place of this answer's data, for a tool that writes (`Wrote`). The answer itself stays as it is: the one
+   * builder of host tools gives the receipt in its place where the user's setting asks for one, and keeps the answer whole in a file.
+   */
+  receipt(lists: Wrote["lists"], rest: JsonObject = {}): this {
+    this.wrote = { lists, rest };
     return this;
   }
 
@@ -452,11 +477,24 @@ export interface AreaWords<C extends AreaCall> {
   call(base: AreaCall): C;
   /** A throw the area answers as the fact it is (a scope found unreadable, a turn joined to another), said in its lines; none for any other, which is a fault. */
   told?(error: unknown, call: C): Reply | undefined;
+  /** Where the whole of a write's answer is kept when its caller reads a receipt, and a receipt's size (`receipt.ts`); none: every answer is given whole. */
+  receipts?: ReceiptKeeper;
+}
+
+/**
+ * A call's context as the host that built the tools may give it: RPH's, and the scope whose folders hold the call's own files where
+ * that is another than the scope it works at. A continue's held turn reads and writes the state at the turn it was joined to, and its
+ * folder stays its own.
+ */
+export interface AreaCtx extends ToolCtx {
+  folders?: RunScope;
 }
 
 /**
  * A tool of any area as RPH holds it: its spec with its file's words, run with the call's context. A throw in its code is a fault,
- * answered as one (`faultAnswer`) unless the area tells it as a fact.
+ * answered as one (`faultAnswer`) unless the area tells it as a fact. A tool that writes answers with a receipt where the area holds
+ * a keeper for one (`receipt.ts`); whatever fails in making the receipt is told as a fault of RPE's and the answer is given whole, since
+ * what the call wrote stands.
  */
 export function hostTool<C extends AreaCall>(spec: AreaSpec<C>, text: ToolText, area: AreaWords<C>): HostTool {
   return {
@@ -466,7 +504,7 @@ export function hostTool<C extends AreaCall>(spec: AreaSpec<C>, text: ToolText, 
     ...(spec.lane !== undefined ? { lane: spec.lane } : {}),
     description: text.description,
     parameters: described(spec.properties, spec.required, text),
-    async run(args: JsonValue, ctx: ToolCtx): Promise<ToolResult> {
+    async run(args: JsonValue, ctx: AreaCtx): Promise<ToolResult> {
       const given = typeof args === "object" && args !== null && !Array.isArray(args) ? args : {};
       // A job of no chat has no chat's records to work on: said in the answers' words, nothing read or written.
       const { scope } = ctx;
@@ -476,12 +514,22 @@ export function hostTool<C extends AreaCall>(spec: AreaSpec<C>, text: ToolText, 
       const lines = use.lines;
       const call = area.call({ scope, agent: ctx.agent, callId: ctx.callId, signal: ctx.signal, tool: spec.name, lines, reply: () => new Reply(lines) });
       try {
-        return (await spec.run(given, call)).result();
-      } catch (error) {
-        if (ctx.signal.aborted) throw error;
-        const told = area.told?.(error, call);
-        if (told !== undefined) return told.result();
-        return faultAnswer(lines, spec.name, error, area.failed, ctx.scope.turn ?? "");
+        let reply: Reply;
+        try {
+          reply = await spec.run(given, call);
+        } catch (error) {
+          if (ctx.signal.aborted) throw error;
+          const told = area.told?.(error, call);
+          if (told !== undefined) return told.result();
+          return faultAnswer(lines, spec.name, error, area.failed, ctx.scope.turn ?? "");
+        }
+        if (spec.tier !== "write" || area.receipts === undefined) return reply.result();
+        try {
+          return await receiptOf(reply, lines, area.receipts, { scope: ctx.folders?.chat !== undefined ? ctx.folders : scope, callId: ctx.callId, tool: spec.name });
+        } catch (error) {
+          area.failed?.({ op: spec.name, error, turn: ctx.scope.turn ?? "", change: null });
+          return reply.result();
+        }
       } finally {
         await use.keep();
       }

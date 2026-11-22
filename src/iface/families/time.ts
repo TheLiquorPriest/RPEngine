@@ -12,6 +12,7 @@ import { calendarOf, clockAt, dateAt, formatClock } from "../../engine/calendar"
 import { followOf } from "../../packs/castlife/core/routines";
 import { routineGmView } from "../../packs/castlife/core/view";
 import { clockRecorded } from "../../store/blank";
+import type { StoreState } from "../../store/types";
 import { NUMBER, OBJECT, oneOf, TEXT, WHOLE } from "../kit";
 import { find, isUnread, named, notAs, notOneOf, type OpContext, textArg, type Unread, unknownFields } from "../ops";
 import { calmStateOf, weatherTarget } from "../../packs/weather/core";
@@ -80,8 +81,12 @@ const routine: WriteDef = {
       if (refused.code !== "not_owner") return notApplicable(o, refused.code);
       o.reply.line("already_so", { n: o.n, op: o.op, what: named(o.reading, person.id) });
     }
-    // How they follow their routine is kept apart from them: the answer shows it as it now stands.
-    o.after((state) => ({ routine: followOf(o.reading.registry.context(o.reading.doc, state.world), person.id) as unknown as JsonObject, asked: edit as unknown as JsonObject }));
+    // How they follow their routine is kept apart from them: the answer shows it as it now stands, beside the edit as it was asked, which a receipt leaves out.
+    const follows = (state: StoreState): JsonObject => followOf(o.reading.registry.context(o.reading.doc, state.world), person.id) as unknown as JsonObject;
+    o.after(
+      (state) => ({ routine: follows(state), asked: edit as unknown as JsonObject }),
+      (state) => ({ routine: follows(state) }),
+    );
     o.draft.record(o.n, o.op, "engine", o.prov, from);
     return undefined;
   },

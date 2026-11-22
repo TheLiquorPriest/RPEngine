@@ -1,5 +1,5 @@
 ---
-description: The sentences the story tools answer with (story_query, story_record). A tool's answer is data from the story record and these lines, filled with that data. One line per name, a name, a colon, then its text. Change the words freely. Delete a line and that answer is given with no words. The lines named wants_ (what an argument takes) are words put inside the other lines. The Story page is told in these words too when it is refused (no_chat, no_turn, unknown_id, unreadable, and the lines named page_, which only the page uses).
+description: The sentences the story tools answer with (story_query, story_record). A tool's answer is data from the story record and these lines, filled with that data. One line per name, a name, a colon, then its text. Change the words freely. Delete a line and that answer is given with no words. The lines named wants_ (what an argument takes) are words put inside the other lines. The Story page is told in these words too when it is refused (no_chat, no_turn, unknown_id, unreadable, and the lines named page_, which only the page uses). A tool that writes answers with a receipt, which ends with receipt_kept, the line that names the file its whole answer is in; delete that line and those tools answer whole, and delete receipt_left and a long receipt is not cut.
 format: lines
 ---
 no_chat: There is no chat {{id}} in the engine's records.
@@ -34,6 +34,8 @@ overlay_unknown: Operation {{n}} (overlay): there is no lore entry {{entry}}.{{#
 store_unread: The story record could not read that call: {{why}}
 turn_joined: This turn, {{turn}}, was joined to turn {{joined}}, the turn the continue extended, so nothing was read or recorded here. Address turn {{joined}} instead.
 engine_fault: {{tool}} failed in the engine, not in your call: the fault is in RPE's log. Nothing was recorded.
+receipt_kept: This is {{tool}}'s receipt. Its whole answer, {{chars}} characters, is in {{path}}.
+receipt_left: {{left}} of the {{of}} ids {{tool}} wrote under are left out of this receipt, to hold it to its size; the file lists them all.
 quest_unresolved: Operation {{n}} ({{op}}): the quest {{quest}} names no quest of this world, so it is kept as the words you wrote and tied to none.
 place_unresolved: Operation {{n}} ({{op}}): the place {{place}} names no place of this world, so it is kept as the words you wrote and tied to none.
 none: Nothing in the story record matches.

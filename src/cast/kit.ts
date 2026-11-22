@@ -11,6 +11,7 @@ import type { NumberSettings, Setting } from "../app/setting-list";
 import { calendarOf, formatClock, placeOffset } from "../engine/calendar";
 import { placeOfEntity } from "../engine/scope";
 import { type AreaCall, type AreaSpec, type AreaWords, IFACE_DEFAULTS, type LastUseKeeper, type Reply, type Writes } from "../iface/kit";
+import type { ReceiptKeeper } from "../iface/receipt";
 import { nearestOf } from "../iface/reading";
 import { type GuidanceFiles, Lines } from "../iface/texts";
 import { clockRecorded, JoinedTurnError, type Store, StoreInputError, type UserStore } from "../store";
@@ -129,6 +130,8 @@ export interface CastDeps {
   search?: MemorySearch;
   /** What keeps the values each line of the answers part was last said with in a chat, for the Prompts preview; none: nothing is kept. */
   lastUse?: LastUseKeeper;
+  /** Where the whole of a write's answer is kept when its caller reads a receipt (plan §5.2), and a receipt's size; none: every answer is given whole. */
+  receipts?: ReceiptKeeper;
   /** The user's setting for each lane in the chat: only `recall` asks it (the strengthening it records is a change of the story lane, which a Never holds back); the tools that write are held by the harness's gate before they run. */
   approvals?: Pick<ApprovalsPort, "permission">;
   /** Settings over `CAST_DEFAULTS`. */
@@ -159,6 +162,7 @@ export function castWords(deps: CastDeps, lines: Lines): AreaWords<CastCall> {
     part: CAST_ANSWERS,
     lines,
     ...(deps.lastUse !== undefined ? { lastUse: deps.lastUse } : {}),
+    ...(deps.receipts !== undefined ? { receipts: deps.receipts } : {}),
     failed: (fault) => deps.store.env.failed?.(fault),
     call: (base) => ({ ...base, deps, settings }),
     // A turn joined to another, met unresolved: told as the fact, naming both, and nothing is written. Input the store cannot read: told in the cast's words.

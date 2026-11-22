@@ -32,6 +32,10 @@
 //     jobReportChars: 1500       characters of each finished job's report it carries; past them, job_read reads the rest
 //   reply:
 //     lastText: false            a turn that ends with no reply sends the Author's last plain text in place of the error line
+//   tools:
+//     receiptTokens: 1500        tokens a tool that writes answers with at most, as a receipt: what it wrote, under which ids, and what
+//                                did not add up; the whole answer is kept in a file of the turn the receipt names; null: every tool
+//                                answers whole
 //
 // With them, the settings of the areas the turn lane hands a chat's work to, each group declared by its
 // area (`cast:`, `story:`, `worldState:`, `engine:`): read here for the chat, at every level. The areas
@@ -130,6 +134,8 @@ export interface TurnSettings {
   storyNewest: StoryNewest;
   /** The most characters of a gap check's hit in the state or the story record (`tools.gap.snippetChars`). */
   gapSnippet: number;
+  /** Tokens a tool that writes answers with at most, as a receipt whose whole answer is kept in a file of the turn (`tools.receiptTokens`, plan §5.2); null: every tool answers whole. */
+  receiptTokens: number | null;
   /** What a write to each lane does (`permissions.<lane>`), and a call of a tool outside RPE (`external`): the user's, per chat, read at every level. */
   permissions: Readonly<Record<"story" | "engine" | "external", LanePermission>>;
 }
@@ -189,6 +195,8 @@ export const TURN_DEFAULTS: Readonly<TurnSettings> = Object.freeze({
   storyFrom: "lumiverse",
   storyNewest: "directive",
   gapSnippet: 240,
+  // The plan's §5.2: a receipt of a call of a few dozen operations, its ids and its report lines, fits it; the answers it replaces ran to tens of thousands of characters.
+  receiptTokens: 1500,
   // Appendix D.1: "Write permission, each lane: Auto"; the external tier has its own, with the same three values.
   permissions: { story: "auto", engine: "auto", external: "auto" } satisfies TurnSettings["permissions"],
 });
@@ -430,6 +438,18 @@ const DEFS = {
     about: "The most characters of a gap check's hit in the world state or the story record that the agent reads and the evidence keeps.",
     effect: "turn",
   },
+  receiptTokens: {
+    key: "tools.receiptTokens",
+    default: TURN_DEFAULTS.receiptTokens,
+    takes: { type: "whole", least: 0 },
+    advice: [{ below: 100, says: "Under 100 tokens a receipt of more than a few operations leaves their ids to the file, and the agent opens the file for them." }],
+    orNone: true,
+    none: "every tool answers whole",
+    perConnection: false,
+    name: "A writing tool's receipt",
+    about: "The most tokens a tool that writes answers with: a receipt of what it wrote and under which ids, with each thing that did not add up in a line. The whole answer is kept in a file of the turn, which the receipt names and the agent reads with its file tool; a receipt past the size says how many ids it left to that file, and no report line is ever cut. None: every tool answers whole, giving back what it was sent and how each thing now stands.",
+    effect: "turn",
+  },
   permissionStory: {
     key: "permissions.story",
     default: TURN_DEFAULTS.permissions.story,
@@ -505,6 +525,7 @@ export async function turnSettings(files: FilesPort, scope: Scope, log: Log): Pr
     storyFrom: read.value(DEFS.storyFrom) as StoryFrom,
     storyNewest: read.value(DEFS.storyNewest) as StoryNewest,
     gapSnippet: read.value(DEFS.gapSnippet) as number,
+    receiptTokens: read.value(DEFS.receiptTokens) as number | null,
     permissions: {
       story: read.value(DEFS.permissionStory) as LanePermission,
       engine: read.value(DEFS.permissionEngine) as LanePermission,

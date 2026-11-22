@@ -148,11 +148,17 @@ export interface Asked {
   prov: Provenance;
 }
 
+/** What an operation adds to its entry of the answer once its changes are recorded, and what a receipt holds in its place where it names that. */
+interface After {
+  add(state: StoreState): JsonObject;
+  receipt?(state: StoreState): JsonObject;
+}
+
 /** One attempt at the call's operations on a copy of the state: the draft, or what one of them could not read. */
 interface Attempt {
   reply: Reply;
   draft: Draft;
-  afters: Map<number, (state: StoreState) => JsonObject>;
+  afters: Map<number, After>;
   unread?: Unread;
 }
 
@@ -183,11 +189,11 @@ function attempt(call: Call, base: Reading, asked: readonly Asked[], skip: Reado
   const reply = call.reply();
   const draft = new Draft(base, call);
   draft.reply = reply;
-  const afters = new Map<number, (state: StoreState) => JsonObject>();
+  const afters = new Map<number, After>();
   for (const a of asked) {
     if (skip.has(a.n)) continue;
     const later = asked.filter((x) => x.n > a.n).map((x) => x.args);
-    const o: OpContext = { n: a.n, op: a.def.name, lane: a.lane, args: a.args, prov: a.prov, draft, reply, call, reading: draft.reading(), later, after: (add) => afters.set(a.n, add) };
+    const o: OpContext = { n: a.n, op: a.def.name, lane: a.lane, args: a.args, prov: a.prov, draft, reply, call, reading: draft.reading(), later, after: (add, receipt) => afters.set(a.n, receipt === undefined ? { add } : { add, receipt }) };
     const unread = a.def.run(o);
     if (unread) return { reply, draft, afters, unread: unreadAs(call, draft, unread) };
   }
@@ -335,7 +341,8 @@ function heldRefusal(call: Call, unread: Unread, asked: readonly Asked[], held: 
  * tool that names its lane: RPH's gate asked by it before the tool ran, and the player is asked
  * once); then what may go ahead worked out again inside its write, on the state as it stands when
  * the write runs, and recorded there; and answered with what changed, how it now stands, and the
- * reports.
+ * reports. Its receipt is each operation with the ids it wrote under and what the engine made of it,
+ * and every thing that changed, without the texts the call itself sent (`answerDraft`).
  */
 export async function runOperations(call: Call, asked: readonly Asked[], askArgs?: (mine: readonly Asked[]) => JsonObject, explain?: (reply: Reply, unread: Unread, reading: Reading) => void): Promise<Reply> {
   const first = call.reply();
@@ -372,8 +379,12 @@ export async function runOperations(call: Call, asked: readonly Asked[], askArgs
     else left.push(heldBack(reply, a, why));
   }
   const added = new Map<number, JsonObject>();
-  for (const [n, add] of run.afters) added.set(n, add(done.state));
-  return answerDraft(run.draft, done, reply, { operations: left, added });
+  const short = new Map<number, JsonObject>();
+  for (const [n, after] of run.afters) {
+    added.set(n, after.add(done.state));
+    if (after.receipt !== undefined) short.set(n, after.receipt(done.state));
+  }
+  return answerDraft(run.draft, done, reply, { operations: left, added, short, sent: asked.map((a) => a.args) });
 }
 
 async function applyOperations(args: JsonObject, call: Call): Promise<Reply> {

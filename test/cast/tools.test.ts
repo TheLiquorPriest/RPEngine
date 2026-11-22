@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ApprovalAnswer, ApprovalAsk, HostTool, JsonObject, LanePermission, ToolResult } from "rp-harness/contract";
+import type { AgentRef, ApprovalAnswer, ApprovalAsk, HostTool, JsonObject, LanePermission, ToolResult } from "rp-harness/contract";
 import { castTools, type CastDeps } from "../../src/cast/index";
 import { charactersOf, pinCasting } from "../../src/cast/record";
 import { Lines, SHIPPED_GUIDANCE, shippedTexts } from "../../src/iface/texts";
-import { CHAT, openTable, type Table, USER } from "./rig";
+import { CHAT, openBench, openTable, type Table, USER } from "./rig";
 
 const patterns = Lines.parse(readFileSync(join(SHIPPED_GUIDANCE, ".prompts", "cast-answers.md"), "utf8"), "cast-answers.md").patterns();
 
@@ -350,5 +350,64 @@ describe("cast_update answers as the engine's tools do", () => {
     expect(r.error).toBeUndefined();
     expect((ops(r)[0]?.now as JsonObject).about_refs).toEqual(["quest:errand", "quest:errand/done", "quest:errand/asked"]);
     expect((r.reports ?? []).join("\n")).toContain("errand/lost names nothing in the world; the nearest are Asked, Delivered");
+  });
+});
+
+describe("the cast's writing tools answer with receipts", () => {
+  const BRAM: AgentRef = { id: "bram-1", definition: "character", plays: "Bram" };
+
+  test("with a keeper each answers the ids it wrote under and what the record made of the write, with its report lines and nothing it was sent, and names the file that holds the whole answer", async () => {
+    const kept = new Map<string, string>();
+    const b = await openBench({ receipts: { chars: 6000, keep: async (_scope, callId, text) => (kept.set(callId, text), `cache/answers/${callId}.md`) } });
+    b.t.shelf.put("entry", "e-112", "The Gilded Hart", "r1");
+    /** A receipt's own words hold nothing of `sent`; its last line names the file, which holds the whole answer and all of `sent`. The whole answer. */
+    const wholeOf = (r: ToolResult, tool: string, sent: readonly string[]): string => {
+      expect(r.error).toBeUndefined();
+      wordsFromFiles(r);
+      const named = /^This is (\w+)'s receipt\. Its whole answer, (\d+) characters, is in cache\/answers\/(.+)\.md\.$/.exec(texts(r).at(-1) ?? "");
+      const whole = kept.get(named?.[3] ?? "") ?? "";
+      expect({ tool: named?.[1], chars: Number(named?.[2]) }).toEqual({ tool, chars: whole.length });
+      for (const text of sent) expect({ text, said: texts(r).join("\n").includes(text), kept: whole.includes(text) }).toEqual({ text, said: false, kept: true });
+      expect(whole.split("\n").slice(-(r.reports?.length ?? 0) || whole.length)).toEqual(r.reports ?? []);
+      return whole;
+    };
+    const turn = await b.t.begin();
+
+    const update = await b.call(
+      "cast_update",
+      {
+        operations: [
+          { op: "bind", who: "Bram", entry: "e-112", defines: "background" },
+          { op: "cast", who: "Bram", as: "principal", line: "The innkeeper of the Gilded Hart." },
+          { op: "knowledge", who: "Bram", text: "The reeve's seal has a chipped corner.", how: "He saw it on the letter.", colour: "red" },
+        ],
+      },
+      turn.id,
+    );
+    const bram = charactersOf(b.t.db, USER, [CHAT])[0]?.id ?? "";
+    const who = { id: bram, name: "Bram" };
+    // A bound source comes with its title as Lumiverse holds it; knowledge with the id it was written under.
+    expect(dataOf(update)).toEqual({ operations: [{ n: 1, op: "bind", who, title: "The Gilded Hart" }, { n: 2, op: "cast", who }, { n: 3, op: "knowledge", who, id: expect.stringMatching(/^k-\d+$/) }] });
+    expect(update.reports).toEqual(["Operation 3 (knowledge) was written without colour. It reads who, id, text, secret, told_by, learned, belief, sure, about, how, drop, why."]);
+    expect(wholeOf(update, "cast_update", ["The innkeeper of the Gilded Hart.", "The reeve's seal has a chipped corner.", "He saw it on the letter."])).toContain('"now":');
+
+    const perceived = await b.call("perceive", { perceptions: [{ who: "Bram", moment: "Wren opens the letter", reach: "part", content: "From behind the bar: Wren breaks a seal and goes pale.", missed: "What the letter says.", knows: ["Wren had a sealed letter."] }] }, turn.id);
+    expect(dataOf(perceived)).toEqual({ perceptions: [{ n: 1, who, id: expect.stringMatching(/^p-\d+$/), knowledge: [expect.stringMatching(/^k-\d+$/)] }] });
+    wholeOf(perceived, "perceive", ["Wren opens the letter", "From behind the bar: Wren breaks a seal and goes pale.", "What the letter says.", "Wren had a sealed letter."]);
+    await b.t.tie(turn);
+
+    // The character's own writes: each entry by its number in the call and the id it was written under.
+    const later = await b.t.begin();
+    const remembered = await b.play("remember", { memories: [{ text: "She went pale at the letter, and I poured her cider as if I had not seen.", gist: "Pretended not to see her go pale.", weight: 2 }] }, later.id, BRAM);
+    expect(dataOf(remembered)).toEqual({ memories: [{ n: 1, id: expect.stringMatching(/^mem-\d+$/) }] });
+    wholeOf(remembered, "remember", ["She went pale at the letter, and I poured her cider as if I had not seen.", "Pretended not to see her go pale."]);
+
+    const mind = await b.play("mind_set", { entries: [{ kind: "feeling", text: "Cornered, and angry at being cornered." }, { kind: "plan", text: "Read the next sealed letter before I pass it on." }] }, later.id, BRAM);
+    expect(dataOf(mind)).toEqual({ entries: [{ n: 1, id: expect.stringMatching(/^\w+-\d+$/) }, { n: 2, id: expect.stringMatching(/^\w+-\d+$/) }] });
+    wholeOf(mind, "mind_set", ["Cornered, and angry at being cornered.", "Read the next sealed letter before I pass it on."]);
+
+    const related = await b.play("relate", { relationships: [{ with: "Wren", text: "She lied to me about the causeway, and I still want her safe.", trust: -10, warmth: 30 }] }, later.id, BRAM);
+    expect(dataOf(related)).toEqual({ relationships: [{ n: 1, id: expect.any(String) }] });
+    wholeOf(related, "relate", ["She lied to me about the causeway, and I still want her safe."]);
   });
 });
