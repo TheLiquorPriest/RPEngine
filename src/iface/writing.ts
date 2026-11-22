@@ -444,12 +444,47 @@ export function touchedRefs(changed: readonly JsonObject[]): string[] {
   return changed.flatMap((c) => (typeof c.at === "string" && (c.at.startsWith("entity:") || c.at.startsWith("place:")) ? [c.at] : []));
 }
 
+/** Every text a call sent, wherever in its arguments, trimmed; a list of plain values also as an answer shows one (`shown`). */
+function textsSent(value: JsonValue, out: Set<string>): void {
+  if (typeof value === "string") out.add(value.trim());
+  else if (Array.isArray(value)) {
+    for (const v of value) textsSent(v, out);
+    if (value.length > 0 && value.every((x) => x === null || typeof x !== "object")) out.add(value.map((x) => String(x)).join(", "));
+  } else if (isRecord(value)) for (const v of Object.values(value)) textsSent(v as JsonValue, out);
+}
+
+/**
+ * What changed as a receipt says it (plan §5.2): every thing that changed, with the values the engine made of the call. A value that
+ * is a text the call itself sent is not said again, nor what stood there before it: its key is named in `as_sent`, so the thing still
+ * says all that changed of it.
+ */
+function unsaid(changed: readonly JsonObject[], sent: readonly JsonValue[]): JsonObject[] {
+  const texts = new Set<string>();
+  for (const value of sent) textsSent(value, texts);
+  return changed.map((entry) => {
+    const { was, now, ...rest } = entry;
+    if (!isRecord(now)) return entry;
+    const given = Object.keys(now).filter((k) => {
+      const v = now[k];
+      return typeof v === "string" && texts.has(v.trim());
+    });
+    if (given.length === 0) return entry;
+    const others = (from: Record<string, unknown>): JsonObject => Object.fromEntries(Object.entries(from).flatMap(([k, v]) => (given.includes(k) ? [] : [[k, v as JsonValue]])));
+    const before = isRecord(was) ? others(was) : {};
+    const after = others(now);
+    return { ...rest, ...(Object.keys(before).length > 0 ? { was: before } : {}), ...(Object.keys(after).length > 0 ? { now: after } : {}), as_sent: given };
+  });
+}
+
 /**
  * The answer to a draft recorded: each operation with its lane and provenance, what changed, how it now stands, and what did not apply.
  * A turn joined to another after the write was recorded still says what it recorded; in place of how things now stand it says the fact
- * (`turn_joined`), since nothing reads the turn it was joined to here.
+ * (`turn_joined`), since nothing reads the turn it was joined to here. Its receipt (plan §5.2) is each operation with whether it applied,
+ * what it made, the ids of its changes and what it adds to its entry (`extra.short` where the operation names what a receipt holds of
+ * that), then every thing that changed, without the texts the call itself sent (`extra.sent`, its operations' arguments). How each
+ * thing now stands, and the lane and provenance the call sent, are the whole answer's.
  */
-export function answerDraft(draft: Draft, done: Committed, reply: Reply, extra: { operations?: JsonObject[]; added?: ReadonlyMap<number, JsonObject> } = {}): Reply {
+export function answerDraft(draft: Draft, done: Committed, reply: Reply, extra: { operations?: JsonObject[]; added?: ReadonlyMap<number, JsonObject>; short?: ReadonlyMap<number, JsonObject>; sent?: readonly JsonValue[] } = {}): Reply {
   const store = draft.call.deps.store;
   let view: TreeView | null = null;
   try {
@@ -462,15 +497,19 @@ export function answerDraft(draft: Draft, done: Committed, reply: Reply, extra: 
   }
   const changed = changedBetween(draft.base.state, done.state, draft.base.doc, draft.inputs.map((i) => i.value), draft.base.lines, draft.call.deps.env);
   const operations: JsonObject[] = [...(extra.operations ?? [])];
+  const receipt: JsonObject[] = [...(extra.operations ?? [])];
   for (const rec of draft.recorded) {
     const rows = rec.inputs.map((i) => done.rows[i]).filter((r): r is ChangeRow => r !== undefined);
     // An operation that recorded nothing did not apply.
     const applied = rows.length > 0 && rows.every((r) => r.applied);
     const entry: JsonObject = { n: rec.n, op: rec.op, lane: rec.lane, applied, ...provenanceData(rec.prov) };
-    if (rec.made !== undefined) entry.made = rec.made;
+    const short: JsonObject = { n: rec.n, op: rec.op, applied };
+    if (rec.made !== undefined) entry.made = short.made = rec.made;
     Object.assign(entry, extra.added?.get(rec.n) ?? {});
-    if (rows.length > 0) entry.changes = rows.map((r) => r.id);
+    Object.assign(short, extra.short?.get(rec.n) ?? extra.added?.get(rec.n) ?? {});
+    if (rows.length > 0) entry.changes = short.changes = rows.map((r) => r.id);
     operations.push(entry);
+    receipt.push(short);
     for (const r of rows) {
       for (const rep of r.reports) {
         // The store's own codes are said by their own lines (`store_<code>`), with their values; a
@@ -482,6 +521,7 @@ export function answerDraft(draft: Draft, done: Committed, reply: Reply, extra: 
     }
   }
   operations.sort((a, b) => Number(a.n) - Number(b.n));
+  receipt.sort((a, b) => Number(a.n) - Number(b.n));
   // A world's quest whose way on this call made hold (an action's outcome that set a flag its stage reads): nothing moves it but an
   // agent's call (plan §8.3), so the answer says so, with the call that moves it, and a stage that now fails by its own condition the same.
   const env = draft.call.deps.env;
@@ -497,7 +537,7 @@ export function answerDraft(draft: Draft, done: Committed, reply: Reply, extra: 
           const node = view.node(ref);
           return node ? [{ ref: node.ref, name: node.name, what: node.what, reflection: node.reflection, values: node.values.map((v) => ({ key: v.key, value: v.value, ...(v.from !== undefined ? { from: v.from } : {}) })) } as unknown as JsonObject] : [];
         });
-  reply.data({ operations, changed, now });
+  reply.data({ operations, changed, now }).receipt({ operations: receipt, changed: unsaid(changed, extra.sent ?? []) });
   reply.details = { ...reply.details, changes: done.rows.map((r) => r.id) };
   return reply;
 }

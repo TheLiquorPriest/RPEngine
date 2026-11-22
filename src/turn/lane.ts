@@ -37,7 +37,8 @@ import { charactersOf } from "../cast/record";
 import { holdersOf } from "../quests/holders";
 import { createRegistry } from "../engine/registry-impl";
 import { engineTools, gridMoves, mapView, mapWording } from "../iface";
-import type { CarriedPort, EngineDeps, LastUseKeeper } from "../iface/kit";
+import type { AreaCtx, CarriedPort, EngineDeps, LastUseKeeper } from "../iface/kit";
+import { receiptKeeper } from "../iface/receipt";
 import { indexedSearch } from "../iface/search";
 import { bindingsInForce, EntryNumbers, Lore, type LoreBooks, LoreIndex, LORE_INDEX_SETTING_DEFS, LORE_SETTINGS, LoreProjection, type LoreProposals, type LoreScope, loreLines, lorePort, loreSettingsFor, loreTools, overlayCheck, type ProjectionBooks, secretIds, secretMarkLines, type SecretSettingsFor, secretSettingsFor, storedBindings, storePath, storeWorlds } from "../lore";
 import type { CastKnowledge, PlaceSourcesReader } from "../places";
@@ -595,16 +596,19 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
   /**
    * The host's tools for a scope: one list for its session (the contract's `ToolsPort`), every family's in it, each on the chat's own
    * settings. The engine's are given squares on a map for the operations that name one, and the map that `world_query` shows, both
-   * worded by the map's lines in force, and what time brings due; the story's `overlay` operation writes the lore's overlays.
+   * worded by the map's lines in force, and what time brings due; the story's `overlay` operation writes the lore's overlays. Where his
+   * `tools.receiptTokens` is a size, the tools that write answer with receipts and keep each whole answer in the call's turn folder
+   * (plan §5.2); at none they are given no keeper, and answer whole.
    */
   const hostTools = async (scope: Scope): Promise<HostTool[]> => {
     const texts = guidanceTexts(files, scope, app.log);
     const asked = env.approvals === undefined ? {} : { approvals: env.approvals };
     const [wording, settings] = await Promise.all([mapWording(texts), turnSettings(files, scope, app.log)]);
+    const receipts = settings.receiptTokens === null ? {} : { receipts: receiptKeeper(files, settings.receiptTokens * settings.charsPerToken, app.log) };
     const [engine, cast, story, indexing] = await Promise.all([
-      engineTools({ store: store.user(scope.user), env: store.envOf(scope.user), writes: app.writes, files: texts, search: indexedSearch(stateIndex, { user: scope.user, chat: scope.chat }), grid: gridMoves(wording.lines, settings.map), map: mapView(wording, settings.map), mapSettings: settings.map, due, dueAhead: settings.worldState.dueAhead, settings: settings.engine, places: settings.places, quests: settings.quests, placeSources, questHolders, lastUse, ...(options.carried !== undefined ? { carried: options.carried } : {}), ...(options.worlds !== undefined ? { worlds: options.worlds } : {}), ...asked }),
-      castTools({ store, writes: app.writes, files: texts, sources, books: bookTexts(options.books), secretFact: (user, shown) => secretFacts.secretFactOf(user, shown), search: memorySearch, now: () => clock.now(), settings: settings.cast, lastUse, ...asked }),
-      storyTools({ store, writes: app.writes, files: texts, overlay, settings: settings.story, lastUse }),
+      engineTools({ store: store.user(scope.user), env: store.envOf(scope.user), writes: app.writes, files: texts, search: indexedSearch(stateIndex, { user: scope.user, chat: scope.chat }), grid: gridMoves(wording.lines, settings.map), map: mapView(wording, settings.map), mapSettings: settings.map, due, dueAhead: settings.worldState.dueAhead, settings: settings.engine, places: settings.places, quests: settings.quests, placeSources, questHolders, lastUse, ...receipts, ...(options.carried !== undefined ? { carried: options.carried } : {}), ...(options.worlds !== undefined ? { worlds: options.worlds } : {}), ...asked }),
+      castTools({ store, writes: app.writes, files: texts, sources, books: bookTexts(options.books), secretFact: (user, shown) => secretFacts.secretFactOf(user, shown), search: memorySearch, now: () => clock.now(), settings: settings.cast, lastUse, ...receipts, ...asked }),
+      storyTools({ store, writes: app.writes, files: texts, overlay, settings: settings.story, lastUse, ...receipts }),
       loreTools({ index: loreIndex, guidance: loadGuidance(files, scope), log: app.log }),
     ]);
     return [...engine, ...cast, ...story, ...indexing];
@@ -647,8 +651,20 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
     },
     // `web_search` over the provider he sets on the Connections page; off until he sets one.
     web,
-    // RPE's tools are a chat's: a job of no chat is given none of them.
-    tools: { all: async (scope) => (scope.chat === undefined ? ((await options.jobTools?.(scope)) ?? []) : (await hostTools(joined(scope))).map((tool) => ({ ...tool, run: (args, ctx) => tool.run(args, { ...ctx, scope: joined(ctx.scope) }) }))) },
+    // RPE's tools are a chat's: a job of no chat is given none of them. A call works at the turn its scope is joined to, and what it keeps
+    // of its own (the whole of an answer given as a receipt) goes to its own turn's folder, where RPH keeps the rest of the call.
+    tools: {
+      all: async (scope) => {
+        if (scope.chat === undefined) return (await options.jobTools?.(scope)) ?? [];
+        return (await hostTools(joined(scope))).map((tool) => ({
+          ...tool,
+          run: (args, ctx) => {
+            const own: AreaCtx = { ...ctx, scope: joined(ctx.scope), folders: ctx.scope };
+            return tool.run(args, own);
+          },
+        }));
+      },
+    },
     // `gap_check`'s places beside the chat and the lore: the folded state and the story record, at the check's turn as it is joined.
     searchers: [stateSearcher, storySearcher].map((make) => {
       const searcher = make({ store, meaning, personPlayed: (at, plays) => lore.personPlayed(at, plays), snippet: async (scope) => (await turnSettings(files, scope, app.log)).gapSnippet });

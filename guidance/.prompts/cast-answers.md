@@ -1,5 +1,5 @@
 ---
-description: The sentences the cast tools answer with (cast_query, cast_update, perceive, recall, remember, reflect, dream, mind_set, relate). A tool's answer is data from the cast and these lines, filled with that data. One line per name, a name, a colon, then its text. Change the words freely. Delete a line and that answer is given with no words. The lines named wants_ (what an argument takes) are words put inside the other lines. The Cast page is told in these words too when it is refused (no_chat, no_turn, no_character, unreadable, and the lines named page_, which only the page uses).
+description: The sentences the cast tools answer with (cast_query, cast_update, perceive, recall, remember, reflect, dream, mind_set, relate). A tool's answer is data from the cast and these lines, filled with that data. One line per name, a name, a colon, then its text. Change the words freely. Delete a line and that answer is given with no words. The lines named wants_ (what an argument takes) are words put inside the other lines. The Cast page is told in these words too when it is refused (no_chat, no_turn, no_character, unreadable, and the lines named page_, which only the page uses). A tool that writes answers with a receipt, which ends with receipt_kept, the line that names the file its whole answer is in; delete that line and those tools answer whole, and delete receipt_left and a long receipt is not cut.
 format: lines
 ---
 no_chat: There is no chat {{id}} in the engine's records.
@@ -8,6 +8,8 @@ no_turn: There is no turn {{id}} in this chat.
 turn_joined: Turn {{turn}} was joined to turn {{joined}}, the turn the continue extended, so nothing was read or written here. Address turn {{joined}} instead.
 store_unread: The cast could not read that call: {{why}}
 engine_fault: {{tool}} failed in the engine, not in your call: the fault is in RPE's log. Nothing was recorded.
+receipt_kept: This is {{tool}}'s receipt. Its whole answer, {{chars}} characters, is in {{path}}.
+receipt_left: {{left}} of the {{of}} ids {{tool}} wrote under are left out of this receipt, to hold it to its size; the file lists them all.
 no_operations: operations cannot be read: send a list of operations.
 unknown_op: Operation {{n}}: op cannot be read, you sent {{value}}. It is one of: {{choices}}.
 unreadable: {{field}} cannot be read{{#value}}: you sent {{value}}{{/value}}.{{#choices}} It is one of: {{choices}}.{{/choices}}

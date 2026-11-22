@@ -386,7 +386,11 @@ function setPlaceBase(o: OpContext, place: string, value: JsonValue | undefined)
   if (typeof value !== "string" || value.trim() === "") return notAs(o, "value", value ?? null, "words");
   if (!own(o.draft.w.ctx.world.places, place)) return refusedAs(o, { code: "missing_place", reason: say("why_no_place_place", { place: place }) }, "at", "place");
   o.draft.recordStoreOp(o.n, o.op, "engine", o.prov, { op: PLACE_OPS.base, value: { place, text: value.trim(), drawn: drawnAgainst(o.call, place) } });
-  o.after((state) => ({ base: baseOf(placeSliceOf(state), place)?.text ?? null }));
+  // The answer gives the base as it now reads; the call sent those words, so a receipt holds none of them.
+  o.after(
+    (state) => ({ base: baseOf(placeSliceOf(state), place)?.text ?? null }),
+    () => ({}),
+  );
   return undefined;
 }
 
@@ -486,8 +490,14 @@ const fact: OpDef = {
     }
     // The lane its writer names; with none named it is the engine's, and the answer says so.
     if (o.args.lane === undefined || o.args.lane === null) o.reply.report("fact_lane_default", { n: o.n, op: o.op, lane: o.lane });
-    o.draft.recordStoreOp(o.n, o.op, o.lane, o.prov, FACTS.change({ about: about.ref, key, value, ...(replaces !== undefined ? { replaces } : {}), ...(part !== undefined ? { part } : {}), ...(beat !== undefined ? { beat } : {}) }));
-    o.after((state) => ({ facts: FACTS.of(state, about.ref) }));
+    const change = FACTS.change({ about: about.ref, key, value, ...(replaces !== undefined ? { replaces } : {}), ...(part !== undefined ? { part } : {}), ...(beat !== undefined ? { beat } : {}) });
+    o.draft.recordStoreOp(o.n, o.op, o.lane, o.prov, change);
+    // The answer lists the facts standing on the thing; a receipt names the one this wrote, by the id a later fact replaces it by.
+    const id = isRecord(change.value) && typeof change.value.id === "string" ? change.value.id : null;
+    o.after(
+      (state) => ({ facts: FACTS.of(state, about.ref) }),
+      (): JsonObject => (id === null ? {} : { fact: id }),
+    );
     return undefined;
   },
 };

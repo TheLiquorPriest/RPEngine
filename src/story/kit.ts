@@ -10,6 +10,7 @@ import { calendarOf, formatClock, placeOffset } from "../engine/calendar";
 import { placeOfEntity } from "../engine/scope";
 import { writtenTime } from "../engine/time";
 import { type AreaCall, type AreaSpec, type AreaWords, type LastUseKeeper, Reply, type Writes } from "../iface/kit";
+import type { ReceiptKeeper } from "../iface/receipt";
 import { nearestOf } from "../iface/reading";
 import { type Fields, type GuidanceFiles, Lines, textOf } from "../iface/texts";
 import { clockRecorded, JoinedTurnError, type Store, StoreInputError, type StoreState, type TreeView } from "../store";
@@ -64,6 +65,8 @@ export interface StoryDeps {
   settings?: Partial<StorySettings>;
   /** Keeps the values each line a call said was filled with, as the answers part's last use in the call's chat (the Prompts preview reads them). Absent: none is kept. */
   lastUse?: LastUseKeeper;
+  /** Where the whole of a write's answer is kept when its caller reads a receipt (plan §5.2), and a receipt's size; none: every answer is given whole. */
+  receipts?: ReceiptKeeper;
   /** Milliseconds since 1970, for a row's time; `Date.now` when absent. */
   now?: () => number;
 }
@@ -90,6 +93,7 @@ export function storyWords(deps: StoryDeps, lines: Lines): AreaWords<StoryCall> 
     part: STORY_ANSWERS,
     lines,
     ...(deps.lastUse !== undefined ? { lastUse: deps.lastUse } : {}),
+    ...(deps.receipts !== undefined ? { receipts: deps.receipts } : {}),
     failed: (fault) => deps.store.env.failed?.(fault),
     call: (base) => ({ ...base, deps, settings }),
     // A turn joined to another, met unresolved: told as the fact, nothing read or written. Input the store cannot read: told in the story's words.

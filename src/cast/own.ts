@@ -34,7 +34,11 @@ const FROM_PARTS = ["perception", "memory"] as const;
 const RELATIONSHIP: Readonly<Record<string, Kind>> = { with: "name", text: "text", ...Object.fromEntries(RELATIONSHIP_DIMENSIONS.map((d) => [d, "dimension"])), from: "texts", drop: "flag", why: "text" };
 const RELATIONSHIP_READS: Reads = { reads: [...Object.keys(RELATIONSHIP), ...PROVENANCE_READS], needs: ["with"], newNeeds: [] };
 
-/** Writes what a call read, and answers with each item it wrote as it now stands, with the source it was recorded with, and with what was left out. */
+/**
+ * Writes what a call read, and answers with each item it wrote as it now stands, with the source it was recorded with, and with what was
+ * left out. Its receipt (plan §5.2) is each entry's number in the call and the id it was written under: every entry of a call that is
+ * written at all makes one write, so the writes stand in the entries' order.
+ */
 async function writeOwn(call: CastCall, reply: Reply, writer: CastWriter, items: readonly ItemRead[], writes: readonly CastWrite[], reads: Reads, key: string): Promise<Reply> {
   if (items.some((it) => it.fatal.length > 0)) return refused(reply, items, () => reads);
   const rows: CastRow[] = await call.deps.writes.run(() => writeCast(call.deps.store, writer, writes), call.tool);
@@ -47,7 +51,7 @@ async function writeOwn(call: CastCall, reply: Reply, writer: CastWriter, items:
     const item = after.record.items.get(id);
     return item === undefined ? [] : [{ ...itemView(after, item), source: sources.get(id) ?? null }];
   });
-  return reply.data({ [key]: shown });
+  return reply.data({ [key]: shown }).receipt({ [key]: rows.map((r, i) => ({ n: items[i]?.n ?? i + 1, id: r.item })) });
 }
 
 // ---------------------------------------------------------------- mind_set

@@ -161,6 +161,8 @@ async function remember(args: JsonObject, call: CastCall): Promise<Reply> {
   if (self === null) return reply;
   const items: ItemRead[] = [];
   const writes: CastWrite[] = [];
+  /** Which memory of the call each write of a memory is, by the write's place among the writes: a receipt names each id by it. */
+  const numbered = new Map<number, number>();
   for (const [i, raw] of list.entries()) {
     const n = i + 1;
     if (!isRecord(raw)) {
@@ -193,6 +195,7 @@ async function remember(args: JsonObject, call: CastCall): Promise<Reply> {
     } else if (id === undefined) needed(it, ["text", "gist"].filter((f) => fields[f] === undefined));
     else if (Object.keys(fields).length === 0) it.fatal.push({ line: "needs_one", fields: { n, op: "memory", fields: MEMORY_READS.reads.filter((f) => f !== "id" && !(PROVENANCE_READS as readonly string[]).includes(f)) } });
     if (it.fatal.length === 0) {
+      if (!only) numbered.set(writes.length, n);
       if (!only) writes.push({ character: self.character.id, part: "memory", item: (id as string | undefined) ?? null, value: fields, ...(id === undefined && moment !== undefined ? { at: moment } : {}), ...stampOn(it.prov) });
       for (const p of taken === undefined ? [] : ownIds(self, it, "perception", "taken", taken, false)) writes.push({ character: self.character.id, part: "perception", item: p, value: { taken: true }, ...stampOn(it.prov) });
     }
@@ -204,8 +207,10 @@ async function remember(args: JsonObject, call: CastCall): Promise<Reply> {
   for (const it of items) leftOut(reply, it, MEMORY_READS.reads);
   sourceLines(reply, items);
   saidLeft(reply, call.settings, leaving);
-  const shown = after(call, reply, self, new Map(rows.slice(0, writes.length).map((r, i) => [r.item, writes[i]])));
-  return shown === null ? reply : reply.data({ memories: shown });
+  const written = rows.slice(0, writes.length);
+  const shown = after(call, reply, self, new Map(written.map((r, i) => [r.item, writes[i]])));
+  if (shown === null) return reply;
+  return reply.data({ memories: shown }).receipt({ memories: written.flatMap((r, i) => (numbered.has(i) ? [{ n: numbered.get(i) ?? 0, id: r.item }] : [])) });
 }
 
 export const REMEMBER: CastToolSpec = {
@@ -249,7 +254,9 @@ async function reflect(args: JsonObject, call: CastCall): Promise<Reply> {
   leftOut(reply, it, REFLECT_READS.reads);
   sourceLines(reply, [it]);
   const shown = after(call, reply, self, new Map([[written.id, stampOn(it.prov)]]));
-  return shown === null ? reply : reply.data({ realization: shown[0] ?? null, ...(written.growth !== null ? { proposed_growth: written.growth } : {}) });
+  if (shown === null) return reply;
+  const proposed: JsonObject = written.growth !== null ? { proposed_growth: written.growth } : {};
+  return reply.data({ realization: shown[0] ?? null, ...proposed }).receipt({}, { realization: written.id, ...proposed });
 }
 
 export const REFLECT: CastToolSpec = {
@@ -330,13 +337,9 @@ async function dream(args: JsonObject, call: CastCall): Promise<Reply> {
   const made = rows.filter((r) => !byId.has(r.item)).map((r) => r.item);
   const shown = after(call, reply, self, new Map([...rows.filter((r) => byId.has(r.item)), ...rows.filter((r) => !byId.has(r.item))].map((r) => [r.item, writes[rows.indexOf(r)]])));
   if (shown === null) return reply;
-  return reply.data({
-    settled: writes.filter((w) => w.value.settled !== undefined).map((w) => w.item),
-    kept,
-    faded,
-    connections: made,
-    memories: shown,
-  });
+  const settled = writes.filter((w) => w.value.settled !== undefined).map((w) => w.item);
+  // A receipt keeps the ids the dream made longest, then those it raised and dimmed, then all it settled.
+  return reply.data({ settled, kept, faded, connections: made, memories: shown }).receipt({ connections: made, kept, faded, settled });
 }
 
 export const DREAM: CastToolSpec = {

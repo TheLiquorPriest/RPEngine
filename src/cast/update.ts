@@ -10,11 +10,14 @@
 // nothing is written. The user's setting for the story lane is held by the harness's gate before the
 // call ever runs (the spec's tier and lane), so the tool asks nothing itself. What goes ahead is
 // written in one queued write, and the answer says what each operation wrote and how its part of the
-// record now stands. A name the cast does not hold yet is made a character at the write, known to
-// every operation of the call whatever their order, so a call can bind, draw and cast someone new at
-// once; one no operation casts is made not yet cast, and the answer says so. Knowledge that names a
-// secret the lore marks makes the character its holder on the call's turn, the way a perception that
-// names it does (`secrets.ts`); a secret that cannot be held is left out, and said.
+// record now stands; its receipt (plan §5.2) is each operation's number, its op, the character and the
+// id it wrote under, with what the record made of it that the call did not send (the secrets held and
+// let go, a bound source's title, the sources a base is older than). A name the cast does not hold yet
+// is made a character at the write, known to every operation of the call whatever their order, so a
+// call can bind, draw and cast someone new at once; one no operation casts is made not yet cast, and
+// the answer says so. Knowledge that names a secret the lore marks makes the character its holder on
+// the call's turn, the way a perception that names it does (`secrets.ts`); a secret that cannot be
+// held is left out, and said.
 
 import type { Database } from "bun:sqlite";
 import type { JsonObject, JsonValue } from "rp-harness/contract";
@@ -674,6 +677,7 @@ async function update(args: JsonObject, call: CastCall): Promise<Reply> {
   const after = readingOr(call, reply);
   if (after === null) return reply;
   const operations: JsonObject[] = [];
+  const receipt: JsonObject[] = [];
   for (const o of ops) {
     leftOut(reply, o, readsOf(o.op as Op).reads);
     sourceLines(reply, [o]);
@@ -682,6 +686,7 @@ async function update(args: JsonObject, call: CastCall): Promise<Reply> {
     const id = written.ids.get(p.character) ?? p.character;
     const who = whoView({ id, name: p.name });
     const done: JsonObject = { n: p.n, op: p.op, who, wrote: p.op === "bind" && p.source !== undefined ? { [p.source.kind]: p.source.ref, ...p.value } : p.value, ...(p.prov !== undefined ? provenanceData(p.prov) : {}) };
+    const short: JsonObject = { n: p.n, op: p.op, who };
     if (p.op === "cast") {
       const character = findCharacter(store.db, user, after.chats, id) as Character;
       const casting = castingInForce(after.record, character);
@@ -689,11 +694,16 @@ async function update(args: JsonObject, call: CastCall): Promise<Reply> {
       if (casting?.pinned === true && casting.as !== p.value.as) reply.report("pinned", { n: p.n, who: p.name, as: casting.as });
     } else if (p.op === "bind" || p.op === "base") {
       const states = await sourcesNow((_s, src) => read(src.kind, src.ref), scope, bindingsOf(store.db, user, id), baseOf(store.db, user, id, scope.chat).values());
-      if (p.op === "bind") done.now = states.map(sourceView);
-      else {
+      if (p.op === "bind") {
+        done.now = states.map(sourceView);
+        // The source as Lumiverse holds it now: its title, and whether the base is older than it.
+        const bound = states.find((s) => s.kind === p.source?.kind && s.ref === p.source.ref);
+        if (bound !== undefined) Object.assign(short, bound.title !== null ? { title: bound.title } : { gone: true }, bound.newer ? { newer_than_base: true } : {});
+      } else {
         const older = states.filter((s) => s.newer);
         const growth = growthOver(after, id);
         done.now = { ...baseView(baseOf(store.db, user, id, scope.chat), null), ...(growth.length > 0 ? { growth } : {}), ...(older.length > 0 ? { older_than: older.map(sourceView) } : {}) };
+        if (older.length > 0) short.older_than = older.map(sourceView);
       }
     } else if (p.op === "filed") {
       done.now = { files: importedFiles(after.record, id).map((f) => ({ file: fileName(f), filed: isFiled(f) })) };
@@ -702,13 +712,15 @@ async function update(args: JsonObject, call: CastCall): Promise<Reply> {
       const item = itemId === undefined ? undefined : after.record.items.get(itemId);
       done.id = itemId ?? null;
       done.now = item === undefined ? null : itemView(after, item);
-      if (p.holds !== undefined) done.holds = [p.holds.fact];
+      short.id = itemId ?? null;
+      if (p.holds !== undefined) done.holds = short.holds = [p.holds.fact];
       const gone = p.forgets?.flatMap((f) => (f.events.length > 0 ? [f.fact] : [])) ?? [];
-      if (gone.length > 0) done.lets_go = gone;
+      if (gone.length > 0) done.lets_go = short.lets_go = gone;
     }
     operations.push(done);
+    receipt.push(short);
   }
-  return reply.data({ operations });
+  return reply.data({ operations }).receipt({ operations: receipt });
 }
 
 export const CAST_UPDATE: CastToolSpec = {

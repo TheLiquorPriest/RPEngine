@@ -447,3 +447,38 @@ describe("the story tools' files", () => {
     }
   });
 });
+
+describe("story_record's receipt", () => {
+  test("with a keeper it answers each operation's number, op and id, with its report lines and nothing it was sent, and names the file that holds the whole answer", async () => {
+    const operations: JsonObject[] = [
+      { op: "scene", new: true, title: "The toll bridge", who: ["Wren", "Hale"], tension: "Hale wants double." },
+      { op: "beat", text: "Hale names his price: two silver.", who: ["Hale"], colour: "grey" },
+      { op: "thread", text: "Who pays Hale's wages?", kind: "question", hot: true },
+      { op: "scene", wants: "Wren wants across; Hale wants coin." },
+    ];
+    const played = async (b: Bench): Promise<ToolResult> => {
+      await b.t.play();
+      return b.call("story_record", { operations }, (await b.t.begin()).id);
+    };
+    // The setting at none: the whole answer, as a table with no keeper gives it.
+    const whole = await played(await bench());
+    expect(ops(whole)[0]).toMatchObject({ n: 1, op: "scene", wrote: { title: "The toll bridge" }, now: { title: "The toll bridge", tension: "Hale wants double." } });
+
+    const kept = new Map<string, string>();
+    const r = await played(await bench({ receipts: { chars: 6000, keep: async (_scope, callId, text) => (kept.set(callId, text), `cache/answers/${callId}.md`) } }));
+    expect(r.error).toBeUndefined();
+    wordsFromFiles(r);
+    const scene = ops(r)[0]?.id;
+    expect(scene).toMatch(/^sc-\d+$/);
+    expect(dataOf(r)).toEqual({ operations: [{ n: 1, op: "scene", id: scene }, { n: 2, op: "beat", id: ops(whole)[1]?.id }, { n: 3, op: "thread", id: ops(whole)[2]?.id }, { n: 4, op: "scene", id: scene }] });
+    expect(r.reports).toEqual(whole.reports);
+    expect(r.reports?.[0]).toStartWith("Operation 2 (beat) was recorded without colour.");
+    for (const sent of ["The toll bridge", "Hale wants double.", "two silver", "wages", "Wren wants across"]) expect(texts(r).join("\n")).not.toContain(sent);
+    const [[callId, file] = ["", ""]] = [...kept];
+    expect(texts(r).at(-1)).toBe(`This is story_record's receipt. Its whole answer, ${file.length} characters, is in cache/answers/${callId}.md.`);
+    expect(file).toBe([...texts(whole), ...(whole.reports ?? [])].join("\n"));
+    // The lines the answer said stay where they were (each operation here names no source); the data is the receipt's, and its last line the file's.
+    expect(texts(r).slice(0, 4)).toEqual(texts(whole).slice(0, 4));
+    expect(r.details).toEqual({ parts: ["line", "line", "line", "line", "data", "line"], receipt: { path: `cache/answers/${callId}.md`, chars: file.length } });
+  });
+});

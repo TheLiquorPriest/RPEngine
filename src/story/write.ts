@@ -9,7 +9,8 @@
 // answers the whole call, and nothing is recorded. The user's setting for the story lane is not asked
 // here: the tool is a write to that lane, so the harness's gate holds the call by it before it runs,
 // once. What goes ahead is recorded in one queued write, the lore lane's overlays included, and the
-// answer says what each operation wrote, how its item now stands, and what did not add up.
+// answer says what each operation wrote, how its item now stands, and what did not add up. Its receipt
+// (plan §5.2) is each operation's number, its op and the id it wrote under.
 
 import type { AgentRef, JsonObject, JsonValue } from "rp-harness/contract";
 import type { Reply } from "../iface/kit";
@@ -481,6 +482,7 @@ async function recordOperations(args: JsonObject, call: StoryCall): Promise<Repl
   if (after === null) return reply;
   const spans = allSpans(after);
   const operations: JsonObject[] = [];
+  const receipt: JsonObject[] = [];
   for (const o of ops) {
     // What an operation was recorded without is said once, with what it reads.
     for (const u of o.unread) reply.report(u.line, u.fields);
@@ -493,6 +495,8 @@ async function recordOperations(args: JsonObject, call: StoryCall): Promise<Repl
       const ov = r as PlannedOverlay;
       const done = written.get(ov.n);
       operations.push({ n: ov.n, op: ov.op, entry: ov.entry, wrote: { text: ov.note }, ...(ov.prov !== undefined ? provenanceData(ov.prov) : {}), ...(done !== undefined ? { written: { overlay: done.change, entry: ov.entry, note: ov.note } } : { recorded: false }) });
+      // The entry is named as the lore lane knows it, which may be another id than the call's.
+      receipt.push({ n: ov.n, op: ov.op, entry: ov.entry, ...(done !== undefined ? { overlay: done.change } : { recorded: false }) });
       continue;
     }
     const p = r as Planned;
@@ -500,8 +504,9 @@ async function recordOperations(args: JsonObject, call: StoryCall): Promise<Repl
     const item = row?.item == null ? undefined : after.items.get(row.item);
     for (const report of p.reports) reply.report(report.line, report.fields);
     operations.push({ n: p.n, op: p.op, id: row?.item ?? null, wrote: valueView(after, p.value, reading.clock), ...(p.prov !== undefined ? provenanceData(p.prov) : {}), now: item === undefined ? null : itemView(after, item, reading.clock, spans) });
+    receipt.push({ n: p.n, op: p.op, id: row?.item ?? null });
   }
-  return reply.data({ operations });
+  return reply.data({ operations }).receipt({ operations: receipt });
 }
 
 export const STORY_RECORD: StoryToolSpec = {

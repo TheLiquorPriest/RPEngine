@@ -30,8 +30,12 @@ export interface OpContext {
   reading: Reading;
   /** The operations after it in the call, as sent: a name one of them spawns is theirs to make. */
   later: readonly JsonObject[];
-  /** Adds to the operation's entry in the answer, from the state as recorded (what a span of time brings due). */
-  after(add: (state: StoreState) => JsonObject): void;
+  /**
+   * Adds to the operation's entry in the answer, from the state as recorded (what a span of time brings due). `receipt`: what a receipt
+   * holds in its place (plan §5.2), where what is added gives back what the call sent or how a thing now stands: only what the engine
+   * made that the call did not send. Left out, a receipt holds what is added.
+   */
+  after(add: (state: StoreState) => JsonObject, receipt?: (state: StoreState) => JsonObject): void;
 }
 
 /**
