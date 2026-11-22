@@ -14,7 +14,7 @@ export { nameKey, recordStory, STORY_PARTS, storyHead, StoryRecord, writeStory, 
 export { storyCoverage, type StoryCoverage } from "./cover";
 export { STORY_FACT_DEFAULTS, STORY_FACT_DEFS, storyFacts, type StoryFacts, type StoryFactSettings, type StoryFactsDeps } from "./facts";
 export { closeOpenScene, sceneSession, type SceneSession } from "./sessions";
-export { STORY_FACT_SETTING_DEFS, STORY_SETTING_DEFS, STORY_SETTINGS, STORY_SO_FAR_SETTING_DEFS } from "./settings";
+export { STORY_FACT_SETTING_DEFS, STORY_SETTING_DEFS, STORY_SETTINGS, STORY_SETTINGS_RETIRED, STORY_SO_FAR_SETTING_DEFS } from "./settings";
 export { STORY_CORRECT_PATH, STORY_COVERAGE_PATH, STORY_PATH, STORY_SO_FAR_PATH, STORY_STRIKE_PATH, STORY_TIMELINE_PATH, storyRoutes, type StoryRoutesDeps } from "./routes";
 export {
   type StoryAnswer,

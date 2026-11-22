@@ -342,8 +342,7 @@ The story record, the characters' memories, places, quests and the world state t
 | `story.nearMatches` | `5` | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Near ids listed: How many near ids an answer about an id the story record does not hold lists. |
 | `story.nearDistance` | `0.25` | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Spelling distance of a near id: How far off in spelling an id may be and still be listed as a near one, as a part of its length: 0.25 lets a quarter of its letters differ. |
 | `story.ahead` | `2` | RPE-global.yml | from RPE's next start | beyond Appendix D.1, for the owner's approval | Messages ahead of a turn: Messages the chat is taken to grow by before the next turn's prompt (this turn's reply and your next message), where the story record is measured. |
-| `story.soFar.share` | `0.05` | RPE-global.yml or a chat's RPE.yml | from the next turn | Appendix D.1: The story so far, in the briefing | The story so far: share of the window: The share of the Author's window the briefing's story so far may fill. |
-| `story.soFar.minTokens` | `6000` tokens | RPE-global.yml or a chat's RPE.yml | from the next turn | Appendix D.1: The story so far, in the briefing | The story so far: fewest tokens: The fewest tokens the briefing's story so far may fill, however small the window. |
+| `story.soFar.tokens` | `16000` tokens | RPE-global.yml or a chat's RPE.yml | from the next turn | Appendix D.1: The story so far, in the briefing | The story so far: tokens: The most tokens the briefing's story so far may fill, on every model. What does not fit is counted in the block, and the Author opens it with story_query. |
 
 ### Characters and their memories
 
@@ -361,6 +360,7 @@ The story record, the characters' memories, places, quests and the world state t
 | `cast.memoryWeight` | `1` | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Weight of a memory given none: The weight a memory has when it is written with none. |
 | `cast.maxMemoryWeight` | `5` | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Highest weight of a memory: The highest weight a memory can have; weights run from 1. |
 | `cast.comesToMindTokens` | `2000` tokens | RPE-global.yml or a chat's RPE.yml | from the next turn | Appendix D.1: What comes to mind | What comes to mind: Tokens of a character's memories that come to mind for a scene. |
+| `cast.outlineTokens` | `1500` tokens | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | An outline of a character's record: Tokens an outline of a character's record may fill: in the briefing, a principal's history is given newest first up to it, and the earlier entries are counted with their size and the call that reads them. |
 | `cast.recallItems` | `10` | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Memories one recall brings back: The most memories one recall brings back; the answer says how many more touch the cue. |
 | `cast.dimensionScale` | `100` | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Scale of a relationship's dimensions: The scale a relationship's trust, warmth, respect and fear are read and reported against: from minus this to this. A value past it is kept as sent, and said to be past. |
 | `cast.dreamAfterHours` | `24` hours | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Story hours before a dream is due: Story hours after a character last dreamt (or first perceived something, if it never has) from which the fact dream.due counts it, whether or not it slept; a sleep begun since its last dream counts it sooner. Only a rule that names the fact reads it. |
@@ -390,6 +390,7 @@ The story record, the characters' memories, places, quests and the world state t
 |---|---|---|---|---|---|
 | `worldState.tokens` | `4000` tokens | RPE-global.yml or a chat's RPE.yml | from the next turn | Appendix D.1: World state: everything else | World state: everything else: Tokens of the briefing's world state that everything but the horizon shares. |
 | `worldState.dueAheadMinutes` | `360` minutes | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | Time ahead listed as due: Minutes of story time ahead that the world state's due section lists. |
+| `worldState.foldTokens` | `600` tokens | RPE-global.yml or a chat's RPE.yml | from the next turn | beyond Appendix D.1, for the owner's approval | World state: what one thing holds: Tokens the things inside one thing may take in the world state's horizon. A thing that holds more is given closed: its own line and values, what it holds by name, how large that is, and the query that opens it. People, places and what they hold directly are never closed. |
 
 ## Lore and secrets
 

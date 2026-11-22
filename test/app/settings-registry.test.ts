@@ -14,6 +14,7 @@ import { compose } from "../../src/app/compose";
 import { diskTexts, portTexts, readConfig } from "../../src/app/config-read";
 import { gatherSettings } from "../../src/app/hooks";
 import { EFFECT_WORDS, HARNESS_ROW_KEYS, type Setting } from "../../src/app/setting-list";
+import { STORY_SETTINGS_RETIRED, STORY_SO_FAR_SETTING_DEFS } from "../../src/story";
 import { CHAT_CONFIG, CHATS_FOLDER, type ChatLocation, levelFiles, levelTexts, treeSettingsOf } from "../../src/tree";
 import { NO_SESSION, turnSettings } from "../../src/turn";
 import { bootstrapSettings } from "../../src/turn/bootstrap/settings";
@@ -99,6 +100,29 @@ test("a section that is not a mapping, and a whole file that is not one, are log
     { message: "A config file is not a mapping of keys that RPE can read; the settings in it are passed over.", fields: { file: "RPE.yml", why: "RPE.yml must hold one mapping of names to values." } },
     { message: "A setting has a value it does not take; its default holds.", fields: { setting: "history", value: 5, file: "@global/RPE-global.yml", why: "history holds the settings under it as a mapping of keys, not 5." } },
   ]);
+});
+
+test("a file that still sets a key RPE reads no longer is read as before: its value is passed over, and the log names the key, the file and the setting to use, once", () => {
+  const warned: Record<string, JsonValue>[] = [];
+  const log: Log = { debug: () => undefined, info: () => undefined, warn: (_message, fields) => void warned.push(fields ?? {}), error: () => undefined };
+  const read = readConfig(
+    [
+      { level: "shipped", file: "@shipped/RPE-global.yml", text: "history:\n  window: 40\n" },
+      { level: "global", file: "@global/RPE-global.yml", text: "story:\n  soFar:\n    share: 0.1\n    minTokens: 3000\nhistory:\n  window: 12\n" },
+    ],
+    log,
+    TURN_SETTINGS,
+  );
+  for (let i = 0; i < 2; i++) read.retired(STORY_SETTINGS_RETIRED);
+
+  // The file's other settings hold, and the story so far is at its shipped size.
+  expect(read.value(TURN_SETTINGS.find((d) => d.key === "history.window")!)).toBe(12);
+  expect(read.value(STORY_SO_FAR_SETTING_DEFS.tokens)).toBe(16000);
+  expect(warned.map(({ setting, value, file }) => ({ setting, value, file }))).toEqual([
+    { setting: "story.soFar.share", value: 0.1, file: "@global/RPE-global.yml" },
+    { setting: "story.soFar.minTokens", value: 3000, file: "@global/RPE-global.yml" },
+  ]);
+  for (const { why } of warned) expect(why).toContain("story.soFar.tokens");
 });
 
 test("the same files give every area the same values", async () => {

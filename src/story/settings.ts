@@ -30,10 +30,14 @@ export const STORY_FACT_SETTING_DEFS = {
 
 /** The story so far's (`storySoFar`): read at every level, since it is worked out for each turn's briefing. */
 export const STORY_SO_FAR_SETTING_DEFS = {
-  // A share of the window: past 0 and 1 it has no meaning (plan §2.1 point 5 keeps such a bound).
-  share: { key: "story.soFar.share", default: STORY_SO_FAR_DEFAULTS.share, takes: { type: "number", least: 0, most: 1 }, perConnection: false, name: "The story so far: share of the window", about: "The share of the Author's window the briefing's story so far may fill.", effect: "turn", row: "The story so far, in the briefing" },
-  floor: { key: "story.soFar.minTokens", default: STORY_SO_FAR_DEFAULTS.floor, takes: { type: "whole", least: 0 }, perConnection: false, name: "The story so far: fewest tokens", about: "The fewest tokens the briefing's story so far may fill, however small the window.", effect: "turn", row: "The story so far, in the briefing" },
+  tokens: { key: "story.soFar.tokens", default: STORY_SO_FAR_DEFAULTS.tokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "The story so far: tokens", about: "The most tokens the briefing's story so far may fill, on every model. What does not fit is counted in the block, and the Author opens it with story_query.", effect: "turn", row: "The story so far, in the briefing" },
 } as const satisfies NumberSettings<keyof StorySoFarSettings>;
+
+/** Keys the story lane read once, each with what took its place: a config file that still sets one is read as before, and the log says so (`ConfigRead.retired`). */
+export const STORY_SETTINGS_RETIRED: Readonly<Record<string, string>> = {
+  "story.soFar.share": "The story so far has one size on every model now: set story.soFar.tokens.",
+  "story.soFar.minTokens": "The story so far has one size on every model now: set story.soFar.tokens.",
+};
 
 /** Every setting the story lane reads, as a config file writes it. */
 export const STORY_SETTINGS: readonly Setting[] = [...Object.values(STORY_SETTING_DEFS), ...Object.values(STORY_FACT_SETTING_DEFS), ...Object.values(STORY_SO_FAR_SETTING_DEFS)];

@@ -53,6 +53,8 @@ export const CAST_DEFAULTS = Object.freeze({
   weightMax: 5,
   /** What comes to mind for a scene, in tokens (plan §7.4, Appendix D.1). */
   comesToMindTokens: 2000,
+  /** What an outline of a character's record may fill, in tokens: past it, the rest is counted with its size and the call that reads it. */
+  outlineTokens: 1500,
   /** The most memories one recall brings back; the answer says how many more touch the cue. */
   recallItems: 10,
   /** The scale a relationship's dimensions are read and reported against: from minus this to this (`src/packs/relationships/core/index.ts:41-45` keeps today's regard on it). */
@@ -81,6 +83,7 @@ export const CAST_SETTING_DEFS = {
   memoryWeight: { key: "cast.memoryWeight", default: CAST_DEFAULTS.memoryWeight, takes: { type: "whole", least: 1 }, perConnection: false, name: "Weight of a memory given none", about: "The weight a memory has when it is written with none.", effect: "turn" },
   weightMax: { key: "cast.maxMemoryWeight", default: CAST_DEFAULTS.weightMax, takes: { type: "whole", least: 1 }, perConnection: false, name: "Highest weight of a memory", about: "The highest weight a memory can have; weights run from 1.", effect: "turn" },
   comesToMindTokens: { key: "cast.comesToMindTokens", default: CAST_DEFAULTS.comesToMindTokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "What comes to mind", about: "Tokens of a character's memories that come to mind for a scene.", effect: "turn", row: "What comes to mind" },
+  outlineTokens: { key: "cast.outlineTokens", default: CAST_DEFAULTS.outlineTokens, takes: { type: "whole", least: 0 }, perConnection: false, name: "An outline of a character's record", about: "Tokens an outline of a character's record may fill: in the briefing, a principal's history is given newest first up to it, and the earlier entries are counted with their size and the call that reads them.", effect: "turn" },
   recallItems: { key: "cast.recallItems", default: CAST_DEFAULTS.recallItems, takes: { type: "whole", least: 1 }, perConnection: false, name: "Memories one recall brings back", about: "The most memories one recall brings back; the answer says how many more touch the cue.", effect: "turn" },
   dimensionScale: { key: "cast.dimensionScale", default: CAST_DEFAULTS.dimensionScale, takes: { type: "number", least: 1 }, perConnection: false, name: "Scale of a relationship's dimensions", about: "The scale a relationship's trust, warmth, respect and fear are read and reported against: from minus this to this. A value past it is kept as sent, and said to be past.", effect: "turn" },
   dreamAfterHours: { key: "cast.dreamAfterHours", default: CAST_DEFAULTS.dreamAfterHours, takes: { type: "number", least: 1 }, perConnection: false, name: "Story hours before a dream is due", about: "Story hours after a character last dreamt (or first perceived something, if it never has) from which the fact dream.due counts it, whether or not it slept; a sleep begun since its last dream counts it sooner. Only a rule that names the fact reads it.", effect: "turn" },

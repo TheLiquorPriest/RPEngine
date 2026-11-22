@@ -131,7 +131,7 @@ test("for each area, a value changed through PUT /api/v1/settings is what that a
   // At the next turn: the cast's, the story lane's, the world state's and the engine's tools', each read through the one reader as a turn begins.
   const nextTurn: readonly [string, number, (t: TurnSettings) => number][] = [
     ["cast.topOfMind", 4, (t) => t.cast.topOfMind],
-    ["story.soFar.minTokens", 3000, (t) => t.storySoFar.floor],
+    ["story.soFar.tokens", 3000, (t) => t.storySoFar.tokens],
     ["worldState.tokens", 2500, (t) => t.worldState.budget],
     ["engine.searchHits", 7, (t) => t.engine.searchHits],
   ];

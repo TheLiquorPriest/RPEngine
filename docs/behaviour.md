@@ -173,13 +173,13 @@ At the start of every turn, the Author's briefing has an **On stage** part: view
 
 ```
 on_stage_views:
-  - history:principal
-  - imported:supporting
+  - history-outline:principal
+  - imported-outline:supporting
 ```
 
-As shipped, that is the history of each principal character on stage, and the old mind files, carried from the previous build and not yet filed, of each supporting one. A name alone (`history`) gives that view of everyone on stage the cast holds; a name and a casting (`history:principal`) gives it of those cast so (`principal`, `supporting` or `extra`).
+As shipped, that is the history of each principal character on stage, newest first up to a size (`cast.outlineTokens`) with the earlier entries counted, and a list, by name and size, of the old mind files of each supporting one that were carried from the previous build and are not yet filed. Their whole forms are the views `history` and `imported`. A name alone (`history`) gives that view of everyone on stage the cast holds; a name and a casting (`history:principal`) gives it of those cast so (`principal`, `supporting` or `extra`).
 
-To be shown the history of supporting characters too, and what is on a principal's mind now, copy `files/defaults/.prompts/briefing.md` to `files/.prompts/briefing.md` and change the list to:
+To be shown the whole history of principal and supporting characters, what is on a principal's mind now, and the old mind files word for word, copy `files/defaults/.prompts/briefing.md` to `files/.prompts/briefing.md` and change the list to:
 
 ```
 on_stage_views:
@@ -189,4 +189,4 @@ on_stage_views:
   - imported:supporting
 ```
 
-The views it can name are the cast's: `base`, `growth`, `mind`, `what-comes-to-mind`, `relationships:present`, `unprocessed-perceptions`, `imported`, `game-side` and `history`, each laid out by its own file in `.prompts/` (`guidance/.prompts/cast-mind.md` for `mind`, and so on). A name that is none of these is passed over. Take a name out and that view is no longer given.
+The views it can name are the cast's: `base`, `growth`, `mind`, `what-comes-to-mind`, `relationships:present`, `unprocessed-perceptions`, `imported`, `game-side`, `history`, `history-outline` and `imported-outline`, each laid out by its own file in `.prompts/` (`guidance/.prompts/cast-mind.md` for `mind`, and so on). A name that is none of these is passed over. Take a name out and that view is no longer given.

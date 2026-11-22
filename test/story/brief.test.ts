@@ -149,7 +149,7 @@ describe("the record's parts for the story so far", () => {
     });
 
     // The shape the story so far takes: the summary stands for its beats, the later beat is printed.
-    const shown = storySoFar({ record: parts, keptFrom: 6, contextWindow: 1_000_000, settings: STORY_SO_FAR_DEFAULTS, tokens: (s) => Math.ceil(s.length / 4), layout: layouts["story-so-far"] as TemplatePart });
+    const shown = storySoFar({ record: parts, keptFrom: 6, settings: STORY_SO_FAR_DEFAULTS, tokens: (s) => Math.ceil(s.length / 4), layout: layouts["story-so-far"] as TemplatePart });
     expect(shown.text).toContain("Scene summary, messages 0 to 3:\nWren crosses the ford, soaked.");
     expect(shown.text).toContain("- Message 4: A carter offers a ride.");
     expect(shown.text).not.toContain("boots");

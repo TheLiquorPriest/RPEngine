@@ -7,7 +7,9 @@
 // inferred, and none of its words are code's: the layout words every line. A section the layout
 // leaves out is not compiled, and moving one moves it.
 //
-// The horizon is never cut for length. Every other section shares a budget: each takes what it needs
+// The horizon is never cut for length: who is where, and what is at hand, is given whole. A thing in
+// it that holds more than `foldTokens` of printed lines is given closed, with what it holds by name,
+// how large that is and the query that opens it. Every other section shares a budget: each takes what it needs
 // while that is no more than an even share of what is left, and one cut short ends with the layout's
 // line counting what it left out. The outline takes the room the others leave: breadth first, a
 // level's levels go in while they fit, and a level whose levels do not fit is given as its own line
@@ -94,6 +96,8 @@ export const WORLD_STATE_DEFAULTS = Object.freeze({
   budget: 4000,
   /** Minutes of story time ahead that the due section lists. */
   dueAhead: 360,
+  /** Tokens the things inside one thing may take in the horizon; a thing that holds more is given closed. */
+  foldTokens: 600,
 });
 
 export type WorldStateSettings = { -readonly [K in keyof typeof WORLD_STATE_DEFAULTS]: number };
@@ -258,7 +262,8 @@ export function worldState(store: UserStore, input: WorldStateInput): WorldState
   if (want("horizon")) {
     const left = new Set<string>(horizon);
     const maps: Maps = { port: input.map, given: input.drawnGiven ?? {}, shown: drawnShown, grids: new Set(), around: horizon };
-    const show = (ref: string): ViewLine[] => (left.delete(ref) ? horizonLines(view, ref, depthOf.get(ref) ?? "full", maps, reading, input.placeLines) : []);
+    const closeAt = settings.foldTokens * input.charsPerToken;
+    const show = (ref: string): ViewLine[] => (left.delete(ref) ? closeLarge(view, part, horizonLines(view, ref, depthOf.get(ref) ?? "full", maps, reading, input.placeLines), closeAt, input.charsPerToken) : []);
     const said = new Set<string>();
     sections.horizon = [
       ...(scenePlace === null ? [] : show(scenePlace)),
@@ -610,6 +615,44 @@ function horizonLines(view: TreeView, ref: string, depth: number | "full", maps:
   if (map === null) return given;
   const at = given.findIndex((l, i) => i > 0 && l.kind.startsWith("level_"));
   return at < 0 ? [...given, map] : [...given.slice(0, at), map, ...given.slice(at)];
+}
+
+/**
+ * A horizon entry's lines with its large containers closed (`worldState.foldTokens`): a thing that
+ * holds things whose printed lines pass `most` characters is given as its own line with the query
+ * that opens it, its own values, and the layout's `folded` line, which names what is in it and says
+ * how large that is. The entry itself is never closed, nor a person, a place, or a thing that holds
+ * a person, and what a person or a place holds stays listed: who is where, with what at hand, is
+ * whole. A layout that words no `folded` line closes nothing (R-139: nothing goes without a word).
+ */
+function closeLarge(view: TreeView, part: Part, lines: readonly ViewLine[], most: number, charsPerToken: number): ViewLine[] {
+  if (!part.lines.has("folded")) return [...lines];
+  const personAt = (l: ViewLine): boolean => l.kind === "level_entity" && typeof l.fields.ref === "string" && view.isPerson(l.fields.ref);
+  const out: ViewLine[] = [];
+  for (let i = 0; i < lines.length; ) {
+    const line = lines[i] as ViewLine;
+    // What the level holds: the lines after it that lie deeper, from its first level on; its own values come before.
+    let end = i + 1;
+    while (end < lines.length && (lines[end] as ViewLine).depth > line.depth) end++;
+    let inner = i + 1;
+    while (inner < end && !(lines[inner] as ViewLine).kind.startsWith("level_")) inner++;
+    const held = lines.slice(inner, end);
+    const thing = i > 0 && line.kind === "level_entity" && !personAt(line) && held.length > 0 && !held.some(personAt);
+    const size = thing ? held.reduce((n, l) => n + costOf(part, l), 0) : 0;
+    if (size <= most) {
+      out.push(line);
+      i++;
+      continue;
+    }
+    const names = held.filter((l) => l.kind.startsWith("level_") && l.depth === line.depth + 1).map((l) => (typeof l.fields.name === "string" ? l.fields.name : String(l.fields.id)));
+    out.push({ ...line, fields: { ...line.fields, opens: true } }, ...lines.slice(i + 1, inner), {
+      kind: "folded",
+      depth: line.depth + 1,
+      fields: { n: names.length, one: names.length === 1, names: names.join(", "), tokens: Math.ceil(size / charsPerToken) },
+    });
+    i = end;
+  }
+  return out;
 }
 
 /**

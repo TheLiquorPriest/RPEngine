@@ -113,4 +113,40 @@ describe("the Author's views of those on stage", () => {
     ]);
     expect(await castPresentViews(["history:principal"], input(b, ["Odile"]))).toEqual([{ name: "history:principal", text: "" }]);
   });
+
+  test("the outlines the briefing lists: a principal's history newest first as far as the outline's size holds, the earlier entries counted with their size and the call that reads them; a supporting character's old mind files by name and size, with none of their text", async () => {
+    const b = await openBench();
+    const beat = await cast(b);
+    const turn = await b.t.begin();
+    const more = Array.from({ length: 30 }, (_, i) => ({ op: "history", who: "Bram", text: `Fixture year ${i + 1}: Bram mends the roof again and counts the casks before the first frost.` }));
+    expect((await b.call("cast_update", { operations: more }, turn.id)).error).toBeUndefined();
+    const odile = charactersOf(b.t.db, USER, [CHAT]).find((c) => c.name === "Odile")?.id ?? "";
+    const old = "Odile. Keeps the cellar key. ".repeat(40).trim();
+    await b.t.write(turn, [{ character: odile, part: "mind", item: `imported:${odile}:core.md`, value: { kind: "imported", file: "core.md", text: old, entity: "odile", filed: false } }], "migration");
+    await b.t.tie(turn);
+    const named = ["history-outline:principal", "imported-outline:supporting"];
+    const on = (settings: CastViewInput["settings"]) => castPresentViews(named, { ...input(b, ["Odile", "Bram"]), settings });
+
+    // Room for all of it: every entry whole, oldest first, as the whole view has them, and nothing counted.
+    const [whole] = await on({ outlineTokens: 100_000 });
+    const [history] = await castPresentViews(["history:principal"], input(b, ["Odile", "Bram"]));
+    expect(whole?.text).toBe(history?.text ?? "");
+    expect(whole?.text).toContain(`- Took the inn over from his mother. (Sat 1 Mar 2031, 8:00 AM) (beat ${beat}, years ago)`);
+
+    // A small outline: the newest entries whole and in order, the earlier ones counted, within the size.
+    const [short, files] = await on({ outlineTokens: 300 });
+    const lines = (short?.text ?? "").split("\n");
+    expect(lines[0]).toBe("### Bram's history in the story");
+    const counted = /^(\d+) earlier entries, (\d+) tokens, not shown here\. cast_query reads them: who Bram, part history\.$/.exec(lines[2] ?? "");
+    const shown = lines.filter((l) => l.startsWith("- "));
+    expect(Number(counted?.[1]) + shown.length).toBe(31);
+    expect(shown.length).toBeGreaterThan(3);
+    expect(shown.at(-1)).toStartWith("- Fixture year 30:");
+    expect(shown[0]).toStartWith(`- Fixture year ${31 - shown.length}:`);
+    expect(Number(counted?.[2])).toBeGreaterThan(Number(counted?.[1]) * 10);
+    expect(tokensOf(short?.text ?? "")).toBeLessThanOrEqual(300);
+
+    // Odile's old file is listed by its name and size; its words are not here.
+    expect(files?.text).toBe(`### Odile's old mind files, not yet filed\n- core.md: ${tokensOf(old)} tokens\n\nThey stand whole, word for word, in this turn's folder: cast/Odile/imported.md.`);
+  });
 });
