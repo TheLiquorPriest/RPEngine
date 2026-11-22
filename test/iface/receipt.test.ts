@@ -116,6 +116,8 @@ describe("a receipt", () => {
 
     // What the Turn page shows of the call keeps its shape, and gains where the whole is.
     expect(receipt.details).toEqual({ changes: [1, 2, 3, 4, 5, 6, 7], parts: ["data", "line"], receipt: { path: `${KEPT}call-1.md`, chars: file?.length ?? 0 } });
+    // The answer itself names the file that holds it whole, for the harness: it keeps no second copy, and a later turn that carries the answer names the file.
+    expect(receipt.kept).toBe(`${KEPT}call-1.md`);
     expect(warned).toEqual([]);
   });
 
