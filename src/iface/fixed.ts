@@ -19,7 +19,7 @@ import { rollOfName } from "../packs/d20/core/procedures";
 import { WORLD_STATE_DEFAULTS } from "../store/world-state";
 import type { ViewLine } from "../store/words";
 import { rulesetData } from "./bestiary";
-import { type Call, oneOf, Reply, SEARCH_KINDS, type StateKind, TEXT, type ToolSpec, WHOLE, YES_NO } from "./kit";
+import { type Call, oneOf, QUESTION, Reply, SEARCH_KINDS, type StateKind, TEXT, type ToolSpec, WHOLE, YES_NO } from "./kit";
 import { baseOf, isPlaceFactPart, PLACE_FACT_PARTS, PLACES_DEFAULTS, placeAtState, placeSliceOf, sourcesNow, sourcesOf, withPlaceLines } from "../places";
 import { queryQuests, searchedQuests } from "../quests/query";
 import { clockText, listDue, timeFrom } from "./ops-time";
@@ -65,7 +65,7 @@ export const WORLD_QUERY: ToolSpec = {
   name: "world_query",
   family: "state",
   tier: "read",
-  properties: { at: TEXT, depth: { anyOf: [WHOLE, oneOf(["full"])] }, due: TEXT, map: YES_NO, part: oneOf(PLACE_FACT_PARTS), how: oneOf(WORLD_HOWS) },
+  properties: { at: TEXT, depth: { anyOf: [WHOLE, oneOf(["full"])] }, due: TEXT, map: YES_NO, part: oneOf(PLACE_FACT_PARTS), how: oneOf(WORLD_HOWS), ...QUESTION },
   required: ["at"],
   example: { at: "thornbury", depth: 2, due: "six hours" },
   async run(args, call) {

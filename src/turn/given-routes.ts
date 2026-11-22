@@ -21,6 +21,17 @@ type GivenKind = (typeof GIVEN_KINDS)[number];
 /** The kinds RPH finds itself (`rp-harness`'s attachments): the host is never asked for them. */
 const RPH_KINDS: Readonly<Partial<Record<GivenKind, true>>> = { file: true, chat: true, lore: true, prompt: true };
 
+/**
+ * The names RPH gives of its own turn, which the host is never asked for either: the lead's briefing and what its session carries,
+ * and a thing of the window of the agent that starts another (a section of its briefing, the answer of a call of its own).
+ */
+const RPH_OWN = /^(?:briefing|session:carry|carry|briefing:.+|call:.+|work:.+\.\..+|given:.+)$/;
+
+/** Whether RPH finds a name itself, at the run. */
+function rphFinds(name: string): boolean {
+  return RPH_KINDS[kindOf(name)] === true || RPH_OWN.test(name);
+}
+
 /** What kind of thing a name an agent is given is, by its form. */
 function kindOf(ref: string): GivenKind {
   const prefixed = (["file", "lore", "prompt", "world", "story", "cast", "turn", "index", "map"] as const).find((kind) => ref.startsWith(`${kind}:`));
@@ -84,12 +95,12 @@ export function givenRoutes(turns: Turns) {
               const agent: AgentRef = { id: d.name, definition: d.name };
               const purposes = Object.entries(d.purposes ?? {});
               const named = [...new Set([...d.given, ...purposes.flatMap(([, names]) => names)])];
-              const ours = named.filter((name) => RPH_KINDS[kindOf(name)] !== true);
+              const ours = named.filter((name) => !rphFinds(name));
               // Read as a preview: nobody is started, so nothing is kept of it (the indexer's batch is held for no one).
               const read = new Map((await turns.given(scope, agent, ours, { task: "", preview: true })).map((g) => [g.ref, g.text]));
               const shown = (name: string) => {
                 const kind = kindOf(name);
-                const rph = RPH_KINDS[kind] === true;
+                const rph = rphFinds(name);
                 const text = rph ? null : (read.get(name) ?? null);
                 return { name, kind, by: rph ? ("rph" as const) : ("rpe" as const), found: rph ? null : text !== null, tokens: text === null ? null : tokens(text) };
               };

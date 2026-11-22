@@ -3,10 +3,11 @@
 // history when asked. It reads only. It picks by the record's own marks, names and positions, never by
 // what an item says, and answers in the record's order. Asked `how: gist` (plan 3.2 §7.1) it gives each
 // item by what the record itself holds that stands for it, its title and its summary, with the size of
-// the item whole; code writes no summary of its own.
+// the item whole; code writes no summary of its own. Asked a `question` (§7.4), its answer goes to a
+// reader, which answers the question from it (`hostTool`).
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
-import { oneOf, type Reply, TEXT, WHOLE, YES_NO } from "../iface/kit";
+import { oneOf, QUESTION, type Reply, TEXT, WHOLE, YES_NO } from "../iface/kit";
 import { textOf } from "../iface/texts";
 import { questRefOf } from "../quests/read";
 import { allSpans, itemView, namesOf, nearIds, placeRefOf, recordOr, type StoryCall, storyClock, type StoryToolSpec, treeOf } from "./kit";
@@ -28,6 +29,7 @@ const QUERY_PROPERTIES: Record<string, JsonObject> = {
   hot: YES_NO,
   history: YES_NO,
   how: oneOf(HOWS),
+  ...QUESTION,
 };
 
 /**

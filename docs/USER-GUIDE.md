@@ -20,6 +20,8 @@ You chat in Lumiverse as you always do. A chat whose connection is "RPE" is play
 - **The characters.** A principal character can be run as an agent of its own, in its own mind and voice, one run per character.
 - **The narrator** writes the prose from the Author's brief, when the Author hands it over. As shipped, the Author writes the reply itself, and hands it over when this chat's notes on writing ask for a separate voice, or when the turn's working has grown large.
 - **The keeper, the historian, the indexer and the mapper** do work that can wait: bookkeeping after the reply, reading a stretch of the chat's past, indexing your lore, and mapping the preset's prompt. The Author starts them as jobs.
+- **The Author's assistant** takes one part of the Author's work when the Author hands it on: a search across the record, a comparison, a stretch to weigh, records to write from what the Author decided. It works by the Author's rules, with the tools that read and the tools that record, and it cannot write to you.
+- **The reader** answers a question about a long text. An agent that wants one thing out of a lore entry, a stretch of the chat, a file or a record asks its reading tool with a question; a reader reads the whole and answers, and only the answer goes back.
 
 How each agent behaves is written in plain files you can read and change, not fixed in code (see [Files, agents, rules and skills](#files-agents-rules-and-skills)).
 

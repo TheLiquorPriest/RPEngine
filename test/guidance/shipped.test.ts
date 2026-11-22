@@ -80,6 +80,8 @@ const READ_BY_CODE: Record<string, true> = { description: true, format: true, ar
 
 /** The definitions' names, in the order E.4 lists them. */
 const AGENTS = ["author", "gm", "character", "narrator", "keeper", "historian", "indexer", "mapper", "assistant"];
+/** Series 3.2's two profiles (its plan's section 7.4): the Author's own kind for a part of its work, and the reader a question is answered by. */
+const PROFILES = ["author-assistant", "reader"];
 /** Build's five model jobs' definitions (R-171), beyond App. C's nine. */
 const BUILD_JOBS = ["build-import-lore", "build-index-text", "build-refine", "build-describe-map", "build-propose-routines"];
 
@@ -119,7 +121,7 @@ async function inForce(guidance: LoaderGuidance): Promise<string[]> {
 /** Every definition names its model and effort; who holds a tool reads the file for every agent and the rules, and who holds none reads neither. */
 async function reads(guidance: LoaderGuidance, texts: ReadonlyMap<string, string>): Promise<string[]> {
   const out: string[] = [];
-  for (const name of AGENTS) {
+  for (const name of [...AGENTS, ...PROFILES]) {
     const path = `.agents/${name}.md`;
     const definition = await guidance.definition(name);
     if (definition === undefined) {
@@ -134,7 +136,7 @@ async function reads(guidance: LoaderGuidance, texts: ReadonlyMap<string, string
     const replies = definition.tools.some((tool) => tool === "write_reply" || tool === "reply_release");
     if (holds && !replies && !definition.outOfReach.includes("reply")) out.push(`reach: ${path} does not keep the reply family out of its reach`);
     if (replies && definition.outOfReach.includes("reply")) out.push(`reach: ${path} names a reply tool and keeps the family out`);
-    if ((name === "gm" || name === "keeper") && !definition.outOfReach.includes("agents")) out.push(`reach: ${path} does not keep the agents family out of its reach`);
+    if ((name === "gm" || name === "keeper" || name === "author-assistant") && !definition.outOfReach.includes("agents")) out.push(`reach: ${path} does not keep the agents family out of its reach`);
   }
   return out;
 }
@@ -289,8 +291,19 @@ describe("each check fails on a scratch copy of the set that breaks it", () => {
   });
 });
 
-test("the shipped definitions are App. C's nine and Build's five, and no other: RPH ships none", () => {
-  expect([...SHIPPED.keys()].filter((path) => path.startsWith(".agents/")).map((path) => basename(path, ".md")).sort()).toEqual([...AGENTS, ...BUILD_JOBS].sort());
+test("the shipped definitions are App. C's nine, series 3.2's two profiles and Build's five, and no other: RPH ships none", () => {
+  expect([...SHIPPED.keys()].filter((path) => path.startsWith(".agents/")).map((path) => basename(path, ".md")).sort()).toEqual([...AGENTS, ...PROFILES, ...BUILD_JOBS].sort());
+});
+
+test("the reader holds no tool and starts nobody, and the Author's assistant holds no tool that writes to the player or starts another kind of agent", async () => {
+  const reader = await guidance.definition("reader");
+  expect({ tools: reader?.tools, starts: reader?.starts }).toEqual({ tools: [], starts: [] });
+  const assistant = await guidance.definition("author-assistant");
+  expect(assistant?.starts).toEqual(["author-assistant"]);
+  for (const tool of ["write_reply", "reply_release", "delegate", "agent_message", "job_start", "suggest"]) expect({ tool, held: assistant?.tools.includes(tool) }).toEqual({ tool, held: false });
+  // What it reads and records with is the Author's own.
+  const author = await guidance.definition("author");
+  for (const tool of assistant?.tools ?? []) if (tool !== "ask_author") expect({ tool, authors: author?.tools.includes(tool) }).toEqual({ tool, authors: true });
 });
 
 test("the Author's fixed tools, as RPH's loader reads them, are §6.8's thirty with `window` and `task`, name for name", async () => {

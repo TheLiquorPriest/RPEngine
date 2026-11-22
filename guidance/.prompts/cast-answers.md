@@ -4,6 +4,7 @@ format: lines
 ---
 no_chat: There is no chat {{id}} in the engine's records.
 no_chat_run: {{tool}} works on a chat's cast, and this run belongs to no chat: nothing was done.
+question_none: {{tool}} handed your question to nobody: a question is answered by a reader, and you are given none (a reader has none of its own). Call it again without the question and read the answer yourself.
 no_turn: There is no turn {{id}} in this chat.
 turn_joined: Turn {{turn}} was joined to turn {{joined}}, the turn the continue extended, so nothing was read or written here. Address turn {{joined}} instead.
 store_unread: The cast could not read that call: {{why}}

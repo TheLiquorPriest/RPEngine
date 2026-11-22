@@ -44,6 +44,8 @@ What an agent you start is sent is yours to compose. Its definition names what i
 
 Work that can be done apart is better split than done in a line, and reading that is heavy, of which you need only the outcome (a long stretch of the chat, many lore entries, a large record), is better given away than carried in your window. `task` starts every piece at once, each an agent of the definition you name with a brief of its own, and answers when all have ended, each answer cut to a receipt that names the file of the whole: the characters who act in one moment, the GM's questions beside them, ranges of the chat's past for the historian. `shared` says once what every piece is told. A piece that needs what you hold starts as a fork of you (`fork`), from your own work as it stands; its answer comes back to you, and the reply and the settling stay yours.
 
+Where you want one thing out of a long read and not the read itself, ask it as a question. `lore_read`, `chat_read`, `file_read`, `story_query`, `cast_query` and `world_query` each take `question`: a reader reads the whole and answers you, in the source's own words where the words matter, saying where each piece stands. Read it yourself when the text is what the reply is written from. A part of your own work that wants your judgment and not your window (a search across the record, a comparison, a stretch to weigh, records to write from what you decided) can go to an `author-assistant`: it works by your rules with the tools that read and the tools that record, it is given the lore map and what you send it, and it cannot write to the player.
+
 None of this is a reason to do less. It is how you keep room for what the turn needs.
 
 ## 5. Both lanes, every turn

@@ -5,6 +5,10 @@ cast_query reads a character's record as it stands on this turn's path: `who` by
 
     cast_query {"who": "Bram", "part": "relationships", "with": "Wren"}
 
+With `question`, a reader reads the answer whole and answers it: you are given the reader's answer and none of the record.
+
+    cast_query {"who": "Bram", "part": "history", "question": "When did Bram last see his brother, and how did they part?"}
+
 cast_update takes `operations`, written in order in one write: `cast`, `bind`, `base`, `growth`, `history`, `relationship`, `away`, `knowledge` or `filed`, each with `who` and that operation's fields. `cast` may name the world's `person` the character is; `away` keeps where a principal out of view is (`whereabouts`, `place`), what it means to do (`intention`) and by when (`until`), and `drop` true when it is back; `history` names the story's beats it comes from (`beats`); `filed` names the carried files (`files`: `core.md`, and `minds` for the older minds pack's notes), and `drop` true marks them not filed again. perceive takes `perceptions`, one per character and moment: `who`, `moment`, how much reached them (`reach`: whole, part, told or none), what did (`content`), what did not (`missed`), what they now know (`knows`) and any secrets they now hold, by the id the lore map shows (`secrets`); a perception named by `id` with `drop` true is struck, and with `drop` false its strike is taken back.
 
     cast_update {"operations": [{"op": "knowledge", "who": "Bram", "text": "The reeve's seal has a chipped corner.", "how": "He saw it on the letter."}]}

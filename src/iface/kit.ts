@@ -384,7 +384,10 @@ export interface AreaSpec<C extends AreaCall> {
   tier: ToolTier;
   /** For a tool all of whose writes go to one lane. `world_apply` names none: each operation says its own. */
   lane?: string;
-  /** Its arguments' schemas, with no description: each argument's text is in the tool's file. */
+  /**
+   * Its arguments' schemas, with no description: each argument's text is in the tool's file. A tool that reads takes a question a
+   * reader answers (`QUESTION`, plan 3.2 §7.4) by naming `question` among them: its own code is never given that argument.
+   */
   properties: Record<string, JsonObject>;
   required: readonly string[];
   /** A worked call, for the operation reference and the tests. */
@@ -493,10 +496,23 @@ export interface AreaCtx extends ToolCtx {
 }
 
 /**
+ * The argument a reading tool takes for a question (plan 3.2 §7.4), declared beside its own: asked with one, the tool answers as the
+ * call asks, whole where the call names no `how`, and a reader answers the question from that answer (`hostTool`).
+ */
+export const QUESTION: Readonly<Record<string, JsonObject>> = { question: { type: "string" } };
+
+/** What a tool's answer says, as a model reads it: its texts, then each line it reports. */
+function answerText(result: ToolResult): string {
+  return [...result.content.flatMap((part) => (part.type === "text" ? [part.text] : [])), ...(result.reports ?? [])].join("\n");
+}
+
+/**
  * A tool of any area as RPH holds it: its spec with its file's words, run with the call's context. A throw in its code is a fault,
  * answered as one (`faultAnswer`) unless the area tells it as a fact. A tool that writes answers with a receipt where the area holds
  * a keeper for one (`receipt.ts`); whatever fails in making the receipt is told as a fault of RPE's and the answer is given whole, since
- * what the call wrote stands.
+ * what the call wrote stands. A tool that reads and takes a question (`QUESTION`) hands its answer to a reader with the question,
+ * through the door RPH gives the call (`ToolCtx.reader`), and answers what the reader says: its own answer reaches nobody's window.
+ * An answer that says the call could not be read stands as it is, and a caller that can ask no reader is told so (`question_none`).
  */
 export function hostTool<C extends AreaCall>(spec: AreaSpec<C>, text: ToolText, area: AreaWords<C>): HostTool {
   return {
@@ -507,7 +523,12 @@ export function hostTool<C extends AreaCall>(spec: AreaSpec<C>, text: ToolText, 
     description: text.description,
     parameters: described(spec.properties, spec.required, text),
     async run(args: JsonValue, ctx: AreaCtx): Promise<ToolResult> {
-      const given = typeof args === "object" && args !== null && !Array.isArray(args) ? args : {};
+      const all = typeof args === "object" && args !== null && !Array.isArray(args) ? args : {};
+      // A question is the reader's, never the tool's own argument; asked with one and no `how`, the tool answers whole.
+      const takes = spec.tier === "read" && Object.hasOwn(spec.properties, "question");
+      const { question, ...rest } = all;
+      const asks = takes && typeof question === "string" && question.trim() !== "" ? question : undefined;
+      const given: JsonObject = !takes ? all : asks === undefined ? rest : { ...rest, ...(Object.hasOwn(spec.properties, "how") && rest.how === undefined ? { how: "whole" } : {}) };
       // A job of no chat has no chat's records to work on: said in the answers' words, nothing read or written.
       const { scope } = ctx;
       if (scope.chat === undefined) return new Reply(area.lines).line("no_chat_run", { tool: spec.name }).fail().result();
@@ -524,6 +545,12 @@ export function hostTool<C extends AreaCall>(spec: AreaSpec<C>, text: ToolText, 
           const told = area.told?.(error, call);
           if (told !== undefined) return told.result();
           return faultAnswer(lines, spec.name, error, area.failed, ctx.scope.turn ?? "");
+        }
+        if (asks !== undefined) {
+          const whole = reply.result();
+          if (whole.error === true) return whole;
+          if (ctx.reader === undefined) return new Reply(lines).line("question_none", { tool: spec.name }).fail().result();
+          return await ctx.reader(asks, [{ name: `${spec.name} ${JSON.stringify(rest)}`, text: answerText(whole) }]);
         }
         if (spec.tier !== "write" || area.receipts === undefined) return reply.result();
         try {

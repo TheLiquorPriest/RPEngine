@@ -1,10 +1,11 @@
 // `cast_query` (plan §7.1, §6.8): a character's record as it stands on the call's path, part by part,
 // or with no character named, who is in the cast there and as what. Sources are read live, each
 // marked when the base is older than it. It reads only. It picks by the record's own marks, names and
-// words, never by what an entry means, and answers in the record's order.
+// words, never by what an entry means, and answers in the record's order. Asked a `question` (plan 3.2
+// §7.4), its answer goes to a reader, which answers the question from it (`hostTool`).
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
-import { IFACE_DEFAULTS, oneOf, type Reply, TEXT, WHOLE, YES_NO } from "../iface/kit";
+import { IFACE_DEFAULTS, oneOf, QUESTION, type Reply, TEXT, WHOLE, YES_NO } from "../iface/kit";
 import { nearestOf } from "../iface/reading";
 import { textOf } from "../iface/texts";
 import { askOf, holdingsFor, minds, whoKnows } from "./knowledge";
@@ -29,6 +30,7 @@ const QUERY_PROPERTIES: Record<string, JsonObject> = {
   secret: TEXT,
   history: YES_NO,
   skip: WHOLE,
+  ...QUESTION,
 };
 
 /** Whether every one of `words` is in what an entry says, case ignored. */

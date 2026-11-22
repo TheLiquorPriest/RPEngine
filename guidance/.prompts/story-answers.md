@@ -4,6 +4,7 @@ format: lines
 ---
 no_chat: There is no chat {{id}} in the engine's records.
 no_chat_run: {{tool}} works on a chat's story, and this run belongs to no chat: nothing was done.
+question_none: {{tool}} handed your question to nobody: a question is answered by a reader, and you are given none (a reader has none of its own). Call it again without the question and read the answer yourself.
 no_turn: There is no turn {{id}} in this chat.
 turn_needed: Operation {{n}} ({{op}}): a record of a turn needs a turn, and this chat has none yet, so nothing was written.
 no_operations: operations cannot be read: send a list of operations.

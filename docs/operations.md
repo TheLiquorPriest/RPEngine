@@ -623,6 +623,8 @@ The agents' own list holds these with `world_apply`: read the tree at a point an
 
 Reads the world's tree at a point: the point with its values and where each comes from, the levels beneath it to the depth asked, each with a line on what is beneath it. An answer that is not everything beneath the point ends by saying how many tokens it shows of how many, so that you can open the rest or one level of it. At a place opened in full it also gives the place's record, a line for each entry: its base and the lore entries it comes from, its ways to other places with the minutes and distance by each way of travel, what adjoins it, and the newest few entries of each of what the story changed there (since), its features and its access, with a line saying how many more there are and the query that reads them; a part with nothing in it says so. At a quest it gives its record whole: what it is, each stage with its condition as written, its state and the reason it was last moved, who and where it involves, its stakes and rewards, what the player may see of it, where it comes from, its thread and that thread's state, and the beats that moved it, the newest first, with how many more there are; and for a stage the world built, what the world authored for it: its effects, rewards, gate, truth, cue, hints and the stages it goes on to. Asked for a span, it also lists what falls due in that span there; it applies none of it.
 
+Asked with a question, it hands its answer to a reader and gives you what the reader says in its place.
+
 Reads; changes nothing.
 
 | Argument | Shape | Needed | What it is |
@@ -633,6 +635,7 @@ Reads; changes nothing.
 | `map` | true or false |  | true to add the place's map as text. |
 | `part` | one of since, feature, access |  | For a place: since, feature or access, to read that part of its record whole (what the story changed there, its features, who may enter and how it stands) in place of the newest few the place's lines show. |
 | `how` | one of gist, whole |  | Where you name no depth. gist: the point alone, with one line on what is beneath it. whole: everything beneath it, as depth full. |
+| `question` | text |  | A question about what this call reads. A reader reads the answer whole (everything beneath the point, unless you name a depth or a how) and answers it: you are given its answer and none of the tree. |
 
 Worked example:
 
