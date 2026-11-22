@@ -2,7 +2,8 @@
 // size, a line for what waits, and an outline of the rest of its record with sizes; `self_read` opens the rest, a part at a time,
 // for the character the calling agent plays and for no one else, from what the character may know; `cast_query` answers by gist
 // for the omniscient side. With no size set and no outline named, a character is handed what it was handed before there were
-// sizes. Played on the cast's invented chat. Every name and every word here is made up.
+// sizes. A batch of a take-in (plan 3.2 §6.5) opens by its range of ids, whatever was struck since its plan was read. Played on the
+// cast's invented chat. Every name and every word here is made up.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { TemplatePart } from "../../src/app/guidance";
@@ -11,6 +12,7 @@ import type { CastDeps } from "../../src/cast/index";
 import { charactersOf, type CastWrite } from "../../src/cast/record";
 import { type CastViewInput, type CastViewName, castViews, type Layout } from "../../src/cast/views";
 import { CAST_START_DEFAULTS, castClock } from "../../src/cast/kit";
+import { takeInViews } from "../../src/cast/take-in";
 import { untakenSized } from "../../src/cast/zoom";
 import { isRecord } from "../../src/shared/json";
 import { writeStory } from "../../src/story/record";
@@ -533,5 +535,31 @@ describe("cast_query by gist", () => {
     expect(odd.error).toBe(true);
     expect(texts(odd)).toEqual(['how cannot be read: you sent "part". It is one of: gist, whole.']);
     expect(dataOf(await b.call("cast_query", { who: "Bram", part: "perceptions", how: "whole" }, null))).toEqual(dataOf(await b.call("cast_query", { who: "Bram", part: "perceptions" }, null)));
+  });
+});
+
+describe("a batch of a take-in", () => {
+  test("opens by its range of ids: an end struck after the plan was read still bounds the batch, and what is untaken inside it is given; a batch with nothing left says so", async () => {
+    const { b, ids } = await backlog();
+    const name = `unprocessed-perceptions[${ids[2]}..${ids[4]}]`;
+    const batch = (): string => takeInViews([name], input(b), { perceptions: layouts["unprocessed-perceptions"] })[0]?.text ?? "";
+    const held = (text: string): string[] => ids.filter((id) => text.includes(`[${id}]`));
+    expect(batch()).toContain(`The batch ${ids[2]}..${ids[4]}: 3 of its perceptions not yet taken in, oldest first.`);
+    expect(held(batch())).toEqual(ids.slice(2, 5));
+
+    // The Author strikes the batch's first perception, then its last, after the plan was read: what is left between them is still the batch's.
+    for (const [struck, left] of [[ids[2], ids.slice(3, 5)], [ids[4], ids.slice(3, 4)]] as const) {
+      const turn = await b.t.begin();
+      expect((await b.call("perceive", { perceptions: [{ id: struck ?? "", who: "Bram", drop: true, why: "It did not happen so." }] }, turn.id)).error).toBeUndefined();
+      await b.t.tie(turn);
+      expect(batch()).toContain(`The batch ${ids[2]}..${ids[4]}: ${left.length} of its perceptions not yet taken in, oldest first.`);
+      expect(held(batch())).toEqual([...left]);
+    }
+
+    // Bram takes in the one left: the batch says every perception of it has been taken in.
+    const turn = await b.t.begin();
+    expect((await b.call("remember", { memories: [{ text: "The door was bolted from outside.", gist: "Bolted in.", from: [ids[3] ?? ""] }] }, turn.id, BRAM)).error).toBeUndefined();
+    await b.t.tie(turn);
+    expect(batch()).toBe(`### What Bram has perceived and not yet taken in\n\nEvery perception of the batch ${ids[2]}..${ids[4]} has been taken in.`);
   });
 });

@@ -9,11 +9,11 @@
 //                                          that are still not taken in
 //   imported[<name>]                       one carried file, whole
 //
-// A range is by ids, which do not move: a perception taken in since the plan was read is left out of its
-// range, and one written since comes after every range. Each perception is handed over as its character may
-// read it and sized as that copy is (`zoom.ts`, `ownPerception`): what it missed and how reliable a telling
-// was never come along, whatever a layout says. Code cuts by size and lays out what the record holds; it
-// decides nothing about what a perception is worth.
+// A range is by ids, which do not move: a perception taken in or struck since the plan was read is left out of
+// its range, which keeps its ends all the same, and one written since comes after every range. Each perception
+// is handed over as its character may read it and sized as that copy is (`zoom.ts`, `ownPerception`): what it
+// missed and how reliable a telling was never come along, whatever a layout says. Code cuts by size and lays out
+// what the record holds; it decides nothing about what a perception is worth.
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
 import { isRecord } from "../shared/json";
@@ -189,8 +189,10 @@ export function takeInViews(names: readonly string[], input: Pick<CastViewInput,
   return asked.map((name): TakeInView => {
     const argued = arguedView(name);
     if (argued?.view === PERCEPTIONS) {
-      // The perceptions between the two ids in the record's own order, both included, that are still not taken in.
-      const all = record.of(character.id, "perception");
+      // The perceptions between the two ids in the record's own order, both included, that are still not taken in. The ends are looked
+      // for among every perception of the character, struck ones too: a range keeps its place when an end is struck after the plan was
+      // read, and what is still untaken inside it is given all the same.
+      const all = record.of(character.id, "perception", true);
       const [a, b] = [all.findIndex((p) => p.id === argued.from), all.findIndex((p) => p.id === argued.to)];
       const ids = a < 0 || b < 0 ? new Set<string>() : new Set(all.slice(Math.min(a, b), Math.max(a, b) + 1).map((p) => p.id));
       const items = untakenPerceptions(record, character.id).filter((p) => ids.has(p.id));
