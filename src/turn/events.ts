@@ -13,13 +13,14 @@
 // section, within the share of its budget the briefing gives it; the world's ruleset (`ruleset`), as
 // `world_query` gives it; the turn's reply as saved (`turn:reply(saved)`) and the turn's result (`turn:result`: the beats it opened in
 // order and its staged changes in both lanes, plan §10.4 step 5), each laid out by its own part; the next batch of the chat's lore no run
-// has indexed (`index:batch`), worded by the lore's lines in force; the lore index's bindings as the character the agent plays may know
-// them (`index:known-to-self`); then any view the host adds (`views`); then the cast's views of a character (`cast:<name>(…)`, §10.5),
-// or of the one the agent plays (`cast:self(…)`), with who the open scene has on stage and its place as what is present. A view with
-// nothing in it is given all the same, in its own file's words for that: the layout's `none` part (each cast view's for an agent that
-// plays nobody and is given `cast:self(…)`), the world state's `horizon_none` and `due_none` lines, the lore's `known_none` and
-// `batch_none`. Only a name none of these spaces gives is left out, and RPH says it could not be found. The Agents page reads what each
-// name resolves to through the same resolver (`givenViews`).
+// has indexed (`index:batch`), a job's plan of it in numbered batches (`index:plan`) and one of those batches by its number
+// (`index:batch(2)`, plan 3.2 §7.5), each worded by the lore's lines in force; the lore index's bindings as the character the agent plays
+// may know them (`index:known-to-self`); then any view the host adds (`views`); then the cast's views of a character (`cast:<name>(…)`,
+// §10.5), or of the one the agent plays (`cast:self(…)`), with who the open scene has on stage and its place as what is present. A view
+// with nothing in it is given all the same, in its own file's words for that: the layout's `none` part (each cast view's for an agent
+// that plays nobody and is given `cast:self(…)`), the world state's `horizon_none` and `due_none` lines, the lore's `known_none`,
+// `batch_none`, `plan_none` and `batch_number_done`. Only a name none of these spaces gives is left out, and RPH says it could not be
+// found. The Agents page reads what each name resolves to through the same resolver (`givenViews`).
 //
 // A job's every change of state is kept (`jobs.ts`); its end is recorded in the store in the same write,
 // so what it recorded takes effect before the next turn to begin, and the sessions of the turn that
@@ -32,7 +33,7 @@ import { type Fields, type Guidance, loadGuidance, type TemplatePart } from "../
 import type { AgentRef, AttachMoment, ConsentGrant, ContextBlock, FilesPort, GapCheck, JobView, JsonObject, Log, RuleFiring, RunScope, Scope, TurnEvents } from "rp-harness/contract";
 import { castViews, type MemorySearch, type SourceReader } from "../cast";
 import { mapView, mapWording, noMapWords, rulesetData, rulesetParts, rulesetPlayed } from "../iface";
-import { LORE_BATCH, LORE_KNOWN, type LoreIndex, type LoreProposals, loreBatchBlock, loreKnownBlock, loreLines } from "../lore";
+import { LORE_BATCH, LORE_KNOWN, LORE_PLAN, type LoreIndex, type LoreProposals, loreBatchBlock, loreBatchNumber, loreKnownBlock, loreLines, loreNumberedBlock, lorePlanBlock } from "../lore";
 import { type DueSource, type Lane, type Part, readPart, type Store, type ViewLine, wordLine, worldState, type WorldStateBlock, worldStateFolds } from "../store";
 import { sceneDigest, storyBrief } from "../story";
 import { storyAt } from "../story/path";
@@ -346,6 +347,20 @@ async function castNamed(deps: EventsDeps, scope: Scope, agent: AgentRef, ref: s
 }
 
 /**
+ * The lore's views by name, worded by its lines in force: the next batch (`index:batch`), a job's plan (`index:plan`) and a batch of it
+ * by number (`index:batch(2)`), each held for the job `holder` runs in, none for a preview; and what the agent's character may know of
+ * the lore (`index:known-to-self`). Undefined for any other name.
+ */
+async function loreView(deps: EventsDeps, scope: Scope, agent: AgentRef, ref: string, holder: AgentRef | undefined, guidance: () => Guidance): Promise<string | undefined> {
+  if (ref === LORE_BATCH) return await loreBatchBlock(deps.loreIndex, scope, guidance(), holder);
+  if (ref === LORE_PLAN) return await lorePlanBlock(deps.loreIndex, scope, guidance(), tokenCount((await turnSettings(deps.files, scope, deps.log)).charsPerToken), holder);
+  const n = loreBatchNumber(ref);
+  if (n !== undefined) return await loreNumberedBlock(deps.loreIndex, scope, guidance(), n, holder);
+  if (ref === LORE_KNOWN) return await knownView(deps, scope, agent, guidance());
+  return undefined;
+}
+
+/**
  * What RPE gives by each name an agent is given, at the scope, from its own spaces in the order the header says: the text, or null for a
  * name none of them gives. A name whose view cannot be read is logged and given null.
  */
@@ -367,9 +382,9 @@ export async function givenViews(deps: EventsDeps, scope: Scope, agent: AgentRef
   const out: { ref: string; text: string | null }[] = [];
   for (const ref of refs) {
     try {
-      // A preview hands nothing over, so the batch it measures is held for nobody (plan 3.2 §6.3).
+      // A preview hands nothing over, so the batch or plan it measures is held for nobody (plan 3.2 §6.3).
       const holder = moment.preview === true ? undefined : agent;
-      const mine = ref === LORE_BATCH ? await loreBatchBlock(deps.loreIndex, scope, inForce(), holder) : ref === LORE_KNOWN ? await knownView(deps, scope, agent, inForce()) : await turnView(reading, ref);
+      const mine = (await loreView(deps, scope, agent, ref, holder, inForce)) ?? (await turnView(reading, ref));
       out.push({ ref, text: mine !== undefined ? mine : ((await deps.views?.(scope, agent, ref)) ?? (await castNamed(deps, scope, agent, ref, moment))) });
     } catch (error) {
       deps.log.warn("What an agent was to be given by name could not be read.", { agent: agent.id, ref, error: error instanceof Error ? error.message : String(error) });

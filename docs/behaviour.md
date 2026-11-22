@@ -125,7 +125,7 @@ A chat with no world plays on a blank world. Its clock starts at a date nobody s
 
 ### Notes, and what the agents may write
 
-The agents read your files and never write them. They write their notes in the chat's `persistent-workspace/` folder, and their working files in the turn's folder. Notes follow the turn: a swipe or a deleted turn takes back that turn's notes, and your own edits to notes are kept. When an agent thinks one of your files should change, it files a suggestion, which you accept, edit or dismiss on the Files page.
+The agents read your files and never write them. They write their notes in the chat's `persistent-workspace/` folder, and their working files in the turn's folder; a job, which has no turn, writes its working files in its session's `scratch/` folder, where the pieces of a job split among instances share their notes. Notes follow the turn: a swipe or a deleted turn takes back that turn's notes, and your own edits to notes are kept. When an agent thinks one of your files should change, it files a suggestion, which you accept, edit or dismiss on the Files page.
 
 ## Four examples
 

@@ -469,6 +469,8 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
         meaning.nearest(at.user, at.chat, "lore", text, limit, async () => (await lore.catalog(at)).map((e) => ({ id: e.id, revision: hashJson([e.revision, e.title, e.text]), text: `${e.title}\n${e.text}` }))),
     },
   });
+  // RPH's small durable state, which also keeps an indexing job's plan with the job (plan 3.2 §7.5).
+  const durable = kvStore(app.db, app.writes);
   // The index's readable file is written at the top of the chat's folder, worded by the lore's lines in force for the chat.
   const loreIndex = new LoreIndex({
     lore,
@@ -492,6 +494,7 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
       const view = await harness.jobs.get(user, job);
       return view !== undefined && ["queued", "held", "running", "asking"].includes(view.state);
     },
+    plans: durable,
   });
   // The projection book: the world's entries written to a book of his, after a run's reply and at every change of the path, when the
   // chat's `lore.projection` is on; with it off, a book made while it was on is taken away.
@@ -691,7 +694,7 @@ export function buildTurns(app: App, options: TurnsOptions): Turns {
     switches: app.switches,
     // An agent named in RPH's progress lines as the thinking block's headings name it: a character by the name the cast gives it in the chat.
     names: { agent: (scope, agent) => agentNaming(agent, scope.chat === undefined ? () => null : characterName(store, scope.user, scope.chat)) },
-    store: kvStore(app.db, app.writes),
+    store: durable,
     trace,
     events: {
       intent: (scope, text) => events.intent(scope, text),

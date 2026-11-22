@@ -1,20 +1,22 @@
 // The lore's tools as the host hands them to RPH (plan §6.8, Appendix A `ToolsPort`), the batch an
-// indexing run is given by name (`index:batch`, the indexer's `given:`), and the lore a character's
-// agent is given as its own (`index:known-to-self`, the character's `given:`). As with the engine's and the
-// story's tools, code holds a tool's name, family, tier, lane and the shape of its arguments; its
-// description and each argument's text are its file in `.tools/`, and every sentence of an answer is
-// a line of `.prompts/lore-answers.md`. An answer is data plus those lines. The lore may not reach the
-// engine's tool kit, so it reads the files through RPH's guidance and makes its answers here, in the
-// kit's shape: data as JSON, then lines.
+// indexing run is given by name (`index:batch`, the indexer's `given:`), a job's plan and its numbered
+// batches (`index:plan`, `index:batch(n)`, plan 3.2 §7.5), and the lore a character's agent is given as
+// its own (`index:known-to-self`, the character's `given:`). As with the engine's and the story's tools,
+// code holds a tool's name, family, tier, lane and the shape of its arguments; its description and each
+// argument's text are its file in `.tools/`, and every sentence of an answer is a line of
+// `.prompts/lore-answers.md`. An answer is data plus those lines. The lore may not reach the engine's
+// tool kit, so it reads the files through RPH's guidance and makes its answers here, in the kit's
+// shape: data as JSON, then lines.
 //
 // `lore_index_write` keeps an indexing run's lines and answers with the next batch, so one run goes
-// on batch after batch for as long as its own limits let it. What a run is asked to do is its
-// definition's (`.agents/indexer.md`); nothing here starts one.
+// on batch after batch for as long as its own limits let it; a job that has a plan is answered with
+// what is left outside it, since its numbered batches hand out the rest. What a run is asked to do is
+// its definition's (`.agents/indexer.md`); nothing here starts one.
 
 import type { Fields, Guidance, LinesPart } from "../app/guidance";
 import type { AgentRef, HostTool, JsonObject, JsonSchema, JsonValue, Log, ToolContent, ToolCtx, ToolResult } from "rp-harness/contract";
 import { JoinedTurnError, type Lane } from "../store";
-import type { IndexedEntry, LoreBinding, LoreIndex, LoreIndexInput, LoreNamedFields } from "./indexing";
+import type { IndexedEntry, LoreBinding, LoreIndex, LoreIndexInput, LoreNamedFields, LorePlan } from "./indexing";
 import type { HeldSecret } from "./secrets/character";
 import type { LoreAt } from "./lore";
 
@@ -23,6 +25,18 @@ export const LORE_ANSWERS = "lore-answers";
 
 /** The name an agent is given the next batch by: a host's name, since RPH reads every `lore:` name as a lore entry. */
 export const LORE_BATCH = "index:batch";
+
+/** The name a job's agent is given its plan by (plan 3.2 §7.5): the chat's lore not indexed, cut into numbered batches, each with its size. */
+export const LORE_PLAN = "index:plan";
+
+/** A batch of a job's plan by its number (`index:batch(2)`): what an instance the job's agent starts is handed as its one batch. */
+const NUMBERED = /^index:batch\(\s*(\d+)\s*\)$/;
+
+/** The number a name opens a batch of the plan by (`index:batch(2)` is 2); undefined for any other name, the next batch's among them. */
+export function loreBatchNumber(ref: string): number | undefined {
+  const n = NUMBERED.exec(ref)?.[1];
+  return n === undefined ? undefined : Number(n);
+}
 
 /** The name a character's agent is given the lore its character knows by: a host's name, for the same reason. */
 export const LORE_KNOWN = "index:known-to-self";
@@ -112,23 +126,36 @@ export function entryFields(lines: LinesPart | undefined, e: IndexedEntry): Fiel
   };
 }
 
+/** Each entry's lines and its text, as a batch lays them out; an entry the part has no line for is not shown. */
+function entryBlocks(lines: LinesPart | undefined, entries: readonly IndexedEntry[]): string[] {
+  return entries.flatMap((e) => {
+    const fields = { ...entryFields(lines, e), text: e.text };
+    const parts = ["batch_entry", "batch_text"].flatMap((name) => loreLine(lines, name, fields) ?? []);
+    return parts.length > 0 ? [parts.join("\n")] : [];
+  });
+}
+
 /**
  * The next batch, as an indexing run is given it: a head line counting it and what is left, then each
  * entry's lines and its text. A line the part does not have is not shown; with nothing left, the part's
- * line that says so, or, where another job holds the rest, the line that says that.
+ * line that says so, or, where another job holds the rest, the line that says that; and where the rest
+ * is the job's own plan's, handed out by number, the line that says that, or nothing (never "all indexed").
  */
-export function batchText(lines: LinesPart | undefined, batch: { entries: readonly IndexedEntry[]; left: number; held?: number }): string {
+export function batchText(lines: LinesPart | undefined, batch: { entries: readonly IndexedEntry[]; left: number; held?: number; planned?: number }): string {
   const held = batch.held ?? 0;
-  if (batch.entries.length === 0) return (held > 0 ? loreLine(lines, "batch_held", { held }) : undefined) ?? loreLine(lines, "batch_none") ?? "";
-  const out: string[] = [];
-  const head = loreLine(lines, "batch_head", { count: batch.entries.length, left: batch.left, held });
-  if (head !== undefined) out.push(head);
-  for (const e of batch.entries) {
-    const fields = { ...entryFields(lines, e), text: e.text };
-    const parts = ["batch_entry", "batch_text"].flatMap((name) => loreLine(lines, name, fields) ?? []);
-    if (parts.length > 0) out.push(parts.join("\n"));
+  const planned = batch.planned ?? 0;
+  if (batch.entries.length === 0) {
+    if (planned > 0) return loreLine(lines, "batch_planned", { planned, held }) ?? "";
+    return (held > 0 ? loreLine(lines, "batch_held", { held }) : undefined) ?? loreLine(lines, "batch_none") ?? "";
   }
-  return out.join("\n\n");
+  const head = loreLine(lines, "batch_head", { count: batch.entries.length, left: batch.left, held, planned });
+  return [...(head === undefined ? [] : [head]), ...entryBlocks(lines, batch.entries)].join("\n\n");
+}
+
+/** What a block says of a view that cannot be read (no Lumiverse set up, a book that fails): the part's line for it, with the reason. */
+async function unreadable(guidance: Guidance, error: unknown): Promise<string> {
+  const reason = error instanceof Error ? error.message : String(error);
+  return loreLine(await loreLines(guidance), "batch_unreadable", { reason }) ?? reason;
 }
 
 /**
@@ -137,12 +164,60 @@ export function batchText(lines: LinesPart | undefined, batch: { entries: readon
  * with the reason, so the run is never given an empty block it takes for "all indexed".
  */
 export async function loreBatchBlock(index: LoreIndex, at: LoreAt, guidance: Guidance, agent?: AgentRef): Promise<string> {
-  const lines = await loreLines(guidance);
   try {
-    return batchText(lines, await index.batch(at, undefined, agent?.job));
+    return batchText(await loreLines(guidance), await index.batch(at, undefined, agent?.job));
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    return loreLine(lines, "batch_unreadable", { reason }) ?? reason;
+    return await unreadable(guidance, error);
+  }
+}
+
+/**
+ * A plan as the lines word it: a head line, then a line for each batch with its number, the entries it was cut with, those left to
+ * index in it and their size in tokens as opening it hands them (`tokens`, as the chat counts them), and those indexed since, gone
+ * from the lore or held by another job; the part's line that says there is nothing to plan, when there is not. A batch the part has
+ * no line for is given as its numbers, so the plan is never handed short.
+ */
+function planText(lines: LinesPart | undefined, plan: LorePlan, tokens: (text: string) => number): string {
+  if (plan.batches.length === 0) return loreLine(lines, "plan_none", { held: plan.held }) ?? "";
+  const rows = plan.batches.map((b) => {
+    const fields = { n: b.n, count: b.count, left: b.entries.length, tokens: b.entries.length === 0 ? 0 : tokens(entryBlocks(lines, b.entries).join("\n\n")), indexed: b.indexed, gone: b.gone, held: b.held, done: b.entries.length === 0 && b.held === 0 };
+    return loreLine(lines, "plan_batch", fields) ?? JSON.stringify(fields);
+  });
+  const head = loreLine(lines, "plan_head", { batches: plan.batches.length, left: plan.batches.filter((b) => b.entries.length > 0).length, held: plan.held });
+  return [...(head === undefined ? [] : [head]), ...rows].join("\n");
+}
+
+/**
+ * The `index:plan` block: the job's list of the chat's lore not indexed, cut into numbered batches when the job first asked and kept
+ * with it (`LoreIndex.plan`), worded by the lines in force. Without a job (a preview, an agent no job started) it is cut for the
+ * asking and held for no one.
+ */
+export async function lorePlanBlock(index: LoreIndex, at: LoreAt, guidance: Guidance, tokens: (text: string) => number, agent?: AgentRef): Promise<string> {
+  try {
+    return planText(await loreLines(guidance), await index.plan(at, agent?.job), tokens);
+  } catch (error) {
+    return await unreadable(guidance, error);
+  }
+}
+
+/**
+ * The `index:batch(n)` block: batch `n` of the job's plan as its entries stand now, a head line counting it and what it leaves out
+ * (entries indexed since, gone from the lore, held by another job), then each entry's lines and text as the next batch lays them
+ * out; the part's line for a batch with nothing left to index in it; for a number the plan does not have, the line that says which
+ * numbers it has.
+ */
+export async function loreNumberedBlock(index: LoreIndex, at: LoreAt, guidance: Guidance, n: number, agent?: AgentRef): Promise<string> {
+  try {
+    const lines = await loreLines(guidance);
+    const plan = await index.plan(at, agent?.job);
+    const batch = plan.batches[n - 1];
+    if (batch === undefined) return loreLine(lines, "batch_no_number", { n, batches: plan.batches.length }) ?? "";
+    const fields = { n, batches: plan.batches.length, count: batch.entries.length, size: batch.count, indexed: batch.indexed, gone: batch.gone, held: batch.held };
+    if (batch.entries.length === 0) return loreLine(lines, "batch_number_done", fields) ?? "";
+    const head = loreLine(lines, "batch_number_head", fields);
+    return [...(head === undefined ? [] : [head]), ...entryBlocks(lines, batch.entries)].join("\n\n");
+  } catch (error) {
+    return await unreadable(guidance, error);
   }
 }
 

@@ -16,7 +16,7 @@ import { lstat, readdir } from "node:fs/promises";
 import type { BigIntStats } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { FileKind, Layer, LayerLevel, OwnerWrite, Places, RefusalReason, RunScope, Writer } from "rp-harness/contract";
-import { CHARACTER_FOLDERS, CHAT_CONFIG, CHAT_FOLDERS, CHATS_FOLDER, GENERATED_FILES, GLOBAL_CONFIG, GLOBAL_FOLDERS, JOBS_FOLDER, MOUNTS, NOTES_FOLDER, SESSIONS_FOLDER, SHIPPED_FOLDER, TURN_WRITABLE, TURNS_FOLDER } from "./layout";
+import { CHARACTER_FOLDERS, CHAT_CONFIG, CHAT_FOLDERS, CHATS_FOLDER, GENERATED_FILES, GLOBAL_CONFIG, GLOBAL_FOLDERS, JOBS_FOLDER, MOUNTS, NOTES_FOLDER, SESSION_WRITABLE, SESSIONS_FOLDER, SHIPPED_FOLDER, TURN_WRITABLE, TURNS_FOLDER } from "./layout";
 
 /** The levels, farthest first, as every chat has them. */
 export function treeLayers(): Layer[] {
@@ -36,11 +36,11 @@ export function safeId(what: string, id: string): string {
   return id;
 }
 
-/** A scope's places, its turn's folder named `turnFolder`; a job of no chat's are its notes and its session's folder, under `jobs/`. */
+/** A scope's places, its turn's folder named `turnFolder`; with no turn (a job's), its notes and its session's own folders. A job of no chat's are under `jobs/`. */
 export function placesOf(scope: RunScope, turnFolder: string | null): Places {
   const notes = `${NOTES_FOLDER}/`;
   const session = `${SESSIONS_FOLDER}/${safeId("session", scope.session)}/`;
-  if (scope.turn === undefined || turnFolder === null) return { notes, session, writable: [notes] };
+  if (scope.turn === undefined || turnFolder === null) return { notes, session, writable: [notes, ...SESSION_WRITABLE.map((f) => `${session}${f}/`)] };
   const turn = `${session}${TURNS_FOLDER}/${turnFolder}/`;
   return { notes, session, turn, writable: [notes, ...TURN_WRITABLE.map((f) => `${turn}${f}/`)] };
 }

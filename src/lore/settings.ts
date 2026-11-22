@@ -48,11 +48,11 @@ export const LORE_BOOKS_DEF = {
   effect: "use",
 } as const satisfies Setting;
 
-/** The lore index's (`LoreIndex`): an indexing run's batch, and the lore map's entries bound to the horizon. */
+/** The lore index's (`LoreIndex`): an indexing run's batch (and each numbered batch of a job's plan), and the lore map's entries bound to the horizon. */
 export const LORE_INDEX_SETTING_DEFS = {
-  batch: { key: "lore.index.entriesPerCall", default: LORE_INDEX_DEFAULTS.batch, takes: { type: "whole", least: 1 }, perConnection: false, name: "Lore indexing, entries per call", about: "Entries handed to one call of a lore indexing run.", effect: "use", row: "Lore indexing, entries per call" },
+  batch: { key: "lore.index.entriesPerCall", default: LORE_INDEX_DEFAULTS.batch, takes: { type: "whole", least: 1 }, perConnection: false, name: "Lore indexing, entries per call", about: "Entries handed to one call of a lore indexing run, and the most in one numbered batch of an indexing job's plan.", effect: "use", row: "Lore indexing, entries per call" },
   bound: { key: "lore.index.bound", default: LORE_INDEX_DEFAULTS.bound, takes: { type: "whole", least: 0 }, perConnection: false, name: "Lore map, bound entries", about: "Entries bound to the horizon and not in the prompt that the lore map lists.", effect: "use", row: "Lore map, bound entries not in the prompt" },
-  batchChars: { key: "lore.index.charsPerCall", default: LORE_INDEX_DEFAULTS.batchChars, takes: { type: "whole", least: 1 }, perConnection: false, name: "Lore indexing, characters per call", about: "The most characters of entry text handed to one call of a lore indexing run, so long entries never overrun a small model's window; one entry is handed at least, however long.", effect: "use" },
+  batchChars: { key: "lore.index.charsPerCall", default: LORE_INDEX_DEFAULTS.batchChars, takes: { type: "whole", least: 1 }, perConnection: false, name: "Lore indexing, characters per call", about: "The most characters of entry text handed to one call of a lore indexing run, or put in one numbered batch of an indexing job's plan, so long entries never overrun a small model's window; one entry is handed at least, however long.", effect: "use" },
   // The route that pages the index reads its size once, from the global level.
   page: { key: "lore.index.page", default: LORE_INDEX_DEFAULTS.page, takes: { type: "whole", least: 1 }, levels: ["shipped", "global"], perConnection: false, name: "Lore index, entries per page", about: "Entries one page of the lore index on the Lore page holds.", effect: "start" },
 } as const satisfies NumberSettings<keyof LoreIndexSettings>;
