@@ -170,7 +170,9 @@ test("a backlog: her agent is given the newest of what she perceived whole withi
   expect(sent[0]).not.toContain("PERCEIVED-1");
   expect(sent[0]).toMatch(new RegExp(`Not shown here: 2 earlier perceptions, \\d+ tokens, still to be taken in\\. self_read reads them whole: part perceptions, id ${first}, to ${second}\\.`));
   expect(sent[0]).toContain("### The rest of Wren Hale's record, in outline");
-  expect(sent[0]).toMatch(new RegExp(`Night watch \\[sc-\\d+\\]: 2 perceptions, \\d+ tokens\\. self_read reads them: part perceptions, (day [^,]+, )?scene sc-\\d+, to ${second}\\.`));
+  // The scene is named to her by its id, under its day: its title is the story record's, the Author's account of the scene.
+  expect(sent[0]).toMatch(new RegExp(`Scene sc-\\d+: 2 perceptions, \\d+ tokens\\. self_read reads them: part perceptions, (day [^,]+, )?scene sc-\\d+, to ${second}\\.`));
+  for (const one of sent) expect(one).not.toContain("Night watch");
   expect(sent[0]).toMatch(new RegExp(`- \\[${first}\\] \\d+ tokens, At the stairs: KNOWN-0 someone has been at the stairs\\.`));
   // What self_read answered: the two that waited, whole, as they reached her.
   expect(sent[1]).toContain(`PERCEIVED-0 ${WIND}`);
