@@ -6,7 +6,7 @@
     "bun-types": "^1.4.2",
     "lumiverse-spindle-types": "0.6.81",
     "preact": "11.0.1",
-    "rp-harness": "git+https://github.com/TheLiquorPriest/RPHarness.git#fb61c0fcab7e7c147414719349825915341e4812",
+    "rp-harness": "git+https://github.com/TheLiquorPriest/RPHarness.git#762b94400ee7c5fe8101dffded92a918a3a60447",
     "typescript": "7.0.2"
   },
   "exports": {
