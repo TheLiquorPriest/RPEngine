@@ -106,7 +106,9 @@ test("what a chat's own RPE.yml sets holds at its next turn: the world state is 
 
   expect((before.cast_query?.data.history as JsonObject[]).map((h) => h.text)).toEqual(["She lit the lamp in the great storm.", "She rowed out for the Mary Bell."]);
   expect((after.cast_query?.data.history as JsonObject[]).map((h) => h.text)).toEqual(["She lit the lamp in the great storm."]);
-  expect(after.cast_query?.lines).toEqual(["1 more in history. Ask again with skip 1 to see them."]);
+  // What is left out is counted, and sized by the chat's characters to a token (plan 3.2 §7.1).
+  expect(after.cast_query?.lines).toHaveLength(1);
+  expect(after.cast_query?.lines[0]).toMatch(/^1 more in history, \d+ tokens whole\. Ask again with skip 1 to see them\.$/);
 
   expect((before.story_query?.data.beat as JsonObject[]).map((h) => h.text)).toEqual(["The lamp is lit.", "A gull lands on the rail."]);
   expect((after.story_query?.data.beat as JsonObject[]).map((h) => h.text)).toEqual(["The lamp is lit."]);

@@ -59,7 +59,7 @@
 import type { Carry, FilesPort, LanePermission, Log, Scope } from "rp-harness/contract";
 import { type ConfigRead, diskTextsNow, portTexts, readConfig } from "../app/config-read";
 import type { Setting } from "../app/setting-list";
-import { CAST_DEFAULTS, CAST_SETTING_DEFS, type CastSettings } from "../cast";
+import { CAST_DEFAULTS, CAST_SETTING_DEFS, CAST_START_DEFAULTS, type CastSettings, type CastStart, castStartOf } from "../cast";
 import { IFACE_DEFAULTS, IFACE_SETTING_DEFS, type IfaceSettings } from "../iface";
 import { MAP_DEFAULTS, MAP_SETTINGS, type MapConfig, mapConfigRead } from "../iface/map";
 import { WORLD_STATE_DEFAULTS, WORLD_STATE_SETTING_DEFS, type WorldStateSettings } from "../store";
@@ -119,6 +119,8 @@ export interface TurnSettings {
   window: WindowSettings;
   /** The cast's tools and views, for the chat. */
   cast: CastSettings;
+  /** What a character's own agent is handed whole of its record when it starts, for the chat (`cast.newlyPerceivedTokens`, `cast.importedTokens`; plan 3.2 §6.4): null, all of it. */
+  castStart: CastStart;
   /** The story's tools, for the chat. */
   story: StorySettings;
   /** What a place's answers and lines show, for the chat (`places.*`, registered by the story's area). */
@@ -193,6 +195,7 @@ export const TURN_DEFAULTS: Readonly<TurnSettings> = Object.freeze({
   window: WINDOW_DEFAULTS,
   // Appendix D.1, as each area keeps its own.
   cast: CAST_DEFAULTS,
+  castStart: CAST_START_DEFAULTS,
   story: STORY_DEFAULTS,
   places: PLACES_DEFAULTS,
   quests: QUESTS_DEFAULTS,
@@ -626,6 +629,7 @@ export async function turnSettings(files: FilesPort, scope: Scope, log: Log): Pr
       hold: { on: read.value(DEFS.holdOn) as boolean, cap: read.value(DEFS.holdCap) as number },
     },
     cast: read.numbers(CAST_SETTING_DEFS),
+    castStart: castStartOf(read),
     story: read.numbers(STORY_SETTING_DEFS),
     places: read.numbers(PLACES_SETTING_DEFS),
     quests: read.numbers(QUESTS_SETTING_DEFS),

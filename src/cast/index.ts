@@ -8,12 +8,13 @@
 export { CAST_MIGRATIONS } from "./schema";
 export { CAST_STORE_AREA, CAST_WRITE } from "./fold";
 export { castTools, CAST_TOOLS } from "./tools";
-export { CAST_ANSWERS, CAST_DEFAULTS, CAST_PLAYER_MIND, CAST_SETTING_DEFS, CAST_SETTINGS, type CastDeps, type CastSettings, playerMindOf } from "./kit";
+export { CAST_ANSWERS, CAST_DEFAULTS, CAST_PLAYER_MIND, CAST_SETTING_DEFS, CAST_SETTINGS, CAST_START_DEFAULTS, type CastDeps, type CastSettings, type CastStart, castStartOf, playerMindOf } from "./kit";
 export { CAST_LANE, UPDATE_OPERATIONS } from "./update";
 export { QUERY_PARTS } from "./query";
 export { REACHES } from "./perceive";
 export { CAST_FACT_DEFS, castFacts, type CastFacts, type OnStage, UNPERCEIVED_GROUPS } from "./facts";
 export { CAST_VIEWS, castPresentViews, castViews, type CastPresentView, type CastView, type CastViewInput, type CastViewName } from "./views";
+export { type OwnPerception, type OwnReading, untakenSized } from "./zoom";
 export { MemorySearch } from "./search";
 export { type SourceNow, type SourceReader } from "./sources";
 export { type BookReader, personNamed, worldAt } from "./secrets";

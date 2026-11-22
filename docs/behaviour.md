@@ -191,4 +191,4 @@ on_stage_views:
   - imported:supporting
 ```
 
-The views it can name are the cast's: `base`, `growth`, `mind`, `what-comes-to-mind`, `relationships:present`, `unprocessed-perceptions`, `imported`, `game-side`, `history`, `history-outline` and `imported-outline`, each laid out by its own file in `.prompts/` (`guidance/.prompts/cast-mind.md` for `mind`, and so on). A name that is none of these is passed over. Take a name out and that view is no longer given.
+The views it can name are the cast's: `base`, `growth`, `mind`, `what-comes-to-mind`, `relationships:present`, `unprocessed-perceptions`, `imported`, `game-side`, `history`, `history-outline` and `imported-outline`, each laid out by its own file in `.prompts/` (`guidance/.prompts/cast-mind.md` for `mind`, and so on). A name that is none of these is passed over. Take a name out and that view is no longer given. The cast has one more view, `outline`: the rest of a character's record in outline, written for the agent that plays the character, which `guidance/.agents/character.md` gives it. Its lines name `self_read`, the tool only that agent holds; the Author reads the same record with `cast_query`.

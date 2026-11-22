@@ -372,10 +372,16 @@ export function weekdayName(cal: Calendar, weekday: number): string {
   return cal.system.weekdayNames[weekday] ?? `D${weekday}`;
 }
 
+/** `Fri 16 Oct 2026`: the day a clock reading falls on, as `formatClock` opens with it. */
+export function formatDay(cal: Calendar, clock: number, offsetMinutes = 0): string {
+  const d = dateAt(cal, clock + offsetMinutes);
+  return `${weekdayName(cal, d.weekday)} ${d.day} ${monthName(cal, d.month)} ${d.year}`;
+}
+
 /** `Fri 16 Oct 2026, 7:00 AM`, `Fri 16 Oct 2026, 7:00:06 AM` where the clock holds seconds. */
 export function formatClock(cal: Calendar, clock: number, offsetMinutes = 0): string {
   const d = dateAt(cal, clock + offsetMinutes);
-  return `${weekdayName(cal, d.weekday)} ${d.day} ${monthName(cal, d.month)} ${d.year}, ${formatTimeOfDay(d.minuteOfDay, d.second)}`;
+  return `${formatDay(cal, clock, offsetMinutes)}, ${formatTimeOfDay(d.minuteOfDay, d.second)}`;
 }
 
 // ---------------------------------------------------------------- day parts and the slot grid
