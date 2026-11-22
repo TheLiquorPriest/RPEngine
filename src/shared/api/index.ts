@@ -370,6 +370,8 @@ export interface CallShown {
   /** Tokens written, reasoning among them. */
   output: number;
   reasoning: number | null;
+  /** What it weighs: its tokens as one figure, by the weights of its connection as the settings stood when this was read. */
+  weighted: number;
   /** Its request by part; null for a call of a turn played before RPH told them, whose row carries its totals alone. */
   parts: RequestPart[] | null;
   /** What it asked of its provider's cache and what came of it; null where its record gave none. */
@@ -379,7 +381,7 @@ export interface CallShown {
   error: string | null;
 }
 
-/** What a set of model calls spent together: how many; the tokens sent, those read from the provider's cache and written to it among them; of those, the tokens read from the cache and the tokens written to it, and of the written ones those of the calls that asked the cache's long lifetime; the tokens the model wrote, its reasoning among them; and its reasoning, where the provider reported it. No figure adds a cached token twice: input already holds them. */
+/** What a set of model calls spent together: how many; the tokens sent, those read from the provider's cache and written to it among them; of those, the tokens read from the cache and the tokens written to it, and of the written ones those of the calls that asked the cache's long lifetime; the tokens the model wrote, its reasoning among them; and its reasoning, where the provider reported it. No figure adds a cached token twice: input already holds them. And the same as one weighted figure. */
 export interface CallsSpent {
   calls: number;
   input: number;
@@ -388,6 +390,8 @@ export interface CallsSpent {
   cacheWriteLong: number;
   output: number;
   reasoning: number;
+  /** The weighted figure, a whole number: each token sent fresh counted 1, and each read from the cache, written to it (at its long lifetime, or not) and written by the model counted by its weight, each call by the weights of its connection as the settings stood when this was read. Tokens weighed, never money. */
+  weighted: number;
 }
 
 /** One change of a turn on its card: its id, its operation, the change in words (as the GM view words it), whether it applied, who decided it, where it came from, how sure it is, its value as written, its reports as codes and each in the engine's answers' words, its undo (the operations undoing it would record, what would be left as report codes and, each part one sentence, in the play answers' words: its kind, what it was done to and why it stays; and one sentence of what the undo does) and the changes that already undid it. */
@@ -4097,6 +4101,8 @@ export interface TurnReply {
   usage: Usage;
   /** The jobs its runs started, the first started first, each by its row as a list of jobs shows it, with what it spent as RPH counts it; none for a turn that started none, or whose jobs' records are no longer kept. */
   jobs: JobRow[];
+  /** What the kept rows of its calls weigh, whole numbers: each token sent fresh counted 1 and the rest by the weights the settings hold as this is read (`usage.weights.*`, a connection's own over them). Tokens weighed, never money. Null where no row of its calls is kept: a turn played before the rows were, and not read in. */
+  weighted: { runs: number; jobs: { [key: string]: number } } | null;
   chat: string;
   /** The lead's intent record as it was written (plan §10.3); null when it wrote none. Shown behind the spoiler gate. */
   intent: string | null;
@@ -4154,6 +4160,8 @@ export interface TurnRow {
   usage: Usage;
   /** The jobs its runs started, the first started first, each by its row as a list of jobs shows it, with what it spent as RPH counts it; none for a turn that started none, or whose jobs' records are no longer kept. */
   jobs: JobRow[];
+  /** What the kept rows of its calls weigh, whole numbers: each token sent fresh counted 1 and the rest by the weights the settings hold as this is read (`usage.weights.*`, a connection's own over them). Tokens weighed, never money. Null where no row of its calls is kept: a turn played before the rows were, and not read in. */
+  weighted: { runs: number; jobs: { [key: string]: number } } | null;
   /** Each of its runs, the first first: the run that answered is the latest that is not a Settle now run. */
   runs: TurnRunRow[];
 }
@@ -4207,6 +4215,8 @@ export interface TurnUseReply {
   agents: AgentUse[];
   /** The jobs its runs started, the first started first. */
   jobs: JobUse[];
+  /** The weights every weighted figure here was worked out by. */
+  weights: UsageWeightsShown;
 }
 
 /** What undoing a change of a turn recorded (the ids of the changes that reverse it, his own, citing it) and what is left, as report codes (a part a later change has written since, or one with no reversal) and, each part one sentence, in the play answers' words: its kind, what it was done to and why it stays. */
@@ -4265,16 +4275,34 @@ export interface UsageReply {
   total: CallsSpent;
   /** How many of its calls carry their request by part: the sums by part are of those alone. A call of a turn read in from a trace kept before RPH told the parts carries none. */
   withParts: number;
-  /** By the agent definition that made the calls, the one that used most first. */
+  /** By the agent definition that made the calls, the one that weighs most first. */
   byDefinition: { definition: string; spent: CallsSpent }[];
-  /** By what the calls were for, the operation that used most first; null gathers the calls kept before RPH named it. */
+  /** By what the calls were for, the operation that weighs most first; null gathers the calls kept before RPH named it. */
   byOperation: ({ operation: AgentOperation | null; spent: CallsSpent })[];
   /** By the part of the requests, and its name where it has one, the largest first: the calls that carried it, and its characters and its tokens by RPH's own estimate, added up over them. */
   byPart: ({ part: RequestPartKind; name: string | null; calls: number; chars: number; tokens: number })[];
-  /** By chat, the one that used most first; null gathers the jobs of no chat. */
+  /** By chat, the one that weighs most first; null gathers the jobs of no chat. */
   byChat: ({ chat: string | null; spent: CallsSpent })[];
   /** By the day each call began, as YYYY-MM-DD, the earliest first, counted in the offset asked. */
   byDay: { day: string; spent: CallsSpent }[];
+  /** The weights every weighted figure here was worked out by. */
+  weights: UsageWeightsShown;
+  /** Where the rows of model calls are kept for a number of days alone (`usage.rowsKeptDays`): the setting and the days, so that a page can say that a reading in adds rows older than that, which the next turn's end removes. Null where they are kept for good. */
+  kept: { setting: string; name: string; days: number } | null;
+}
+
+/** What each kind of token counts in the weighted figure, a token sent fresh counting 1, as the settings stood when this was read: every connection's (`usage.weights.*`), and those of each connection that has its own (`connections.<connection>.usage.weights.*`), whose calls are weighed by them. They ship as the terms of one provider; another's differ. */
+export interface UsageWeightsShown {
+  /** A token read from the provider's cache. */
+  cacheRead: number;
+  /** A token written to it by a call that did not ask the cache's long lifetime. */
+  cacheWrite: number;
+  /** A token written to it by a call that asked the long lifetime. */
+  cacheWriteLong: number;
+  /** A token the model wrote, its reasoning among them. */
+  output: number;
+  /** The connections that have weights of their own, by name. */
+  connections: { connection: string; cacheRead: number; cacheWrite: number; cacheWriteLong: number; output: number }[];
 }
 
 /** Where a job the owner started for no chat runs: the user and the job's own session, at the user's level; no chat and no turn. */
@@ -5766,7 +5794,7 @@ export interface ApiRoutes {
     long: false;
     joined: false;
   };
-  /** A chat's turns, newest first, each with what its runs spent together, the jobs its runs started with what each spent, and each of its runs by itself (its kind, where it stands, its error, its moments and its own spend); `before` is a turn's id, and older ones follow it. The settings `turns.page` and `turns.maxPage` give a page's length. */
+  /** A chat's turns, newest first, each with what its runs spent together, the jobs its runs started with what each spent, what the kept rows of its calls weigh, and each of its runs by itself (its kind, where it stands, its error, its moments and its own spend); `before` is a turn's id, and older ones follow it. The settings `turns.page` and `turns.maxPage` give a page's length. */
   "GET /api/v1/chats/:chat/turns": {
     params: { chat: string };
     query: { limit?: number; before?: TurnId };
@@ -5916,7 +5944,7 @@ export interface ApiRoutes {
     long: false;
     joined: true;
   };
-  /** Where a turn's tokens went: the agents of its runs, each with what it was handed and its model calls in order (what each was for, its tokens, its request by part, what it asked of the provider's cache), and the jobs its runs started, each with its own use. The rows stay when the turn is swiped away. */
+  /** Where a turn's tokens went: the agents of its runs, each with what it was handed and its model calls in order (what each was for, its tokens and what they weigh, its request by part, what it asked of the provider's cache), and the jobs its runs started, each with its own use; with the weights the weighted figures were worked out by. The rows stay when the turn is swiped away. */
   "GET /api/v1/chats/:chat/turns/:turn/use": {
     params: { chat: string; turn: string };
     query: Record<string, never>;
@@ -7016,7 +7044,7 @@ export interface ApiRoutes {
     long: false;
     joined: false;
   };
-  /** What a span of his model calls spent, in all and by definition, by operation, by part, by chat and by day: the calls of his newest turns (`turns`), their jobs' among them, or the calls that began in a stretch of time (`from`, `to`), of one chat or of every chat and of none. */
+  /** What a span of his model calls spent, in tokens and as the weighted figure, in all and by definition, by operation, by part, by chat and by day: the calls of his newest turns (`turns`), their jobs' among them, or the calls that began in a stretch of time (`from`, `to`), of one chat or of every chat and of none; with the weights in force, and how long the rows are kept where that is not for good. */
   "GET /api/v1/usage": {
     params: Record<string, never>;
     query: { chat?: string; turns?: number; from?: number; to?: number; offset?: number };

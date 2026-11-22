@@ -1,7 +1,7 @@
 // The Turn page's shared shapes: what a section is drawn from, what a section is, and the turn's folder as the page holds it.
 
 import type { ComponentChildren } from "preact";
-import type { FolderEntry, RequestReply, StageTurn, TurnLoreRow, TurnReply } from "../../../shared/api";
+import type { FolderEntry, RequestReply, StageTurn, TurnLoreRow, TurnReply, TurnUseReply } from "../../../shared/api";
 import type { ReviewShown } from "./review";
 import type { RunNode } from "../../live-model";
 import type { NoticeLines } from "../../notice-words";
@@ -45,7 +45,11 @@ export interface TurnParts {
   stage?: StageTurn | null;
   /** The turn's review card and the record an old engine kept for a carried reply; read once the spoiler gate is open. */
   review?: ReviewShown;
+  /** Where the turn's tokens went, from the rows kept of its model calls, read once the spoiler gate is open; null until read. */
+  use?: TurnUseReply | null;
   onOpenQuest?(id: string): void;
+  /** Opens a setting on the Settings page, by its key. */
+  onOpenSetting?: ((key: string) => void) | undefined;
   onOpenFile(name: string): void;
   onOpenRequest(name: string, held: string | null): void;
   onCloseFile(): void;

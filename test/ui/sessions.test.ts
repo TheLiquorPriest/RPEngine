@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { h } from "preact";
 import type { SessionShown } from "../../src/shared/api";
 import { groupSessions, sessionName, SessionsView } from "../../src/ui/pages/sessions";
-import { CallsLine } from "../../src/ui/pages/usage";
+import { CallsLine } from "../../src/ui/pages/run-usage";
 import { elements, expand, textOf } from "./vnodes";
 
 const scene = (id: string, opened: number, over: Partial<SessionShown> = {}): SessionShown => ({ id, user: "u", chat: "c", kind: "scene", state: "open", opened, turns: 3, ...over });

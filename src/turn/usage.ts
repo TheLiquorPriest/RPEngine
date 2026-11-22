@@ -15,6 +15,11 @@
 // own book counts it), and its row is written then.
 //
 // RPH's `input` already holds the tokens read from and written to the provider's cache (`Usage`): no sum here adds them again.
+//
+// Beside the tokens as counted, every sum gives one weighted figure (plan §4 "The pages show"): each token sent fresh counted 1, and
+// each read from the cache, written to it and written by the model counted by a weight. The weights are the user's settings, given
+// to each read (`UsageWeights`), a connection's own standing over them for its calls; the figure is worked out as it is read, so a
+// weight changed changes it for every row kept. It is tokens weighed, never money.
 
 import type { Database } from "bun:sqlite";
 import type { AgentOperation, CallCache, Effort, Log, RequestPart, RequestPartKind, SentItem, TraceRecord, Usage } from "rp-harness/contract";
@@ -83,7 +88,37 @@ export interface SentRow {
   from: SentItem["from"];
 }
 
-/** What a set of calls spent together: how many, their tokens sent (cached ones among them), read from the cache, written to it and of that at the long lifetime, written, and of those the reasoning. */
+/**
+ * What each kind of token counts in the weighted figure, a token sent fresh counting 1 (plan §2: "a turn's tokens as the provider
+ * weighs them"). They are the user's settings (`usage.weights.*`), shipped as the terms of one provider.
+ */
+export interface Weights {
+  /** A token read from the provider's cache. */
+  cacheRead: number;
+  /** A token written to the cache by a call that did not ask the long lifetime. */
+  cacheWrite: number;
+  /** A token written to the cache by a call that asked the long lifetime. */
+  cacheWriteLong: number;
+  /** A token the model wrote, its reasoning among them. */
+  output: number;
+}
+
+/** The weights as a read finds them: every connection's, and those of each connection that has its own, by the name its calls' rows carry. */
+export interface UsageWeights {
+  general: Weights;
+  connections: ReadonlyMap<string, Weights>;
+}
+
+/** The weights the calls of a connection are weighed by: its own where it has them, else every connection's. */
+export function weightsOf(weights: UsageWeights, connection: string): Weights {
+  return weights.connections.get(connection) ?? weights.general;
+}
+
+/**
+ * What a set of calls spent together: how many, their tokens sent (cached ones among them), read from the cache, written to it and
+ * of that at the long lifetime, written, and of those the reasoning; and the same as one figure, each kind of token counted by its
+ * weight as the settings stood when the sum was read.
+ */
 export interface Spent {
   calls: number;
   input: number;
@@ -93,6 +128,8 @@ export interface Spent {
   cacheWriteLong: number;
   output: number;
   reasoning: number;
+  /** The weighted figure, rounded to a whole number: never money. */
+  weighted: number;
 }
 
 /** The calls a sum is over: of one chat, begun at or after `from` and before `to`, recorded under one of `turns`; each left out bounds nothing. */
@@ -343,21 +380,47 @@ function callOf(r: CallColumns): CallRow {
 const SPENT = `count(*) AS calls, COALESCE(sum(c.input), 0) AS input, COALESCE(sum(c.cache_read), 0) AS cacheRead, COALESCE(sum(c.cache_write), 0) AS cacheWrite,
   COALESCE(sum(CASE WHEN json_extract(c.cache, '$.asked') = 'long' THEN c.cache_write ELSE 0 END), 0) AS cacheWriteLong, COALESCE(sum(c.output), 0) AS output, COALESCE(sum(c.reasoning), 0) AS reasoning`;
 
-const spentOf = (r: Spent): Spent => ({ calls: r.calls, input: r.input, cacheRead: r.cacheRead, cacheWrite: r.cacheWrite, cacheWriteLong: r.cacheWriteLong, output: r.output, reasoning: r.reasoning });
+/** Tokens as counted, before any weight is put on them. */
+type Counted = Omit<Spent, "weighted">;
 
-/** What these calls spent together. */
-export function spentBy(calls: readonly CallRow[]): Spent {
-  const sum: Spent = { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, cacheWriteLong: 0, output: 0, reasoning: 0 };
-  for (const c of calls) {
-    sum.calls++;
-    sum.input += c.input;
-    sum.cacheRead += c.cacheRead;
-    sum.cacheWrite += c.cacheWrite;
-    if (c.cache?.asked === "long") sum.cacheWriteLong += c.cacheWrite;
-    sum.output += c.output;
-    sum.reasoning += c.reasoning ?? 0;
-  }
-  return sum;
+/**
+ * What tokens weigh, not rounded: those sent fresh count 1 each (RPH's `input` holds what was read from and written to the cache,
+ * so they are what is left of it), and the rest by their weights.
+ */
+function weigh(of: Pick<Counted, "input" | "cacheRead" | "cacheWrite" | "cacheWriteLong" | "output">, by: Weights): number {
+  const short = of.cacheWrite - of.cacheWriteLong;
+  return of.input - of.cacheRead - of.cacheWrite + of.cacheRead * by.cacheRead + short * by.cacheWrite + of.cacheWriteLong * by.cacheWriteLong + of.output * by.output;
+}
+
+const nothingSpent = (): Spent => ({ calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, cacheWriteLong: 0, output: 0, reasoning: 0, weighted: 0 });
+
+/** Adds what calls on one connection counted to a sum, weighed by that connection's weights; the sum's weighted figure is rounded once it is whole (`whole`). */
+function add(sum: Spent, counted: Counted, by: Weights): void {
+  sum.calls += counted.calls;
+  sum.input += counted.input;
+  sum.cacheRead += counted.cacheRead;
+  sum.cacheWrite += counted.cacheWrite;
+  sum.cacheWriteLong += counted.cacheWriteLong;
+  sum.output += counted.output;
+  sum.reasoning += counted.reasoning;
+  sum.weighted += weigh(counted, by);
+}
+
+const whole = (sum: Spent): Spent => ({ ...sum, weighted: Math.round(sum.weighted) });
+
+/** One call's tokens as a sum counts them. */
+const countedOf = (c: CallRow): Counted => ({ calls: 1, input: c.input, cacheRead: c.cacheRead, cacheWrite: c.cacheWrite, cacheWriteLong: c.cache?.asked === "long" ? c.cacheWrite : 0, output: c.output, reasoning: c.reasoning ?? 0 });
+
+/** What one call weighs, by its connection's weights. */
+export function weighedCall(call: CallRow, weights: UsageWeights): number {
+  return Math.round(weigh(countedOf(call), weightsOf(weights, call.connection)));
+}
+
+/** What these calls spent together, each weighed by its connection's weights. */
+export function spentBy(calls: readonly CallRow[], weights: UsageWeights): Spent {
+  const sum = nothingSpent();
+  for (const c of calls) add(sum, countedOf(c), weightsOf(weights, c.connection));
+  return whole(sum);
 }
 
 export class CallRows {
@@ -446,10 +509,30 @@ export class CallRows {
   }
 
   /**
-   * What the user's calls of a span spent: in all, and by the definition that made them, by what they were for, by the parts of
-   * their requests, by chat (none for a job of no chat) and by the day each began, counted `offset` minutes east of UTC.
+   * What the kept calls recorded under each of these turns weigh, not rounded: those of the turn's own runs together, and each of
+   * its jobs' by the job's id. A turn none of whose calls is kept is not in the answer.
    */
-  sums(user: string, of: CallsOf, offset: number): SpanSums {
+  weighedOfTurns(user: string, turns: readonly string[], weights: UsageWeights): Map<string, { runs: number; jobs: Map<string, number> }> {
+    const rows = this.db
+      .query<Counted & { turn: string; job: string | null; connection: string }, [string, string]>(`SELECT c.turn AS turn, c.job AS job, c.connection AS connection, ${SPENT} FROM call c WHERE c.user = ? AND c.turn IN (SELECT value FROM json_each(?)) GROUP BY 1, 2, 3`)
+      .all(user, JSON.stringify(turns));
+    const by = new Map<string, { runs: number; jobs: Map<string, number> }>();
+    for (const r of rows) {
+      let of = by.get(r.turn);
+      if (of === undefined) by.set(r.turn, (of = { runs: 0, jobs: new Map() }));
+      const weighed = weigh(r, weightsOf(weights, r.connection));
+      if (r.job === null) of.runs += weighed;
+      else of.jobs.set(r.job, (of.jobs.get(r.job) ?? 0) + weighed);
+    }
+    return by;
+  }
+
+  /**
+   * What the user's calls of a span spent: in all, and by the definition that made them, by what they were for, by the parts of
+   * their requests, by chat (none for a job of no chat) and by the day each began, counted `offset` minutes east of UTC. Each sum
+   * is added up connection by connection, so that each connection's calls are weighed by its own weights.
+   */
+  sums(user: string, of: CallsOf, offset: number, weights: UsageWeights): SpanSums {
     const where = ["c.user = ?"];
     const args: (string | number)[] = [user];
     if (of.chat !== undefined) {
@@ -469,9 +552,24 @@ export class CallRows {
       args.push(JSON.stringify(of.turns));
     }
     const span = where.join(" AND ");
-    const by = <K extends string>(key: string, name: K, first: readonly (string | number)[] = []): ({ [P in K]: string | null } & Spent)[] =>
-      this.db.query<{ [P in K]: string | null } & Spent, (string | number)[]>(`SELECT ${key} AS ${name}, ${SPENT} FROM call c WHERE ${span} GROUP BY 1 ORDER BY sum(c.input) + sum(c.output) DESC, 1`).all(...first, ...args);
-    const total = this.db.query<Spent & { withParts: number | null }, (string | number)[]>(`SELECT ${SPENT}, sum(c.parts IS NOT NULL) AS withParts FROM call c WHERE ${span}`).get(...args);
+    /** The span's calls summed by `key`, the one that weighs most first; then the one that sent and wrote most, then by the key. */
+    const by = (key: string, first: readonly (string | number)[] = []): { key: string | null; spent: Spent }[] => {
+      const sums = new Map<string | null, Spent>();
+      for (const r of this.db.query<Counted & { cut: string | null; connection: string }, (string | number)[]>(`SELECT ${key} AS cut, c.connection AS connection, ${SPENT} FROM call c WHERE ${span} GROUP BY 1, 2`).all(...first, ...args)) {
+        let sum = sums.get(r.cut);
+        if (sum === undefined) sums.set(r.cut, (sum = nothingSpent()));
+        add(sum, r, weightsOf(weights, r.connection));
+      }
+      return [...sums]
+        .map(([cut, sum]) => ({ key: cut, spent: whole(sum) }))
+        .sort((a, b) => b.spent.weighted - a.spent.weighted || b.spent.input + b.spent.output - (a.spent.input + a.spent.output) || (a.key === b.key ? 0 : a.key === null ? 1 : b.key === null ? -1 : a.key < b.key ? -1 : 1));
+    };
+    const total = nothingSpent();
+    let withParts = 0;
+    for (const r of this.db.query<Counted & { connection: string; withParts: number | null }, (string | number)[]>(`SELECT c.connection AS connection, ${SPENT}, sum(c.parts IS NOT NULL) AS withParts FROM call c WHERE ${span} GROUP BY 1`).all(...args)) {
+      add(total, r, weightsOf(weights, r.connection));
+      withParts += r.withParts ?? 0;
+    }
     const parts = this.db
       .query<{ part: RequestPartKind; name: string | null; calls: number; chars: number; tokens: number }, (string | number)[]>(
         `SELECT json_extract(p.value, '$.part') AS part, json_extract(p.value, '$.name') AS name, count(DISTINCT c.rowid) AS calls,
@@ -480,14 +578,14 @@ export class CallRows {
       )
       .all(...args);
     return {
-      total: total === null ? { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, cacheWriteLong: 0, output: 0, reasoning: 0 } : spentOf(total),
-      withParts: total?.withParts ?? 0,
-      byDefinition: by("c.definition", "definition").map((r) => ({ definition: r.definition ?? "", spent: spentOf(r) })),
-      byOperation: by("c.operation", "operation").map((r) => ({ operation: r.operation as AgentOperation | null, spent: spentOf(r) })),
+      total: whole(total),
+      withParts,
+      byDefinition: by("c.definition").map((r) => ({ definition: r.key ?? "", spent: r.spent })),
+      byOperation: by("c.operation").map((r) => ({ operation: r.key as AgentOperation | null, spent: r.spent })),
       byPart: parts,
-      byChat: by("c.chat", "chat").map((r) => ({ chat: r.chat, spent: spentOf(r) })),
-      byDay: by("strftime('%Y-%m-%d', (c.started + ?) / 1000, 'unixepoch')", "day", [offset * 60_000])
-        .map((r) => ({ day: r.day ?? "", spent: spentOf(r) }))
+      byChat: by("c.chat").map((r) => ({ chat: r.key, spent: r.spent })),
+      byDay: by("strftime('%Y-%m-%d', (c.started + ?) / 1000, 'unixepoch')", [offset * 60_000])
+        .map((r) => ({ day: r.key ?? "", spent: r.spent }))
         .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0)),
     };
   }

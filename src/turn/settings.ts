@@ -38,6 +38,13 @@
 //                                answers whole
 //   usage:
 //     rowsKeptDays: ~            days the row of each model call is kept (global level only); null: for good
+//     weights:                   what each kind of token counts in the weighted figure, a token sent fresh counting 1 (global
+//                                level only); shipped as the terms of one provider, and a connection can have its own under
+//                                connections.<connection>.usage.weights
+//       cacheRead: 0.1           a token read from the provider's cache
+//       cacheWrite: 1.25         a token written to it
+//       cacheWriteLong: 2        a token written to it by a call that asked the cache's long lifetime
+//       output: 5                a token the model wrote
 //
 // With them, the settings of the areas the turn lane hands a chat's work to, each group declared by its
 // area (`cast:`, `story:`, `worldState:`, `engine:`): read here for the chat, at every level. The areas
@@ -59,6 +66,7 @@ import { STORY_DEFAULTS, STORY_SETTING_DEFS, STORY_SETTINGS_RETIRED, STORY_SO_FA
 import { STORY_SO_FAR_DEFAULTS, type StorySoFarSettings } from "../story/sofar";
 import { WINDOW_DEFAULTS, type WindowSettings } from "../story/window";
 import { sharedLevels } from "../tree";
+import type { UsageWeights, Weights } from "./usage";
 import { SETTINGS as RPH_SETTINGS } from "rp-harness/helpers";
 
 /** RPH's room kept for the answer (`compaction.reserveTokens`), declared by RPH alone: the room the door's trim leaves a reply whose request names none. */
@@ -494,8 +502,50 @@ const DEFS = {
   },
 } as const satisfies Record<string, Setting>;
 
-/** Every setting the turn lane lists, as a config file writes it: its own, the map's and the taps'. `turn.lead` is RPH's, read here and listed once, by RPH. */
-export const TURN_SETTINGS: readonly Setting[] = [...Object.values(DEFS), ...MAP_SETTINGS, ...TAP_SETTINGS];
+/**
+ * One weight of the weighted figure as two settings (plan §4 "The pages show"): every connection's (`usage.weights.<of>`), shipped
+ * as the terms of the provider the owner uses, and one connection's own (`connections.<connection>.usage.weights.<of>`), which
+ * stands over it for that connection's calls. A weight below nothing means nothing; no other bound is put on one.
+ */
+function weightSettings(of: keyof Weights, shipped: number, what: string, named: string): { general: Setting; own: Setting } {
+  return {
+    general: {
+      key: `usage.weights.${of}`,
+      default: shipped,
+      takes: { type: "number", least: 0 },
+      levels: ["shipped", "global"],
+      perConnection: false,
+      name: `Weight of ${named}`,
+      about: `What ${what} counts in the weighted figure the Usage page and a turn's use show beside the tokens, a token sent fresh counting 1. Shipped as the terms of one provider: another's differ, and a connection can have its own (connections.<connection>.usage.weights.${of}). The figure is worked out as a page reads it, so a change shows at once, for every row kept.`,
+      effect: "use",
+    },
+    own: {
+      key: `connections.<connection>.usage.weights.${of}`,
+      default: null,
+      takes: { type: "number", least: 0 },
+      orNone: true,
+      none: "no weight of its own",
+      levels: ["shipped", "global"],
+      perConnection: true,
+      name: `Weight of ${named}, on a connection`,
+      about: `What ${what} counts in the weighted figure for the calls made on this connection, in place of usage.weights.${of}: for a provider whose terms differ.`,
+      effect: "use",
+    },
+  };
+}
+
+const WEIGHT_DEFS: Readonly<Record<keyof Weights, { general: Setting; own: Setting }>> = {
+  cacheRead: weightSettings("cacheRead", 0.1, "a token read from the provider's cache", "a token read from the cache"),
+  cacheWrite: weightSettings("cacheWrite", 1.25, "a token written to the provider's cache", "a token written to the cache"),
+  cacheWriteLong: weightSettings("cacheWriteLong", 2, "a token written to the provider's cache by a call that asked its long lifetime", "a token written to the cache for its long lifetime"),
+  output: weightSettings("output", 5, "a token the model wrote (its reasoning is among them)", "a token the model wrote"),
+};
+
+/** The four weights, each by what `value` gives for it. */
+const weightsFrom = (value: (of: keyof Weights) => number): Weights => ({ cacheRead: value("cacheRead"), cacheWrite: value("cacheWrite"), cacheWriteLong: value("cacheWriteLong"), output: value("output") });
+
+/** Every setting the turn lane lists, as a config file writes it: its own, the weights of the weighted figure, the map's and the taps'. `turn.lead` is RPH's, read here and listed once, by RPH. */
+export const TURN_SETTINGS: readonly Setting[] = [...Object.values(DEFS), ...Object.values(WEIGHT_DEFS).flatMap((w) => [w.general, w.own]), ...MAP_SETTINGS, ...TAP_SETTINGS];
 
 /** A list of jobs' page when the caller names none, and the most one page may ask (`jobs.page`, `jobs.maxPage`), as `read` sets them. */
 export function jobsPage(read: ConfigRead): { default: number; most: number } {
@@ -505,6 +555,34 @@ export function jobsPage(read: ConfigRead): { default: number; most: number } {
 /** The days the rows of model calls are kept (`usage.rowsKeptDays`), as `read` sets it at the levels every chat shares; null: for good. */
 export function usageRowsKeptDays(read: ConfigRead): number | null {
   return read.value(DEFS.usageRowsKept) as number | null;
+}
+
+/** The setting that says how long the rows of model calls are kept, as a page names it beside what it does: its key, and what the Settings page calls it. */
+export const USAGE_ROWS_KEPT = { key: DEFS.usageRowsKept.key, name: DEFS.usageRowsKept.name } as const;
+
+/** The names and the ids connections are given weights of their own under, in the levels every chat shares; none where no connection has any. */
+export function weighedConnections(read: ConfigRead): string[] {
+  return [...new Set(Object.values(WEIGHT_DEFS).flatMap((w) => read.named(w.own)))];
+}
+
+/**
+ * The weights of the weighted figure as `read` sets them at the levels every chat shares: every connection's, and those of each
+ * connection that has its own, by its name, which is what the row of a call carries. A connection's own weight is the one set
+ * under its id, else the one under its name, else every connection's (as RPH reads a connection's settings); a name no connection
+ * in `connections` has (one since renamed or removed, whose rows still carry it) keeps the weights set under it.
+ */
+export function usageWeights(read: ConfigRead, connections: readonly { id: string; name: string }[]): UsageWeights {
+  const general = weightsFrom((of) => read.value(WEIGHT_DEFS[of].general) as number);
+  const named = new Set(weighedConnections(read));
+  const under = (keys: readonly string[]): Weights => weightsFrom((of) => keys.map((key) => read.value(WEIGHT_DEFS[of].own, key) as number | null).find((value) => value !== null) ?? general[of]);
+  const own = new Map<string, Weights>();
+  for (const c of connections) {
+    const keys = [c.id, c.name].filter((key) => named.has(key));
+    if (keys.length > 0) own.set(c.name, under(keys));
+  }
+  const known = new Set(connections.flatMap((c) => [c.id, c.name]));
+  for (const key of named) if (!known.has(key)) own.set(key, under([key]));
+  return { general, connections: own };
 }
 
 /** The turn's settings for a scope, as its levels' config files set them over the defaults. */

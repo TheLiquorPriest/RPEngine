@@ -14,7 +14,7 @@ import { useSelect } from "../../store";
 import { Written } from "../../markdown";
 import { AgentTree } from "../../trace-view";
 import { counted, errorWords, limitCount, limitName, num, tokenWords, when } from "../../words";
-import { type AgentWindow, CallsLine, WindowGauge } from "../usage";
+import { type AgentWindow, CallsLine, WindowGauge } from "../run-usage";
 import { BootstrapAsk } from "./bootstrap";
 import { BootstrapBrief, isBootstrapJob } from "./bootstrap-mark";
 import { cancellable, JOB_STATE_WORDS, stoppedByWords } from "./words";

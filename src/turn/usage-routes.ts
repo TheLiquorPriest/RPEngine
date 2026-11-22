@@ -6,6 +6,9 @@
 // their folders keep. Every route is a page's: it answers only for the user this RPE belongs to. A turn's use is read by the turns
 // its runs played under (`playedUnder`), so a continue that joined a turn is counted with it; a job is tied to its turn through its
 // own record. Nothing here adds a cached token twice: RPH's `input` already holds what was read from and written to the cache.
+// Beside the tokens as counted every sum and every call carries the weighted figure, worked out as the route answers from the
+// weights the settings hold then (`usage.weights.*`, a connection's own over them), which each reply gives with it: tokens
+// weighed, never money.
 
 import type { Database } from "bun:sqlite";
 import type { JobView, Log, RunScope, TraceRecord } from "rp-harness/contract";
@@ -14,7 +17,8 @@ import type { ConfigRead } from "../app/config-read";
 import { JoinedTurnError } from "../store";
 import { jobRowOf, jobsOfTurns, jobsWithoutCalls } from "./jobs";
 import { playedUnder, type Runs } from "./runs";
-import { type CallRow, type CallRows, type SentRow, type Spent, spentBy } from "./usage";
+import { USAGE_ROWS_KEPT, usageRowsKeptDays } from "./settings";
+import { type CallRow, type CallRows, type SentRow, type Spent, spentBy, type UsageWeights, weighedCall, type Weights } from "./usage";
 
 const T = shape.text();
 const N = shape.number();
@@ -24,10 +28,28 @@ const nullable = shape.nullable;
 
 const spent = shape.named(
   "CallsSpent",
-  "What a set of model calls spent together: how many; the tokens sent, those read from the provider's cache and written to it among them; of those, the tokens read from the cache and the tokens written to it, and of the written ones those of the calls that asked the cache's long lifetime; the tokens the model wrote, its reasoning among them; and its reasoning, where the provider reported it. No figure adds a cached token twice: input already holds them.",
-  shape.object({ calls: N, input: N, cacheRead: N, cacheWrite: N, cacheWriteLong: N, output: N, reasoning: N }),
+  "What a set of model calls spent together: how many; the tokens sent, those read from the provider's cache and written to it among them; of those, the tokens read from the cache and the tokens written to it, and of the written ones those of the calls that asked the cache's long lifetime; the tokens the model wrote, its reasoning among them; and its reasoning, where the provider reported it. No figure adds a cached token twice: input already holds them. And the same as one weighted figure.",
+  shape.object({
+    calls: N,
+    input: N,
+    cacheRead: N,
+    cacheWrite: N,
+    cacheWriteLong: N,
+    output: N,
+    reasoning: N,
+    weighted: field(N, "The weighted figure, a whole number: each token sent fresh counted 1, and each read from the cache, written to it (at its long lifetime, or not) and written by the model counted by its weight, each call by the weights of its connection as the settings stood when this was read. Tokens weighed, never money."),
+  }),
 );
 type SpentMirrored = Holds<Exactly<Infer<typeof spent>, Spent>>;
+
+/** The four weights, as a reply gives them. */
+const weights = { cacheRead: field(N, "A token read from the provider's cache."), cacheWrite: field(N, "A token written to it by a call that did not ask the cache's long lifetime."), cacheWriteLong: field(N, "A token written to it by a call that asked the long lifetime."), output: field(N, "A token the model wrote, its reasoning among them.") };
+
+const weightsShown = shape.named(
+  "UsageWeightsShown",
+  "What each kind of token counts in the weighted figure, a token sent fresh counting 1, as the settings stood when this was read: every connection's (`usage.weights.*`), and those of each connection that has its own (`connections.<connection>.usage.weights.*`), whose calls are weighed by them. They ship as the terms of one provider; another's differ.",
+  shape.object({ ...weights, connections: field(shape.list(shape.object({ connection: field(T, "The connection, by the name its calls carry."), ...weights })), "The connections that have weights of their own, by name.") }),
+);
 
 const callShown = shape.named(
   "CallShown",
@@ -48,6 +70,7 @@ const callShown = shape.named(
     cacheWrite: N,
     output: field(N, "Tokens written, reasoning among them."),
     reasoning: nullable(N),
+    weighted: field(N, "What it weighs: its tokens as one figure, by the weights of its connection as the settings stood when this was read."),
     parts: field(nullable(shape.list(requestPart)), "Its request by part; null for a call of a turn played before RPH told them, whose row carries its totals alone."),
     cache: field(nullable(callCache), "What it asked of its provider's cache and what came of it; null where its record gave none."),
     stop: field(T, "Why it stopped, in the provider's word; for a call a stop or a limit cut off, how its agent ended."),
@@ -84,6 +107,7 @@ export const turnUseReply = shape.named(
     spent: field(spent, "What the calls of its own runs add up to; its jobs' calls are not among them."),
     agents: field(shape.list(agentUse), "The agents of its runs, in the order each first worked."),
     jobs: field(shape.list(jobUse), "The jobs its runs started, the first started first."),
+    weights: field(weightsShown, "The weights every weighted figure here was worked out by."),
   }),
 );
 
@@ -96,14 +120,19 @@ export const usageReply = shape.named(
     turns: field(nullable(N), "For a span of turns: how many turns it holds, fewer than asked where no more were played; null for a span of time."),
     total: spent,
     withParts: field(N, "How many of its calls carry their request by part: the sums by part are of those alone. A call of a turn read in from a trace kept before RPH told the parts carries none."),
-    byDefinition: field(shape.list(shape.object({ definition: T, spent })), "By the agent definition that made the calls, the one that used most first."),
-    byOperation: field(shape.list(shape.object({ operation: nullable(agentOperation), spent })), "By what the calls were for, the operation that used most first; null gathers the calls kept before RPH named it."),
+    byDefinition: field(shape.list(shape.object({ definition: T, spent })), "By the agent definition that made the calls, the one that weighs most first."),
+    byOperation: field(shape.list(shape.object({ operation: nullable(agentOperation), spent })), "By what the calls were for, the operation that weighs most first; null gathers the calls kept before RPH named it."),
     byPart: field(
       shape.list(shape.object({ part: requestPartKind, name: nullable(T), calls: N, chars: N, tokens: N })),
       "By the part of the requests, and its name where it has one, the largest first: the calls that carried it, and its characters and its tokens by RPH's own estimate, added up over them.",
     ),
-    byChat: field(shape.list(shape.object({ chat: nullable(T), spent })), "By chat, the one that used most first; null gathers the jobs of no chat."),
+    byChat: field(shape.list(shape.object({ chat: nullable(T), spent })), "By chat, the one that weighs most first; null gathers the jobs of no chat."),
     byDay: field(shape.list(shape.object({ day: T, spent })), "By the day each call began, as YYYY-MM-DD, the earliest first, counted in the offset asked."),
+    weights: field(weightsShown, "The weights every weighted figure here was worked out by."),
+    kept: field(
+      nullable(shape.object({ setting: field(T, "The setting's key."), name: field(T, "What the Settings page calls it."), days: N })),
+      "Where the rows of model calls are kept for a number of days alone (`usage.rowsKeptDays`): the setting and the days, so that a page can say that a reading in adds rows older than that, which the next turn's end removes. Null where they are kept for good.",
+    ),
   }),
 );
 
@@ -124,18 +153,26 @@ export interface UsageRoutesDeps {
   turn(user: string, turn: string): { chat: string; joined: string | null } | null;
   /** The records a scope's folder keeps, without what the transcripts hold (`TurnTrace.kept`). */
   kept(scope: RunScope): Promise<TraceRecord[]>;
-  /** The levels every chat shares, read now: how much of a job's brief its row shows. */
+  /** The levels every chat shares, read now: how much of a job's brief its row shows, and how long the rows are kept. */
   shared(): ConfigRead;
+  /** The weights of the weighted figure as the settings hold them now, for the user's connections. */
+  weights(user: string): Promise<UsageWeights>;
   log: Log;
 }
 
-/** The agents among these rows, in the order each first worked or was handed something, each with what it was handed and its calls. */
-function agentsOf(calls: readonly CallRow[], sent: readonly SentRow[]): AgentUse[] {
+/** The weights as a reply gives them: every connection's, then each connection that has its own, by name. */
+function weightsView(of: UsageWeights): Infer<typeof weightsShown> {
+  const four = (w: Weights) => ({ cacheRead: w.cacheRead, cacheWrite: w.cacheWrite, cacheWriteLong: w.cacheWriteLong, output: w.output });
+  return { ...four(of.general), connections: [...of.connections].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([connection, w]) => ({ connection, ...four(w) })) };
+}
+
+/** The agents among these rows, in the order each first worked or was handed something, each with what it was handed and its calls, each sum and each call weighed by `weights`. */
+function agentsOf(calls: readonly CallRow[], sent: readonly SentRow[], weights: UsageWeights): AgentUse[] {
   const agents = new Map<string, { first: number; use: AgentUse; rows: CallRow[] }>();
   const of = (row: Pick<CallRow, "run" | "agent" | "definition">, at: number, plays: string | null) => {
     const key = `${row.run}\u0000${row.agent}`;
     let held = agents.get(key);
-    if (held === undefined) agents.set(key, (held = { first: at, use: { run: row.run, agent: row.agent, definition: row.definition, plays, spent: spentBy([]), sent: [], calls: [] }, rows: [] }));
+    if (held === undefined) agents.set(key, (held = { first: at, use: { run: row.run, agent: row.agent, definition: row.definition, plays, spent: spentBy([], weights), sent: [], calls: [] }, rows: [] }));
     held.first = Math.min(held.first, at);
     return held;
   };
@@ -150,9 +187,9 @@ function agentsOf(calls: readonly CallRow[], sent: readonly SentRow[]): AgentUse
     const held = of(c, c.started, c.plays);
     held.use.plays ??= c.plays;
     held.rows.push(c);
-    held.use.calls.push({ n: c.n, operation: c.operation, purpose: c.purpose, model: c.model, connection: c.connection, api: c.api, effort: c.effort, started: c.started, ended: c.ended, sinceLast: c.sinceLast, input: c.input, cacheRead: c.cacheRead, cacheWrite: c.cacheWrite, output: c.output, reasoning: c.reasoning, parts: c.parts, cache: c.cache, stop: c.stop, error: c.error });
+    held.use.calls.push({ n: c.n, operation: c.operation, purpose: c.purpose, model: c.model, connection: c.connection, api: c.api, effort: c.effort, started: c.started, ended: c.ended, sinceLast: c.sinceLast, input: c.input, cacheRead: c.cacheRead, cacheWrite: c.cacheWrite, output: c.output, reasoning: c.reasoning, weighted: weighedCall(c, weights), parts: c.parts, cache: c.cache, stop: c.stop, error: c.error });
   }
-  return [...agents.values()].sort((a, b) => a.first - b.first).map(({ use, rows }) => ({ ...use, spent: spentBy(rows) }));
+  return [...agents.values()].sort((a, b) => a.first - b.first).map(({ use, rows }) => ({ ...use, spent: spentBy(rows, weights) }));
 }
 
 export function usageRoutes(deps: UsageRoutesDeps) {
@@ -164,7 +201,7 @@ export function usageRoutes(deps: UsageRoutesDeps) {
       path: "/api/v1/chats/:chat/turns/:turn/use",
       access: "page",
       group: "turns",
-      does: "Where a turn's tokens went: the agents of its runs, each with what it was handed and its model calls in order (what each was for, its tokens, its request by part, what it asked of the provider's cache), and the jobs its runs started, each with its own use. The rows stay when the turn is swiped away.",
+      does: "Where a turn's tokens went: the agents of its runs, each with what it was handed and its model calls in order (what each was for, its tokens and what they weigh, its request by part, what it asked of the provider's cache), and the jobs its runs started, each with its own use; with the weights the weighted figures were worked out by. The rows stay when the turn is swiped away.",
       reply: turnUseReply,
       joined: true,
       handle: async ({ user, params }) => {
@@ -174,6 +211,7 @@ export function usageRoutes(deps: UsageRoutesDeps) {
         if (ofTurn.length === 0) throw new RouteError(404, `Chat ${params.chat} has no turn ${params.turn}.`);
         // A call that ended a moment ago has its row queued: the read waits for it.
         await calls.settled();
+        const weights = await deps.weights(user);
         const under = playedUnder(params.turn, ofTurn);
         const rows = calls.ofTurns(user, under);
         const sent = calls.sentOfTurns(user, under);
@@ -184,10 +222,11 @@ export function usageRoutes(deps: UsageRoutesDeps) {
         const shared = deps.shared();
         return {
           turn: params.turn,
-          spent: spentBy(own),
+          spent: spentBy(own, weights),
           agents: agentsOf(
             own,
             sent.filter((s) => s.job === null),
+            weights,
           ),
           jobs: ids.map((id) => {
             const of = rows.filter((c) => c.job === id);
@@ -195,13 +234,15 @@ export function usageRoutes(deps: UsageRoutesDeps) {
             return {
               id,
               job: record === undefined ? null : jobRowOf(record, shared),
-              spent: spentBy(of),
+              spent: spentBy(of, weights),
               agents: agentsOf(
                 of,
                 sent.filter((s) => s.job === id),
+                weights,
               ),
             };
           }),
+          weights: weightsView(weights),
         };
       },
     }),
@@ -210,7 +251,7 @@ export function usageRoutes(deps: UsageRoutesDeps) {
       path: "/api/v1/usage",
       access: "page",
       group: "turns",
-      does: "What a span of his model calls spent, in all and by definition, by operation, by part, by chat and by day: the calls of his newest turns (`turns`), their jobs' among them, or the calls that began in a stretch of time (`from`, `to`), of one chat or of every chat and of none.",
+      does: "What a span of his model calls spent, in tokens and as the weighted figure, in all and by definition, by operation, by part, by chat and by day: the calls of his newest turns (`turns`), their jobs' among them, or the calls that began in a stretch of time (`from`, `to`), of one chat or of every chat and of none; with the weights in force, and how long the rows are kept where that is not for good.",
       query: {
         chat: opt(T, "Only this chat's: its turns, for a span of turns; its calls, for a span of time. Left out: every chat's, and the calls of jobs of no chat."),
         turns: opt(shape.whole({ least: 1 }), "A span of turns: the calls of this many of the newest turns he played, each turn's runs' and its jobs' alike, among the turns received at or after `from` and before `to` where those are given."),
@@ -221,15 +262,18 @@ export function usageRoutes(deps: UsageRoutesDeps) {
       reply: usageReply,
       handle: async ({ user, query }) => {
         await calls.settled();
+        const weights = await deps.weights(user);
         const offset = Math.round(query.offset ?? 0);
         const { chat, from, to } = query;
+        const days = usageRowsKeptDays(deps.shared());
+        const beside = { weights: weightsView(weights), kept: days === null ? null : { setting: USAGE_ROWS_KEPT.key, name: USAGE_ROWS_KEPT.name, days } };
         if (query.turns !== undefined) {
           const played = runs.newestPlayed(user, query.turns, { ...(chat !== undefined ? { chat } : {}), ...(from !== undefined ? { from } : {}), ...(to !== undefined ? { to } : {}) });
-          const sums = calls.sums(user, { turns: played.flatMap((p) => p.under) }, offset);
-          return { from: played.at(-1)?.received ?? null, to: to ?? null, turns: played.length, ...sums };
+          const sums = calls.sums(user, { turns: played.flatMap((p) => p.under) }, offset, weights);
+          return { from: played.at(-1)?.received ?? null, to: to ?? null, turns: played.length, ...sums, ...beside };
         }
-        const sums = calls.sums(user, { ...(chat !== undefined ? { chat } : {}), ...(from !== undefined ? { from } : {}), ...(to !== undefined ? { to } : {}) }, offset);
-        return { from: from ?? null, to: to ?? null, turns: null, ...sums };
+        const sums = calls.sums(user, { ...(chat !== undefined ? { chat } : {}), ...(from !== undefined ? { from } : {}), ...(to !== undefined ? { to } : {}) }, offset, weights);
+        return { from: from ?? null, to: to ?? null, turns: null, ...sums, ...beside };
       },
     }),
     route({

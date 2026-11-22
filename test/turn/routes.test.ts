@@ -27,7 +27,7 @@ type StopAnswer = ApiRoutes["POST /api/v1/chats/:chat/turns/:turn/stop"]["reply"
 
 /** Every field of a page's type, once: a field added to the type or left out of here does not compile. */
 const CHAT_FIELDS: Record<keyof ChatList["chats"][number], true> = { id: true, name: true, lastTurnAt: true, running: true, played: true, world: true };
-const SUMMARY_FIELDS: Record<keyof TurnList["turns"][number], true> = { id: true, kind: true, onPath: true, message: true, status: true, marks: true, timings: true, usage: true, jobs: true, runs: true };
+const SUMMARY_FIELDS: Record<keyof TurnList["turns"][number], true> = { id: true, kind: true, onPath: true, message: true, status: true, marks: true, timings: true, usage: true, jobs: true, weighted: true, runs: true };
 const DETAIL_FIELDS: Record<keyof TurnDetail, true> = { ...SUMMARY_FIELDS, chat: true, intent: true, reply: true, emptyReply: true, error: true, trace: true, lore: true, runs: true, prompt: true, asked: true, record: true, found: true, todos: true, changes: true, unsettled: true, told: true, carried: true, card: true, quests: true, threads: true };
 const RUN_FIELDS: Record<keyof TurnDetail["runs"][number], true> = { id: true, run: true, nth: true, kind: true, status: true, target: true, held: true, intentRecord: true, timings: true, usage: true, reply: true, saved: true, error: true, stoppedBy: true, lastText: true, notGiven: true, trace: true, requests: true };
 const fields = (shape: object): string[] => Object.keys(shape).sort();
@@ -54,6 +54,9 @@ describe("the Turn page's routes", () => {
     expect(fields(first.body)).toEqual(["more", "turns"]);
     expect(first.body.turns.map(fields)).toEqual([fields(SUMMARY_FIELDS), fields(SUMMARY_FIELDS)]);
     expect(first.body).toMatchObject({ more: true, turns: [{ id: played[0] }, { id: played[1] }] });
+    // Each turn's kept calls weighed for its line, by the shipped weights: the scripted model caches nothing, so a token sent counts 1 and one written 5. It started no job.
+    for (const row of first.body.turns) expect(row.weighted).toEqual({ runs: row.usage.input + 5 * row.usage.output, jobs: {} });
+    expect(first.body.turns[0]?.usage.calls).toBeGreaterThan(0);
     const rest = await b.page<TurnList>("GET", `/api/v1/chats/${CHAT}/turns?limit=2&before=${played[1]}`);
     expect(rest.body.more).toBe(false);
     expect(rest.body.turns.map((t) => t.id)).toEqual([played[2]]);
@@ -62,6 +65,7 @@ describe("the Turn page's routes", () => {
     const detail = await b.page<TurnDetail>("GET", `/api/v1/chats/${CHAT}/turns/${played[0]}`);
     expect(replyProblems(b.app, "GET /api/v1/chats/:chat/turns/:turn", detail.body)).toEqual([]);
     expect(fields(detail.body)).toEqual(fields(DETAIL_FIELDS));
+    expect(detail.body.weighted).toEqual(first.body.turns[0]?.weighted ?? null);
     expect(fields(detail.body.timings)).toEqual(["ended", "finished", "firstWord", "intake", "intent", "received", "released", "started", "thinking", "wait"]);
     expect(fields(detail.body.reply)).toEqual(["progress", "text"]);
     const seqs = detail.body.trace.map((r) => r.seq);
