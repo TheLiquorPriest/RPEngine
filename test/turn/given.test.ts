@@ -1,8 +1,9 @@
 // What an agent the Author delegates to is given by the names its definition lists (plan §5.4, §10.4,
-// Appendix C): the GM, the scene in full with its map, what is due and the story brief, each laid out
-// as the Author's briefing lays it out and read at the turn it runs in; a name nobody gives is said so,
-// in one line. Played through the stand-in Lumiverse on the scripted model, on a chat that plays an
-// invented world whose revision the store keeps. Every name is invented.
+// Appendix C; plan 3.2 §6.6): the GM, the scene in full with its map, what is due, the story brief, the
+// digest of what lies before the scene's messages it is handed, and the ruleset by its index, each laid
+// out by its own file and read at the turn it runs in; a name nobody gives is said so, in one line.
+// Played through the stand-in Lumiverse on the scripted model, on a chat that plays an invented world
+// whose revision the store keeps. Every name is invented.
 
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -49,12 +50,13 @@ const OPENING = {
   ],
 };
 
-test("a delegated GM's first request holds the scene in full with its map, what is due and the story brief, by the names its definition lists", async () => {
+test("a delegated GM's first request holds the scene in full with its map, what is due, the story brief, the scene's digest and the ruleset's index, by the names its definition lists, and it reads a part of the ruleset with one call", async () => {
   const b = await worldBed(innWorld(), {
     answers: [
       OPENING,
       { pieces: [{ text: "<reply>The common room is warm and loud.</reply>" }] },
       { pieces: [{ text: "<intent>Ask the GM.</intent>" }, { call: "delegate", args: { agent: "gm", brief: "Can Tam reach the market before nine?" } }] },
+      { pieces: [{ call: "ruleset_read", args: { part: "actions" } }] },
       { pieces: [{ text: "He can, with an hour to spare." }] },
       replying("Tam drains his cup and goes."),
     ],
@@ -74,12 +76,19 @@ test("a delegated GM's first request holds the scene in full with its map, what 
   expect(gm).toContain("9:00 AM: place at Market Square, Tam (tam_day)");
   // The story brief, as its layout lays out the scene the record holds open.
   expect(gm).toContain("SCENE-WATCH The night watch");
-  // The world's ruleset, as world_query gives it.
-  expect(gm).toContain('{\\"ruleset\\":');
+  // The world's ruleset by its index: each part with its size and the tool that reads one, and not the ruleset whole.
+  expect(gm).toContain("The world's ruleset, by its parts (");
+  expect(gm).toMatch(/- actions: \d+ entries, \d+ tokens/);
+  expect(gm).not.toContain('{\\"ruleset\\":');
+  // The digest: no scene stands before this one, and the whole of it is in the messages handed over.
+  expect(gm).toContain("No scene stands before this one in the story record, and nothing of this scene lies before the messages you were handed.");
+  // One call reads a part of the ruleset whole: its answer is in the GM's next request.
+  const read = b.model.requests.map((r) => JSON.stringify(r.messages)).find((sent) => sent.includes("You are the GM, at this table") && sent.includes('{\\"ruleset\\":{\\"actions\\":['));
+  expect(read).toBeDefined();
 
   // The Author is told of no name of these the GM was not given.
   const answered = JSON.stringify(b.model.requests.at(-1)!.messages);
-  for (const name of ["story:brief", "world:scene(full, map)", "world:due", "ruleset"]) expect(answered).not.toContain(`was not given ${name}`);
+  for (const name of ["chat:history[scene-window]", "story:scene-digest", "story:brief", "world:scene(full, map)", "world:due", "ruleset:index"]) expect(answered).not.toContain(`was not given ${name}`);
 });
 
 test("a keeper delegated after the reply is given the reply as it went out and the scene in full without its map", async () => {
@@ -122,7 +131,7 @@ test("a definition that names a view nobody gives is answered with one line that
 });
 
 /** Every name of RPE's own a shipped definition lists: none of them may be told to the Author as one that could not be found. */
-const RPE_NAMES = ["story:brief", "world:scene(full, map)", "world:due", "ruleset", "index:known-to-self", "cast:self("];
+const RPE_NAMES = ["story:brief", "story:scene-digest", "world:scene(full, map)", "world:due", "ruleset:index", "index:known-to-self", "cast:self("];
 
 test("a GM delegated on a chat's first turn, in a world where nothing is due, is given each empty view in its own file's words for nothing, and the Author is told of no name of RPE's it was not given", async () => {
   const b = await worldBed(worldWith(INN), {

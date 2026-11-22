@@ -3,7 +3,9 @@
 // roll reads too, so the odds are the real odds). Any action by anyone: whether it can be tried now
 // and, when not, the engine's code for why; the chance of each outcome; the dice, the modifier, the
 // DC, advantage and whom it is rolled against; and what the world's adjudication policy makes of it.
-// It changes nothing, and its answer is data.
+// It changes nothing, and its answer is data. And `ruleset_read` (plan 3.2 §6.6): one part of the
+// world's ruleset whole, or one entry of a part, for an agent that was handed the ruleset by its
+// index (`ruleset:index`) and not whole.
 
 import type { JsonObject, JsonValue } from "rp-harness/contract";
 import { isRecord } from "../../shared/json";
@@ -16,6 +18,7 @@ import { actionOdds } from "../../engine/resolve";
 import { OBJECT, TEXT, type ToolSpec } from "../kit";
 import { isUnread, named, type Unread } from "../ops";
 import type { Reading } from "../reading";
+import { rulesetData, rulesetEntry, rulesetParts } from "../bestiary";
 import { textOf } from "../texts";
 import { foundIn, type ReadDef, readTool } from "./run";
 
@@ -132,5 +135,30 @@ const odds: ReadDef = {
   },
 };
 
+const rulesetRead: ReadDef = {
+  name: "ruleset_read",
+  family: FAMILY,
+  properties: { part: TEXT, id: TEXT },
+  required: ["part"],
+  example: { part: "bestiary", id: "wolf" },
+  read(r, args, reply, call) {
+    // The same data `world_query` gives at `ruleset`: the actions are those this chat plays.
+    const ruleset = rulesetData(r.doc, [...actionsOf(r).keys()].sort());
+    const parts = rulesetParts(ruleset, call.deps.tokens);
+    const said = String(args.part).trim();
+    const part = parts.find((p) => p.part === said) ?? parts.find((p) => p.part.toLowerCase() === said.toLowerCase());
+    if (part === undefined) return { line: "unreadable", fields: { field: "part", value: JSON.stringify(args.part), choices: textOf(parts.map((p) => p.part)) } };
+    const value = ruleset[part.part];
+    if (args.id === undefined || args.id === null || args.id === "") {
+      reply.data({ ruleset: { [part.part]: value ?? null } });
+      return undefined;
+    }
+    const entry = rulesetEntry(value, String(args.id));
+    if (entry === undefined) return { line: "no_ruleset_entry", fields: { part: part.part, id: JSON.stringify(args.id), ...(part.entries !== undefined ? { entries: part.entries } : {}) } };
+    reply.data({ ruleset: { [part.part]: entry } });
+    return undefined;
+  },
+};
+
 /** The checks family. */
-export const CHECK_TOOLS: readonly ToolSpec[] = [readTool(odds)];
+export const CHECK_TOOLS: readonly ToolSpec[] = [readTool(odds), readTool(rulesetRead)];

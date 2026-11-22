@@ -156,6 +156,7 @@ ran_more: Operation {{n}} ({{op}}): only the first {{listed}} lines of what happ
 due_open: Operation {{n}} ({{op}}): nothing in due has happened yet; where people went, what they did, a meal or a night's sleep, the weather and a quest stage met are yours to record, as the story says it went.
 no_map: {{at}} has no map to show.
 shown_of: This shows {{shown}} tokens of the {{whole}} that {{at}} holds in all. world_query at {{id}} with depth full reads all of it; at one of its levels, by name or id, that level alone.
+no_ruleset_entry: The ruleset's {{part}} has nothing called {{id}}{{#entries}} among its {{entries}} entries{{/entries}}. ruleset_read with the part alone reads all of it.
 none_found: Nothing found for {{words}}.
 more_found: Only the first {{shown}} of what {{words}} matches are listed; {{more}} more were found. Narrower words, or a kind, find them.
 carried_none: Turn {{turn}} carries no record of an earlier build: nothing was migrated for it.
