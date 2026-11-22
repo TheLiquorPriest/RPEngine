@@ -53,6 +53,7 @@ export interface AgentShown {
   reads: string[];
   given: string[];
   purposes?: { [key: string]: string[] };
+  starts?: string[];
   writer?: string;
   runsOn: DefinitionRun;
 }

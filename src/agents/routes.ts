@@ -58,6 +58,7 @@ const agentShown = shape.named(
     reads: shape.list(T),
     given: shape.list(T),
     purposes: opt(shape.record(shape.list(T))),
+    starts: opt(shape.list(T)),
     writer: opt(T),
     runsOn,
   }),
