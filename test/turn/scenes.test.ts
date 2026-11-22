@@ -48,13 +48,14 @@ describe("scenes and sessions", () => {
         replying("Wren yawns."),
       ],
     });
-    // The scene open at the chat's head is a stretch an agent can ask for by name: from the first message of its opening turn on.
+    // The scene open at the chat's head is a stretch an agent can ask for by name: from the first message of its opening turn on. The
+    // part of it the prompt holds is another (plan 3.2 §6.6): the whole of it here, where the window cut nothing.
     const stretch = async () => (await b.turns.env.chat.info({ user: USER, chat: CHAT, session: "any" })).ranges;
     expect(await stretch()).toEqual({});
     const first = await play(b, "I climb the stairs.");
-    expect(await stretch()).toEqual({ scene: { from: 1, to: 3 } });
+    expect(await stretch()).toEqual({ scene: { from: 1, to: 3 }, "scene-window": { from: 1, to: 3 } });
     const second = await play(b, "I wait for the light.");
-    expect(await stretch()).toEqual({ scene: { from: 3, to: 5 } });
+    expect(await stretch()).toEqual({ scene: { from: 3, to: 5 }, "scene-window": { from: 3, to: 5 } });
     await play(b, "I watch the sun come up.");
 
     // Each turn played in its own session: none for a scene, then the watch's, then the dawn's.
