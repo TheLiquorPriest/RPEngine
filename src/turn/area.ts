@@ -32,6 +32,7 @@ import { globalConfig, passConnection, TURN_SETTINGS, turnSettings } from "./set
 import { namedStretches } from "./stage";
 import { HARNESS_MIGRATIONS, PROMPT_MIGRATIONS } from "./tables";
 import { EMPTY_REPLY_KIND, leadConnection, NO_SESSION, type MigratedSource } from "./turns";
+import { usageRoutes } from "./usage-routes";
 import { WEB_SETTING_DEFS, webRoutes } from "./web";
 
 /** What the turn lane takes from the composition. */
@@ -276,8 +277,14 @@ export function turnArea(takes: TurnTakes): TurnArea {
       const { harness, lane, runs } = turns;
       // A restart onto a new app file waits for the turns and the jobs that run, and for a request whose turn is still being taken in.
       at.builds.counts(async () => runs.chatsGoing().length + lane.intakesGoing() + (await harness.jobs.list({ user: owner(), states: ["running", "queued"] })).jobs.length);
-      at.routes.add("turn", turnRoutes({ turns, chatName: async (chat) => (await takes.lumiverse()?.reads.chat(chat))?.name ?? null }));
-      at.routes.add("jobs", jobRoutes({ turns, shared: () => globalConfig(at.paths.files, at.log) }));
+      const shared = () => globalConfig(at.paths.files, at.log);
+      at.routes.add("turn", turnRoutes({ turns, chatName: async (chat) => (await takes.lumiverse()?.reads.chat(chat))?.name ?? null, shared }));
+      at.routes.add("jobs", jobRoutes({ turns, shared }));
+      // What the models were used for, from the rows kept of each call: one turn's use, a span of his calls, and the reading in of what was played before the rows were kept.
+      at.routes.add(
+        "usage",
+        usageRoutes({ calls: turns.calls, runs, db: at.db, turn: (user, turn) => made().store.user(user).turn(turn), kept: (scope) => made().trace.kept(scope), shared, log: at.log }),
+      );
       at.routes.add("sessions", sessionRoutes({ turns, writes: at.writes, files: at.paths.files, log: at.log }));
       at.routes.add("web", webRoutes(at.secrets));
       at.routes.add("maps", mapRoutes({ store: turns.store, writes: at.writes, live: at.live, config: async (chat) => (await chatSettings(chat)).map }));

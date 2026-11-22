@@ -21,13 +21,14 @@ function p95(values: readonly number[]): number {
 }
 
 /**
- * The HUD's meter: the chat's newest turn that spent anything (its runs summed: calls, tokens read and written, wall time from start
- * to end, lore searches and reads), with the average and 95th percentile over its last `turns` such turns; null before any.
+ * The HUD's meter: the chat's newest turn that spent anything (its runs summed: calls, tokens sent and written, wall time from start
+ * to end, lore searches and reads), with the average and 95th percentile over its last `turns` such turns; null before any. A run's
+ * `input` already holds the tokens read from and written to the provider's cache (RPH's `Usage`), so they are not added again.
  */
 export function meterOf(db: Database, user: string, chat: string, turns: number): CallMeterView | null {
   const rows = db
     .query<Measure, [string, string, number]>(
-      `SELECT SUM(u.calls) AS calls, SUM(u.input + u.cache_read + u.cache_write + u.output) AS tokens,
+      `SELECT SUM(u.calls) AS calls, SUM(u.input + u.output) AS tokens,
          SUM(MAX(0, COALESCE(r.ended, u.at) - COALESCE(r.started, r.received, u.at))) AS ms, SUM(u.lore_searches + u.lore_reads) AS lookups
        FROM usage u LEFT JOIN turn_run r ON r.user = u.user AND r.id = u.run
        WHERE u.user = ?1 AND u.chat = ?2 GROUP BY u.turn ORDER BY MAX(u.at) DESC LIMIT ?3`,

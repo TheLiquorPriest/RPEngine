@@ -59,6 +59,9 @@ const FORM_WORDS: Readonly<Record<ReleaseForm, string>> = { tags: "its own text,
 
 const COMPACTED_WORDS: Readonly<Record<EventOf<"compacted">["reason"], string>> = { "would-not-fit": "it would not have fit", refused: "the model refused it", asked: "asked for", fold: "its records passed their size" };
 
+/** What an agent did to its own window, in words, before the things it touched. */
+const WINDOW_WORDS: Readonly<Record<EventOf<"window">["action"], string>> = { let_go: "Let go of", note: "Put its own note in place of", restore: "Brought back", handoff: "Went on in a fresh window with" };
+
 const UNHELD_WORDS: Readonly<Record<EventOf<"tool_unheld">["reason"], string>> = { unregistered: "its definition lists it, and nobody registered it", shadowed: "a host's tool took a name of the harness's own and was left out", withdrawn: "the host withdrew it since the session opened, and it answers that it is gone" };
 
 const REPLY_ERROR_WORDS: Readonly<Record<ReplyError["code"], string>> = {
@@ -523,6 +526,13 @@ function NoteView(props: { step: NoteStep; notices: NoticeLines }) {
       return <NoteHead icon="send" title={`Released the reply: ${FORM_WORDS[event.release.form]}, ${counted(event.release.length, "character")}${event.release.path === undefined ? "" : ` (${event.release.path})`}`} />;
     case "compacted":
       return <NoteHead icon="shrink" title={`Compacted session ${event.session}: ${num(event.before)} to ${num(event.after)} tokens (${COMPACTED_WORDS[event.reason]}; ${event.of === "turns" ? "its earlier turns" : "the run's older calls"}${event.keptTurns === undefined ? "" : `, ${counted(event.keptTurns, "turn")} kept as they were`})`} />;
+    case "window":
+      return (
+        <NoteHead
+          icon="shrink"
+          title={`${WINDOW_WORDS[event.action]} ${counted(event.items.length, "thing")} of its window (${num(event.items.reduce((sum, item) => sum + item.tokens, 0))} tokens): ${num(event.sparedTokens)} tokens spared on each later call, ${num(event.costTokens)} spent once`}
+        />
+      );
     case "session":
       return <NoteHead icon="book" title={`Session ${event.session} ${event.change}${event.from === undefined ? "" : ` from ${event.from}`}${event.turn === undefined ? "" : `, for turn ${event.turn}`}${event.by === undefined ? "" : ", by your press"}${event.reason === undefined ? "" : `: ${event.reason}`}`} />;
     case "tool_unheld":

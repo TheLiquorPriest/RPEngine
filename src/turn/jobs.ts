@@ -101,6 +101,33 @@ export function jobsEndedBetween(db: Database, user: string, chat: string, from:
 }
 
 /**
+ * The jobs started under any of these turns, the first started first, each as RPH last kept it: read through each job's own record,
+ * which names the turn that started it. A carried job's transcript is left in the database, as a list of jobs leaves it.
+ */
+export function jobsOfTurns(db: Database, user: string, turns: readonly string[]): JobView[] {
+  return db
+    .query<{ value: string }, [string, string]>("SELECT json_remove(value, '$.transcript') AS value FROM job WHERE user = ? AND value IS NOT NULL AND turn IN (SELECT value FROM json_each(?)) ORDER BY started, id")
+    .all(user, JSON.stringify(turns))
+    .map((r) => JSON.parse(r.value) as JobView);
+}
+
+/**
+ * The user's jobs that ended and have no row of a model call kept (`usage.ts`), the first started first, each as RPH last kept it:
+ * the jobs whose own kept traces a reading in of past use has still to read. A job runs in a session of its own, and its records are
+ * kept under that session (in the turn's folder there, for a job a turn started), apart from the records of the turn's own runs. A
+ * job a migration carried has no trace of RPE's, and is none of them.
+ */
+export function jobsWithoutCalls(db: Database, user: string): JobView[] {
+  return db
+    .query<{ value: string }, [string]>(
+      `SELECT j.value AS value FROM job j WHERE j.user = ? AND j.value IS NOT NULL AND json_extract(j.value, '$.ended') IS NOT NULL AND json_extract(j.value, '$.carried') IS NULL
+         AND NOT EXISTS (SELECT 1 FROM call c WHERE c.user = j.user AND c.run = j.id) ORDER BY j.started, j.id`,
+    )
+    .all(user)
+    .map((r) => JSON.parse(r.value) as JobView);
+}
+
+/**
  * A page of the user's jobs among `ids` (one chat's bootstrap jobs), the newest started first, read from the one record in one query:
  * at most `limit` from after the place `after` names (a page's `next`, `<started>~<id>`), and the place of its last when more follow.
  */

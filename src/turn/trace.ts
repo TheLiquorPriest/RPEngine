@@ -8,7 +8,9 @@
 // call or a result without what the transcript holds, and reads that back from the transcript when the
 // trace is read. Streaming text goes to the live hub only; the call's `call_ended` holds it whole. A
 // piece of streaming text names only its run, by RPH's own id for it: where it goes is where its run's
-// records go, each run's first record coming before any piece of it.
+// records go, each run's first record coming before any piece of it. Every record is given, as it comes,
+// to the turn's runs (`spans.ts`) and to the rows of the model calls (`usage.ts`), neither of which it
+// waits for.
 
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -17,6 +19,7 @@ import { LIVE_JOBS, type LiveHub } from "../app";
 import { isRecord } from "../shared/json";
 import { type TreeFiles, TURN_TRACE, TURN_TRANSCRIPTS } from "../tree";
 import type { RunTimes } from "./spans";
+import type { CallRows } from "./usage";
 
 /** A transcript's line as RPH writes it (`{"at":…,"type":"message"|"call"|"result",…}`), found by its time, its type and its call: a message by the call's number, a tool call and its result by the model's id for the call. */
 type Lines = ReadonlyMap<string, Record<string, unknown>>;
@@ -132,12 +135,19 @@ export interface TraceDeps {
   files: TreeFiles;
   /** The turn's runs, given every record and piece as it comes: they take RPH's own id for each of theirs, and the times of its lead's writing (`spans.ts`). */
   runs: Pick<RunTimes, "record" | "delta">;
+  /** The rows of the model calls, given every record as it comes: each call's row is queued as its end passes, and the trace never waits for it (`usage.ts`). */
+  calls: Pick<CallRows, "record">;
   log: Log;
 }
 
 export interface TurnTrace extends TracePort {
   /** Every record kept for a scope's turn so far (for a scope of no turn, its session's: a job's), in the order RPH gave them. */
   records(scope: RunScope): Promise<TraceRecord[]>;
+  /**
+   * The same records without what the transcripts hold: a call's text and thinking, a tool call's arguments and what a result showed
+   * are left empty, and no transcript is read. For a count of what ran, which needs none of them.
+   */
+  kept(scope: RunScope): Promise<TraceRecord[]>;
   /** What the trace holds now: the turn folders it writes to, the runs it follows, and its writes not yet landed. */
   held(): { folders: number; runs: number; writes: number };
 }
@@ -209,9 +219,19 @@ export function turnTrace(deps: TraceDeps): TurnTrace {
     void done.finally(() => pending.delete(done));
   };
 
+  /** The records kept for a scope so far as its folder's file holds them, without their traffic, once every append has landed; null where the scope has no folder yet. */
+  const keptIn = async (scope: RunScope): Promise<{ folder: string; kept: TraceRecord[] } | null> => {
+    while (pending.size > 0) await Promise.allSettled([...pending]);
+    const folder = await (open.get(keyOf(scope))?.folder ?? lookup(scope));
+    // No folder, or no record kept yet: the run has not begun.
+    if (folder === null) return null;
+    return { folder, kept: (await readLines(folder, TURN_TRACE, (row) => typeof row.seq === "number" && isRecord(row.event), deps.log)) as unknown as TraceRecord[] };
+  };
+
   return {
     event(record) {
       deps.runs.record(record);
+      deps.calls.record(record);
       const { scope } = record;
       const to = scope.chat ?? LIVE_JOBS;
       const key = keyOf(scope);
@@ -236,17 +256,19 @@ export function turnTrace(deps: TraceDeps): TurnTrace {
       return { folders: open.size, runs: going.size, writes: pending.size };
     },
     async records(scope) {
-      while (pending.size > 0) await Promise.allSettled([...pending]);
-      const folder = await (open.get(keyOf(scope))?.folder ?? lookup(scope));
-      // No folder, or no record kept yet: the run has not begun.
-      if (folder === null) return [];
-      const kept = (await readLines(folder, TURN_TRACE, (row) => typeof row.seq === "number" && isRecord(row.event), deps.log)) as unknown as TraceRecord[];
+      const at = await keptIn(scope);
+      if (at === null) return [];
+      const { folder, kept } = at;
       // Each agent's transcript the trace's traffic is in, read once.
       const names = [...new Set(kept.flatMap((record) => (isTraffic(record) ? [transcriptName(record.agent)] : [])))];
       const transcripts = new Map(await Promise.all(names.map(async (name) => [name, await transcriptLines(folder, name, deps.log)] as const)));
       return kept
         .map((record) => (isTraffic(record) ? withTraffic(record, transcripts.get(transcriptName(record.agent)) ?? NO_LINES) : record))
         .sort((a, b) => a.at - b.at || a.seq - b.seq);
+    },
+    async kept(scope) {
+      const at = await keptIn(scope);
+      return at === null ? [] : at.kept.map((record) => (isTraffic(record) ? withTraffic(record, NO_LINES) : record)).sort((a, b) => a.at - b.at || a.seq - b.seq);
     },
   };
 }
