@@ -42,7 +42,7 @@ type RunMirrored = Holds<Exactly<Infer<typeof runsOn>, DefinitionRun>>;
 
 const agentShown = shape.named(
   "AgentShown",
-  "A definition in force for a chat, as RPH lists it: its file and level, the farther files it replaces, whether it is switched off, its profile, effort and limits as its header says them, how its tools are offered, its fixed tools, the instruction files it reads and what it is given at a run's start, the definition its reply goes to a writer through, and what it runs on.",
+  "A definition in force for a chat, as RPH lists it: its file and level, the farther files it replaces, whether it is switched off, its profile, effort and limits as its header says them, how its tools are offered, its fixed tools, the instruction files it reads, what it is given at a run's start and what it is given for each purpose a start may name, the definition its reply goes to a writer through, and what it runs on.",
   shape.object({
     name: T,
     description: T,
@@ -57,6 +57,7 @@ const agentShown = shape.named(
     tools: shape.list(T),
     reads: shape.list(T),
     given: shape.list(T),
+    purposes: opt(shape.record(shape.list(T))),
     writer: opt(T),
     runsOn,
   }),

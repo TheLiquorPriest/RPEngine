@@ -4167,7 +4167,7 @@ export interface AgentRef {
 
 ### `AgentShown`
 
-A definition in force for a chat, as RPH lists it: its file and level, the farther files it replaces, whether it is switched off, its profile, effort and limits as its header says them, how its tools are offered, its fixed tools, the instruction files it reads and what it is given at a run's start, the definition its reply goes to a writer through, and what it runs on.
+A definition in force for a chat, as RPH lists it: its file and level, the farther files it replaces, whether it is switched off, its profile, effort and limits as its header says them, how its tools are offered, its fixed tools, the instruction files it reads, what it is given at a run's start and what it is given for each purpose a start may name, the definition its reply goes to a writer through, and what it runs on.
 
 ```ts
 export interface AgentShown {
@@ -4184,6 +4184,7 @@ export interface AgentShown {
   tools: string[];
   reads: string[];
   given: string[];
+  purposes?: { [key: string]: string[] };
   writer?: string;
   runsOn: DefinitionRun;
 }
@@ -6202,6 +6203,10 @@ export interface JobView {
   stoppedBy?: JobStopper;
   /** The attachments its start named, by name. */
   attach?: string[];
+  /** The purpose its start named, which chose what its definition handed it. */
+  for?: string;
+  /** The names of its definition's list for that purpose that its start left out. */
+  leave?: string[];
   /** The character its agent plays, as its start named it. */
   plays?: string;
   /** The limits of its own its start gave. */
@@ -9940,7 +9945,7 @@ export interface ToolCallView {
 
 ### `ToolResult`
 
-A tool's answer: what the model is shown, whether it failed, what it reports beyond it, its marks, and data for the live view.
+A tool's answer: what the model is shown, whether it failed, what it reports beyond it, its marks, data for the live view, and the path of the file that holds it whole where one does.
 
 ```ts
 export interface ToolResult {
@@ -9949,6 +9954,7 @@ export interface ToolResult {
   reports?: string[];
   marks?: string[];
   details?: JsonValue;
+  kept?: string;
 }
 ```
 

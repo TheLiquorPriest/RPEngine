@@ -61,7 +61,11 @@ export const effort = shape.named("Effort", "How hard a model reasons on a call.
 const sampling = shape.named("Sampling", "Sampling by its usual names, as a preset sets it; each one absent is the connection's own.", shape.object({ temperature: opt(N), top_p: opt(N), top_k: opt(N), min_p: opt(N), frequency_penalty: opt(N), presence_penalty: opt(N), repetition_penalty: opt(N), seed: opt(N), stop: opt(shape.list(T)) }));
 const toolCall = shape.named("ToolCallView", "A tool call a model made: the model's id for it, the tool, its arguments, and when the model began writing it, where the provider gave it in pieces.", shape.object({ id: T, name: T, args: shape.json(), began: opt(N) }));
 const toolContent = shape.union(shape.object({ type: shape.literal("text"), text: T }), shape.object({ type: shape.literal("image"), data: T, mimeType: T }));
-const toolResult = shape.named("ToolResult", "A tool's answer: what the model is shown, whether it failed, what it reports beyond it, its marks, and data for the live view.", shape.object({ content: shape.list(toolContent), error: opt(shape.literal(true)), reports: opt(shape.list(T)), marks: opt(shape.list(T)), details: opt(shape.json()) }));
+const toolResult = shape.named(
+  "ToolResult",
+  "A tool's answer: what the model is shown, whether it failed, what it reports beyond it, its marks, data for the live view, and the path of the file that holds it whole where one does.",
+  shape.object({ content: shape.list(toolContent), error: opt(shape.literal(true)), reports: opt(shape.list(T)), marks: opt(shape.list(T)), details: opt(shape.json()), kept: opt(T) }),
+);
 export const layerLevel = shape.named("LayerLevel", "A level of the agents' tree: what ships, the user's own, a character's, a chat's.", shape.oneOf("shipped", "global", "character", "chat"));
 const factValue = shape.object({ count: N, names: opt(shape.list(T)), by: opt(shape.record(N)), namesBy: opt(shape.record(shape.list(T))), fields: opt(shape.record(shape.json())) });
 const ruleThen = shape.union(shape.object({ did: shape.literal("called"), tools: shape.list(T) }), shape.object({ did: shape.literal("wrote") }), shape.object({ did: shape.literal("released") }), shape.object({ did: shape.literal("ended") }));
@@ -172,6 +176,8 @@ export const jobView = shape.named(
     limit: opt(limitHit),
     stoppedBy: opt(jobStopper, "For a job ended before its agent was done (cancelled, at a limit, off the path, interrupted): who ended it."),
     attach: opt(shape.list(T), "The attachments its start named, by name."),
+    for: opt(T, "The purpose its start named, which chose what its definition handed it."),
+    leave: opt(shape.list(T), "The names of its definition's list for that purpose that its start left out."),
     plays: opt(T, "The character its agent plays, as its start named it."),
     limits: opt(jobLimits, "The limits of its own its start gave."),
     missing: opt(shape.list(T), "The names in attach nobody could find."),
