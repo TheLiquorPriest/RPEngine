@@ -98,15 +98,16 @@ describe("the Cast page", () => {
     expect(elements(view({ ...opened, at: "turn-3" }, true).tree).some((e) => e.type === "button" && textOf(e.props.children) === "Have its agent take them in now")).toBe(false);
   });
 
-  test("the list says who holds perceptions not taken in and how large they are, and one press starts a job for each: it asks first, naming each with its size, then says what was started and what was not", () => {
-    // Two characters hold something: one a backlog its agent takes in as two batches.
+  test("the list says which principals hold perceptions not taken in and how large they are, and one press starts a job for each: it asks first, naming each with its size, then says what was started and what was not", () => {
+    // Two principals hold something: one a backlog its agent takes in as two batches.
+    const principal = { as: "principal" as const, pinned: false, line: null };
     const list = {
       ...CAST,
-      characters: CAST.characters.map((m, at) => ({ ...m, waits: at === 0 ? { ...m.waits, perceptions: 412, tokens: 41000, batches: 2 } : { ...m.waits, perceptions: 3, tokens: 900, batches: 1 } })),
+      characters: CAST.characters.map((m, at) => ({ ...m, casting: m.casting ?? principal, waits: at === 0 ? { ...m.waits, perceptions: 412, tokens: 41000, batches: 2 } : { ...m.waits, perceptions: 3, tokens: 900, batches: 1 } })),
     };
     const [first, second] = list.characters.map((m) => m.name) as [string, string];
     const shown = view({ list }, true);
-    expect(section(shown.tree, "waits-all")).toContain("2 characters hold 415 perceptions their own agents have not taken in, about 41,900 tokens.");
+    expect(section(shown.tree, "waits-all")).toContain("2 principals hold 415 perceptions their own agents have not taken in, about 41,900 tokens.");
     press(shown.tree, "Have their agents take them in now");
     expect(shown.pressed).toEqual([["take in", "ask", [first, second]]]);
 
@@ -125,8 +126,8 @@ describe("the Cast page", () => {
     expect(banners(done.tree).map((b) => b.title)).toEqual(["Job job-7 started", "Not started for everyone"]);
     expect(section(done.tree, "waits-all")).toContain(`${second}: Jobs are switched off.`);
 
-    // Nobody holds anything: the list shows no such section.
-    const quiet = view({ list: { ...CAST, characters: CAST.characters.map((m) => ({ ...m, waits: { ...m.waits, perceptions: 0 } })) } }, true);
+    // No principal holds anything: the list shows no such section. One who is no principal is started from its own page.
+    const quiet = view({ list: { ...CAST, characters: CAST.characters.map((m, at) => ({ ...m, casting: at === 0 ? null : m.casting, waits: { ...m.waits, perceptions: at === 0 ? 5 : 0 } })) } }, true);
     expect(elements(quiet.tree).some((e) => e.props["data-section"] === "waits-all")).toBe(false);
   });
 

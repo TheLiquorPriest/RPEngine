@@ -417,11 +417,12 @@ function WaitsSection(props: { member: CastMemberRow; at: string | null; takeIn:
 }
 
 /**
- * Above the cast's list: everyone who holds perceptions their own agent has not taken in, counted, with one press that starts a job for
- * each. Nothing where nobody holds any.
+ * Above the cast's list: the principals who hold perceptions their own agents have not taken in, counted, with one press that starts a
+ * job for each. A principal is the casting that is run as an agent of its own; another character's is started from its own page.
+ * Nothing where no principal holds any.
  */
 function WaitsForAll(props: { members: readonly CastMemberRow[]; takeIn: TakeInShown | null; onTakeIn(step: TakeInStep, who?: readonly string[]): void }) {
-  const holding = props.members.filter((m) => m.waits.perceptions > 0);
+  const holding = props.members.filter((m) => m.casting?.as === "principal" && m.waits.perceptions > 0);
   if (holding.length === 0) return null;
   const perceptions = holding.reduce((n, m) => n + m.waits.perceptions, 0);
   const sized = holding.every((m) => m.waits.tokens !== undefined);
@@ -429,9 +430,9 @@ function WaitsForAll(props: { members: readonly CastMemberRow[]; takeIn: TakeInS
   // The press is for those it was asked for: who holds something may change under a confirm that is open.
   const asked = props.takeIn === null ? holding : holding.filter((m) => props.takeIn?.who.includes(m.name));
   return (
-    <Section id="waits-all" title="What waits for the characters' own agents">
+    <Section id="waits-all" title="What waits for the principals' own agents">
       <p class="rpe-line" data-waits>
-        {counted(holding.length, "character holds", "characters hold")} {counted(perceptions, "perception")} their own agents have not taken in{sized ? `, about ${counted(tokens, "token")}` : ""}.
+        {counted(holding.length, "principal holds", "principals hold")} {counted(perceptions, "perception")} their own agents have not taken in{sized ? `, about ${counted(tokens, "token")}` : ""}.
       </p>
       <TakeInPress
         members={asked.length === 0 ? holding : asked}
