@@ -1,16 +1,16 @@
-// The Author's fixed list (plan §6.8, §17.3 "A fixed list and a search"; plan 3.2 §7.2 adds `window`): exactly the thirty and `window` by name, the same on every call of a session.
+// The Author's fixed list (plan §6.8, §17.3 "A fixed list and a search"; plan 3.2 §7.2 and §7.3 add `window` and `task`): exactly the thirty and those two by name, the same on every call of a session.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CHAT, openTurnBed, type TurnBed, USER } from "./bed";
 
-/** §6.8's table, by name, and the means over its own window that plan 3.2 gives every agent. */
+/** §6.8's table, by name, with the means over its own window and of splitting its work that plan 3.2 gives every agent. */
 const FIXED = [
   "prompt", "chat_read", "chat_search", "lore_read", "lore_search", "archive_search", "web_search", "gap_check", "delegate", "agent_message",
   "write_reply", "reply_release", "file_read", "file_find", "file_write", "skill_load", "job_start", "suggest", "todo", "tool_search",
   "tool_use", "world_query", "world_search", "world_apply", "roll", "story_query", "story_record", "cast_query", "cast_update", "perceive",
-  "window",
+  "window", "task",
 ];
 
 const beds: TurnBed[] = [];
@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 describe("the Author's tools", () => {
-  test("the shipped Author carries exactly the thirty of §6.8 and `window` by name, and the same list when asked again", async () => {
+  test("the shipped Author carries exactly the thirty of §6.8 with `window` and `task` by name, and the same list when asked again", async () => {
     const b = await openTurnBed({ answers: [] });
     beds.push(b);
     const scope = { user: USER, chat: CHAT, session: "s-author" };

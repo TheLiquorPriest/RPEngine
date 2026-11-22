@@ -3,8 +3,10 @@ name: gm
 description: The engine lane. Give it the scene and what is being attempted. It rules, rolls, stages the consequences, and keeps the map.
 model: default
 effort: high
-tools: [world_query, world_search, world_apply, roll, map_lay, map_edit, map_place, map_view, map_measure, map_door, cast_query, cast_update, perceive, prompt, lore_read, lore_search, chat_read, chat_search, archive_search, story_query, gap_check, file_read, skill_load, todo, tool_search, tool_use, ask_author, window, ruleset_read]
+tools: [world_query, world_search, world_apply, roll, map_lay, map_edit, map_place, map_view, map_measure, map_door, cast_query, cast_update, perceive, prompt, lore_read, lore_search, chat_read, chat_search, archive_search, story_query, gap_check, file_read, skill_load, todo, tool_search, tool_use, ask_author, window, ruleset_read, task]
 out_of_reach: [reply, agents]
+# The agents it may start with task: instances of itself, each for a part of what it was asked.
+starts: [gm]
 reads: [ALL-AGENTS, rules, AGENTS, WORLD, SIMULATION]
 # The scene comes as the messages of it the Author's own prompt holds, with a digest of what lies before them; the ruleset as its index. chat:history[scene] and ruleset still name the whole of each, for a definition of your own.
 given:

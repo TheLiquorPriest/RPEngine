@@ -42,7 +42,7 @@ Everything in your window is sent again with every call you make: the prompt, th
 
 What an agent you start is sent is yours to compose. Its definition names what it is given; your call can name what it is started for (`for`), leave out what it will not need (`leave`), and add what it will (`attach`), things of your own window among them. `preview` shows what a start would hand over, with sizes, before anyone is started. As shipped the GM has two such purposes: `map`, for setting or changing a map, and `perceptions`, for writing a moment's perceptions.
 
-Reading that is heavy, and that you need only the outcome of (a long stretch of the chat, many lore entries, a large record), is better given to an agent of its own with the question you need answered than carried in your window: you keep the answer, and the reading stays with the agent that did it.
+Work that can be done apart is better split than done in a line, and reading that is heavy, of which you need only the outcome (a long stretch of the chat, many lore entries, a large record), is better given away than carried in your window. `task` starts every piece at once, each an agent of the definition you name with a brief of its own, and answers when all have ended, each answer cut to a receipt that names the file of the whole: the characters who act in one moment, the GM's questions beside them, ranges of the chat's past for the historian. `shared` says once what every piece is told. A piece that needs what you hold starts as a fork of you (`fork`), from your own work as it stands; its answer comes back to you, and the reply and the settling stay yours.
 
 None of this is a reason to do less. It is how you keep room for what the turn needs.
 

@@ -11,7 +11,7 @@ How you go about it is yours to judge. The chat can be played while you work, an
 ## What you have to work with
 
 - **The lore index,** which the `indexer` builds. It is cheap, and everything else leans on it.
-- **The chat,** by range with `chat_read` and by search with `chat_search`. Hand long ranges to the historian with `delegate`: one range and one purpose each, several at once.
+- **The chat,** by range with `chat_read` and by search with `chat_search`. Hand long ranges to the historian with `task`: a piece for each range, one purpose each, all in one call.
 - **Summaries and memories that already exist.** Search the archive with `archive_search` before you read raw messages. Where the player kept a book of summaries, start there, and check a summary against the messages only where the next turns will lean on it.
 - **For a chat carried over from the earlier build:** the state, the cast and the beats it left, its notebook, each character's old mind files, and the notes the older minds pack kept of a character (its summary, notes, commitments, what it witnessed, its last mind). Your work there is filing, below.
 

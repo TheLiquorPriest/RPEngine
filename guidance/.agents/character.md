@@ -3,8 +3,10 @@ name: character
 description: One principal character, in their own mind and voice. One run per character.
 model: default
 effort: medium
-tools: [recall, remember, reflect, dream, mind_set, relate, ask_author, skill_load, window]
+tools: [recall, remember, reflect, dream, mind_set, relate, ask_author, skill_load, window, task]
 out_of_reach: [reply]
+# The agents it may start with task: instances of itself, which play the same character and may know only what it may know.
+starts: [character]
 reads: [ALL-AGENTS, rules, AGENTS]
 given:
   - cast:self(base, growth, mind, what-comes-to-mind, relationships:present, unprocessed-perceptions, game-side, imported)
